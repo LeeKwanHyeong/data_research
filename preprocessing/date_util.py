@@ -7,8 +7,8 @@ class DateUtil:
     def __int__(self):
         pass
 
-    def yyyymmdd_to_date(self, yyyymmdd: int) -> datetime:
-        return datetime.strptime(str(yyyymmdd), '%Y%m%d')
+    def yyyymmdd_to_date(self, yyyymmdd: int) -> date:
+        return datetime.strptime(str(yyyymmdd), '%Y%m%d').date()
 
     def add_months_to_date(self, date: datetime, months: int) -> datetime:
         year = date.year + (date.month + months - 1) // 12
