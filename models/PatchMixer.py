@@ -156,15 +156,38 @@ class PatchMixerFeatureModel(nn.Module):
 
         # Combined Head
         patch_repr_dim = self.backbone.a * self.backbone.d_model
+
+        # Projection Layer
+        self.proj = nn.Sequential(
+            nn.Linear(patch_repr_dim, 128),
+            nn.ReLU(),
+            nn.Dropout(0.1)
+        )
+        combined_dim = 128 + feature_dim
+
         self.fc = nn.Sequential(
-            nn.Linear(patch_repr_dim + 8, 64),
+            nn.Linear(combined_dim, 64),
             nn.ReLU(),
             nn.Linear(64, configs.pred_len)  # output = horizon length
         )
 
     def forward(self, ts_input, feature_input):
+        # 1. PatchMixer Backbone 시계열 입력
         patch_repr = self.backbone(ts_input)
+
+        # 2. Projection Layer 차원 축소
+        patch_repr_proj = self.proj(patch_repr)
+        # print(f"patch_repr_proj: {patch_repr_proj.shape}")
+
+        # 3. Feature branch processing (using MLP)
         feature_repr = self.feature_mlp(feature_input)
-        combined = torch.cat([patch_repr, feature_repr], dim=1)
+        # print(f"feature_repr: {feature_repr.shape}")
+
+        # 4. Concatenate patch representation layer and feature representation layer
+        combined = torch.cat([patch_repr_proj, feature_repr], dim=1)
+        # print(f"combined: {combined.shape}")
+
+        # 5. Fully Connected Layers -> Final
         out = self.fc(combined)
+
         return out
