@@ -9,6 +9,8 @@ def ts_min_max_scale(series: pl.Series):
 
 def ts_min_max_rescale(scaled_series: np.ndarray):
     scaler = MinMaxScaler()
+    scaled_series = scaler.fit_transform(scaled_series)
+    return scaled_series
 
 
 
