@@ -30,15 +30,22 @@ class TestTimeMemoryManager:
         self.optimizer = optim.Adam(model.parameters(), lr = lr)
         self.loss_fn = nn.MSELoss()
 
-    def add_context(self, x_context):
+    def add_context(self, new_context):
+        device = next(self.model.parameters()).device
+        new_context = new_context.to(device).detach()  # 🔑 detach 추가
         for block in self.model.encoder.layers:
-            block.attn.update_contextual_memory(x_context)
+            block.attn.update_contextual_memory(new_context)
 
-    def adapt(self, x_new, y_new, steps = 1):
+    def adapt(self, x_new, y_new, steps=1):
+        device = next(self.model.parameters()).device
+        x_new = x_new.to(device).float()
+        y_new = y_new.to(device).float()
+
         self.model.train()
         for _ in range(steps):
-            pred = self.model(x_new)
+            pred = self.model(x_new)  # 새 forward
             loss = self.loss_fn(pred, y_new)
-            loss.backward()
+            self.optimizer.zero_grad()
+            loss.backward()  # retain_graph 필요 없음 (새 forward)
             self.optimizer.step()
         return loss.item()

@@ -27,6 +27,9 @@ class MemoryAttention(nn.Module):
         self.contextual_memory = None # Initialized Dynamically
 
     def update_contextual_memory(self, new_context):
+        device = self.persistent_memory.device  # 모델 파라미터 기준 디바이스
+        # new_context = new_context.to(device)
+        new_context = new_context.detach()
         '''
             new_context: (B, M, d_model) - New contextual memory tokens
         '''
