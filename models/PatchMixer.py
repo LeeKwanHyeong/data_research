@@ -2,7 +2,17 @@ import torch
 import torch.nn as nn
 
 from layers.RevIN import RevIN
-
+class PatchMixerConfig:
+    enc_in = 1
+    lookback_window = 36
+    batch_size = 128
+    horizon = 48
+    patch_len = 16
+    stride = 8
+    mixer_kernel_size = 8
+    d_model = 16
+    head_dropout = 0.1
+    e_layers = 2
 
 # 기존 PatchMixerLayer 그대로 사용
 class PatchMixerLayer(nn.Module):
@@ -37,11 +47,11 @@ class PatchMixerLayer(nn.Module):
 
 # PatchMixer Backbone
 class PatchMixerBackbone(nn.Module):
-    def __init__(self, configs, revin=True, affine=True, subtract_last=False):
+    def __init__(self, configs = PatchMixerConfig, revin=True, affine=True, subtract_last=False):
         super().__init__()
         self.n_vals = configs.enc_in # 입력 변수 개수 (시계열 변수 수)
-        self.lookback = configs.seq_len # 입력 시퀀스 길이
-        self.forecasting = configs.pred_len # 예측 길이
+        self.lookback = configs.lookback_window # 입력 시퀀스 길이
+        self.forecasting = configs.horizon # 예측 길이
         self.patch_size = configs.patch_len # 패치 크기
         self.stride = configs.stride # 패치 추출 간격
         self.kernel_size = configs.mixer_kernel_size # Depthwise Conv Kernel Size
@@ -140,11 +150,33 @@ class PatchMixerBackbone(nn.Module):
         return x  # shape: (batch, patch_num*d_model)
 
 
+class PatchMixerModel(nn.Module):
+    def __init__(self, configs = PatchMixerConfig):
+        super().__init__()
+        self.backbone = PatchMixerBackbone()
+        self.proj = nn.Sequential(
+            nn.Linear(64, 128),
+            nn.Softplus(),
+            nn.Dropout(0.1)
+        )
+        self.fc = nn.Sequential(
+            nn.Linear(128, 64),
+            nn.ReLU(),
+            nn.Linear(64, configs.horizon)
+        )
+
+    def forward(self, x):
+        patch_repr = self.backbone(x)
+        patch_repr_proj = self.proj(patch_repr)
+        out = self.fc(patch_repr_proj)
+        return out
+
+
 # Full Model: PatchMixer + Feature Branch
 class PatchMixerFeatureModel(nn.Module):
-    def __init__(self, configs, feature_dim=4):
+    def __init__(self, configs = PatchMixerConfig, feature_dim=4):
         super().__init__()
-        self.backbone = PatchMixerBackbone(configs)
+        self.backbone = PatchMixerBackbone()
 
         # Feature Branch
         self.feature_mlp = nn.Sequential(
@@ -168,7 +200,7 @@ class PatchMixerFeatureModel(nn.Module):
         self.fc = nn.Sequential(
             nn.Linear(combined_dim, 64),
             nn.ReLU(),
-            nn.Linear(64, configs.pred_len)  # output = horizon length
+            nn.Linear(64, configs.horizon)  # output = horizon length
         )
 
     def forward(self, ts_input, feature_input):
