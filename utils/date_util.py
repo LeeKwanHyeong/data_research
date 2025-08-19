@@ -12,6 +12,10 @@ class DateUtil:
         return datetime.strptime(str(yyyymmdd), '%Y%m%d').date()
 
     @staticmethod
+    def yyyymmdd_to_yyyymm(date_int: int) -> int:
+        return date_int // 100
+
+    @staticmethod
     def add_months_to_date(dt: datetime, months: int) -> datetime:
         year = dt.year + (dt.month + months - 1) // 12
         month = (dt.month + months - 1) % 12 + 1
