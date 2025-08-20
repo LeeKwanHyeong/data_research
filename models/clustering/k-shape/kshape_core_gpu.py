@@ -2,7 +2,7 @@ import math
 import torch
 import numpy as np
 from sklearn.base import ClusterMixin, BaseEstimator
-from tqdm import tqdm
+from tqdm import tqdm, trange
 
 if torch.cuda.is_available():
     device = torch.device("cuda")
@@ -93,7 +93,7 @@ def _extract_shape(idx, x, j, cur_center):
             _a.append(opt_x)
     if len(_a) == 0:
         indices = torch.randperm(x.shape[0])[:1]
-        return torch.squeeze(x[indices].clone())
+        return torch.squeeze(x[indices].detach().clone())
 
     a =  torch.stack(_a)
     columns = a.shape[1]
@@ -128,10 +128,10 @@ def _kshape(x, k, centroid_init = 'zero', max_iter = 100):
         centroids = torch.zeros(k, x.shape[1], x.shape[2], device = device, dtype = torch.float32)
     elif centroid_init == 'random':
         indices = torch.randperm(x.shape[0])[:k]
-        centroids = x[indices].clone()
+        centroids = x[indices].detach().clone()
     distances = torch.empty(m, k, device = device)
 
-    for it in range(max_iter):
+    for _ in trange(max_iter, desc ='KShape Training'):
         old_idx = idx
         for j in range(k):
             for d in range(x.shape[2]):
@@ -220,7 +220,8 @@ class KShapeClusteringGPU(ClusterMixin, BaseEstimator):
         Core clustering algorithm using torch tensors
     '''
     def _fit(self, x, k, centroid_init = 'zero', max_iter = 100):
-        x = torch.tensor(x, device = device, dtype = torch.float32)
+        x = x.detach().clone().to(device=device).to(torch.float32)
+
         idx, centroids = _kshape(x, k, centroid_init, max_iter = max_iter)
         clusters = []
         for i, centroid in tqdm(enumerate(centroids)):
@@ -231,3 +232,19 @@ class KShapeClusteringGPU(ClusterMixin, BaseEstimator):
             clusters.append((centroid, series))
         return clusters
 
+    def save(self, path: str):
+        torch.save({
+            'centroids': self.centroids_,
+            'labels': self.labels_,
+            'n_clusters': self.n_clusters,
+            'max_iter': self.max_iter,
+            'centroid_init': self.centroid_init,
+        }, path)
+
+    def load(self, path: str):
+        data = torch.load(path, map_location = device)
+        self.centroids_ = data['centroids']
+        self.labels = data['labels']
+        self.n_clusters = data['n_clusters']
+        self.max_iter = data['max_iter']
+        self.centroid_init = data['centroid_init']
