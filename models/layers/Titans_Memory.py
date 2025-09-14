@@ -15,43 +15,87 @@ def debug_tensor(name, tensor):
 # - 인코더 은닉 벡터(encoded)와 메모리 벡터(memory) 간의 유사도를 계산
 # - 각 시점별로 가장 관련성이 높은 top-k 메모리를 선택하여 평균 결합
 # - 최종적으로 encoded + matched 메모리 벡터를 선형 변환하여 출력
+# class LMM(nn.Module):
+#     def __init__(self, d_model, top_k = 5):
+#         super().__init__()
+#         self.top_k = top_k # 각 시점별로 선택할 메모리 슬롯 개수 (k-NN 개념)
+#         self.linear = nn.Linear(d_model, d_model)
+#
+#     def forward(self, encoded, memory):
+#         # 입력과 메모리 벡터 정규화 (코사인 유사도 계산을 위해)
+#         # - encoded: [batch, seq_len, d_model]
+#         # - memory:  [batch, mem_len, d_model]
+#         encoded_norm = F.normalize(encoded, dim = -1)
+#         memory_norm = F.normalize(memory, dim = -1)
+#
+#         # 유사도 행렬 계산 (코사인 유사도)
+#         # - similarity: [batch, seq_len, mem_len]
+#         similarity = torch.matmul(encoded_norm, memory_norm.transpose(-2, -1))
+#
+#         # 각 시점별로 top-k 메모리 선택
+#         # - top_k_values: [batch, seq_len, top_k] (유사도 값)
+#         # - top_k_indices: [batch, seq_len, top_k] (선택된 메모리 인덱스)
+#         top_k_values, top_k_indices = torch.topk(similarity, self.top_k, dim = -1)
+#
+#         # 선택된 메모리 인덱스에 따라 메모리 벡터 추출
+#         B, L, M = top_k_indices.size() # batch, seq_len, top_k
+#         memory_exp = memory.unsqueeze(1).expand(-1, L, -1, -1) # [B, L, mem_len, d_model]
+#         top_k_indices_exp = top_k_indices.unsqueeze(-1).expand(-1, -1, -1, memory.size(-1))
+#
+#         # gather로 top-k 메모리 평균 -> 매칭된 메모리 벡터 생성
+#         # matched: [B, L, d_model]
+#         selected = torch.gather(memory_exp, 2, top_k_indices_exp)
+#
+#         # 입력(encoded)과 matched 메모리를 결합 후 선형 변환
+#         # output: [B, L, d_model]
+#         matched = selected.mean(dim = 2)
+#         output = self.linear(encoded + matched)
+#         return output
 class LMM(nn.Module):
-    def __init__(self, d_model, top_k = 5):
+    def __init__(self, d_model: int, top_k: int = 5):
         super().__init__()
-        self.top_k = top_k # 각 시점별로 선택할 메모리 슬롯 개수 (k-NN 개념)
-        self.linear = nn.Linear(d_model, d_model)
+        self.d_model = d_model
+        self.top_k = top_k
+        self.scale = 1.0 / (d_model ** 0.5)
 
-    def forward(self, encoded, memory):
-        # 입력과 메모리 벡터 정규화 (코사인 유사도 계산을 위해)
-        # - encoded: [batch, seq_len, d_model]
-        # - memory:  [batch, mem_len, d_model]
-        encoded_norm = F.normalize(encoded, dim = -1)
-        memory_norm = F.normalize(memory, dim = -1)
+    def forward(self, encoded: torch.Tensor, memory: torch.Tensor) -> torch.Tensor:
+        """
+        encoded: [B, L, D]
+        memory : [B, M, D] or [M, D]
+        return : [B, L, D]
+        """
+        B, L, D = encoded.shape
 
-        # 유사도 행렬 계산 (코사인 유사도)
-        # - similarity: [batch, seq_len, mem_len]
-        similarity = torch.matmul(encoded_norm, memory_norm.transpose(-2, -1))
+        # memory 존재/형상 보정
+        if memory is None or memory.numel() == 0:
+            return encoded  # 메모리 없으면 그대로 통과(안전)
+        if memory.dim() == 2:  # [M, D] -> [B, M, D]
+            memory = memory.unsqueeze(0).expand(B, -1, -1)
 
-        # 각 시점별로 top-k 메모리 선택
-        # - top_k_values: [batch, seq_len, top_k] (유사도 값)
-        # - top_k_indices: [batch, seq_len, top_k] (선택된 메모리 인덱스)
-        top_k_values, top_k_indices = torch.topk(similarity, self.top_k, dim = -1)
+        M = memory.size(1)
+        if M == 0:
+            return encoded
 
-        # 선택된 메모리 인덱스에 따라 메모리 벡터 추출
-        B, L, M = top_k_indices.size() # batch, seq_len, top_k
-        memory_exp = memory.unsqueeze(1).expand(-1, L, -1, -1) # [B, L, mem_len, d_model]
-        top_k_indices_exp = top_k_indices.unsqueeze(-1).expand(-1, -1, -1, memory.size(-1))
+        # k를 M 이내로 동적 제한
+        k = min(self.top_k, M)
 
-        # gather로 top-k 메모리 평균 -> 매칭된 메모리 벡터 생성
-        # matched: [B, L, d_model]
-        selected = torch.gather(memory_exp, 2, top_k_indices_exp)
+        # 정규화 후 유사도 계산
+        encoded_norm = F.normalize(encoded, p=2, dim=-1)
+        memory_norm  = F.normalize(memory,  p=2, dim=-1)
+        similarity   = torch.matmul(encoded_norm, memory_norm.transpose(-2, -1))  # [B, L, M]
 
-        # 입력(encoded)과 matched 메모리를 결합 후 선형 변환
-        # output: [B, L, d_model]
-        matched = selected.mean(dim = 2)
-        output = self.linear(encoded + matched)
-        return output
+        # top-k 선택
+        top_k_vals, top_k_idx = torch.topk(similarity, k, dim=-1)  # [B, L, k], [B, L, k]
 
+        # 선택 메모리 gather -> 평균
+        memory_exp     = memory.unsqueeze(1).expand(-1, L, -1, -1)              # [B, L, M, D]
+        top_idx_exp    = top_k_idx.unsqueeze(-1).expand(-1, -1, -1, D)          # [B, L, k, D]
+        selected_mem   = torch.gather(memory_exp, 2, top_idx_exp)               # [B, L, k, D]
+        matched        = selected_mem.mean(dim=2)                                # [B, L, D]
+
+        # 간단한 residual 결합(필요시 가중치/게이팅 추가 가능)
+        enhanced = encoded + matched
+        return enhanced
 # Efficient Multi-Head Attention with Memory
 # - Titan의 MAC(Memory-as-Context) 핵심 모듈
 # - 기존 Multi-Head Attention에 두 종류의 메모리 결합:

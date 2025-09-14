@@ -5,12 +5,12 @@ import torch.nn as nn
 import torch.optim as optim
 from torch import GradScaler, amp
 
-from models.Titans import TitanConfig, TestTimeMemoryManager
+from models.Titans import TitanConfigMonthly, TestTimeMemoryManager
 
 
 class TitanTrain:
     def __init__(self):
-        self.titan_config = TitanConfig()
+        self.titan_config = TitanConfigMonthly()
 
     def base_train(self, model, train_loader, val_loader, epochs, lr = 1e-3, device = 'cuda'):
         model.to(device)

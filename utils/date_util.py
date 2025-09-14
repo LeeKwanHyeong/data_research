@@ -1,10 +1,52 @@
 # ==== DateUtil: YYYYMM 전용 유틸 추가 ====
-from datetime import date
+from datetime import date, datetime
 import numpy as np
 import pandas as pd
+import polars as pl
 
 class DateUtil:
-    # ... (기존 메서드들은 그대로 두세요)
+    @staticmethod
+    def yyyymmdd_to_date(yyyymmdd: int) -> date:
+        return datetime.strptime(str(yyyymmdd), '%Y%m%d').date()
+
+    @staticmethod
+    def add_months_to_date(dt: datetime, months: int) -> datetime:
+        year = dt.year + (dt.month + months - 1) // 12
+        month = (dt.month + months - 1) % 12 + 1
+        day = min(dt.day, [31,
+                           29 if year % 4 == 0 and (year % 100 != 0 or year % 400 == 0) else 28,
+                           31, 30, 31, 30, 31, 31, 30, 31, 30, 31][month - 1])
+        return datetime(year, month, day)
+
+    @staticmethod
+    def datetime_to_yyyymmdd(dt: datetime) -> int:
+        return int(dt.strftime('%Y%m%d'))
+
+    @staticmethod
+    def yyyyww_to_date(yyyyww: int) -> date:
+        yyyy = yyyyww // 100
+        ww = yyyyww % 100
+        return date.fromisocalendar(yyyy, ww, 1)
+
+    @staticmethod
+    def yyyymm_to_date(yyyymm: int):
+        return datetime.strptime(str(yyyymm), '%Y%m').date()
+
+    @staticmethod
+    def date_to_yyyyww(dt: date) -> int:
+        iso = dt.isocalendar()
+        return iso[0] * 100 + iso[1]
+
+    @staticmethod
+    def date_to_yyyymm(dt: date) -> int:
+        return int(dt.strftime('%Y%m'))
+
+    @staticmethod
+    def extend_weeks_proper(df: pl.DataFrame) -> pl.DataFrame:
+        oper_part = df[0, 'oper_part_no']
+        weeks_to_add = df.shape[0]
+        last_yyyyww = df['order_yyyyww'].max()
+        last_date = DateUtil.yyyyww_to_date(last_yyyyww)
 
     # ---------- 기본 파싱/검증 ----------
     @staticmethod

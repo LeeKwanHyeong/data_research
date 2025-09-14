@@ -7,7 +7,7 @@ from models.layers.Titans_Memory import MemoryEncoder, LMM
 from models.layers.TrendCorrector import TrendCorrector
 
 
-class TitanConfig:
+class TitanConfigMonthly:
     batch_size = 128              # 한 번의 학습/추론에서 처리할 시계열 샘플 개수 (배치 크기)
     lookback = 12                 # 입력 시계열의 과거 타임스텝 길이 (모델 입력 시 고려하는 시점 수)
     input_dim = 1                  # 각 타임스텝에서의 피처(feature) 개수 (예: 단변량=1, 다변량>1)
@@ -19,9 +19,20 @@ class TitanConfig:
     persistent_mem_size = 16       # MAC에서 사용하는 영구 메모리(persistent memory) 슬롯 개수
     horizon = 60            # 예측할 미래 타임스텝 길이 (출력 시점 수)
 
+class TitanConfigWeekly:
+    batch_size = 128              # 한 번의 학습/추론에서 처리할 시계열 샘플 개수 (배치 크기)
+    lookback = 54                 # 입력 시계열의 과거 타임스텝 길이 (모델 입력 시 고려하는 시점 수)
+    input_dim = 1                  # 각 타임스텝에서의 피처(feature) 개수 (예: 단변량=1, 다변량>1)
+    d_model = 64                   # 모델 내부 임베딩 차원 (토큰/패치가 변환되는 은닉 공간의 차원)
+    n_layers = 2                   # Transformer 또는 Titan 블록의 층(layer) 개수
+    n_heads = 4                    # Multi-Head Attention에서 병렬로 사용하는 어텐션 헤드 수
+    d_ff = 256                     # 피드포워드 네트워크(FFN) 내부 차원 (확장된 은닉층 크기)
+    contextual_mem_size = 64       # MAC(Memory-as-Context)에서 사용하는 컨텍스트 메모리 슬롯 개수
+    persistent_mem_size = 16       # MAC에서 사용하는 영구 메모리(persistent memory) 슬롯 개수
+    horizon = 27            # 예측할 미래 타임스텝 길이 (출력 시점 수)
 
 class Model(nn.Module):
-    def __init__(self, config = TitanConfig):
+    def __init__(self, config = TitanConfigMonthly):
         super().__init__()
 
         # RevIN (Reversible Instance Normalization) 레이어
@@ -68,7 +79,7 @@ class Model(nn.Module):
         return pred
 
 class LMMModel(nn.Module):
-    def __init__(self, config = TitanConfig):
+    def __init__(self, config):
         super().__init__()
 
         # RevIN (Reversible Instance Normalization)
@@ -117,6 +128,47 @@ class LMMModel(nn.Module):
             d_model = config.d_model,
             output_horizon = config.horizon
         )
+
+    # def forward(self, x, mode='train'):
+    #     x = self.revin_layer(x, 'norm')
+    #     encoded = self.encoder(x)  # [B, L, D]
+    #     B, L, D = encoded.shape
+    #
+    #     if mode == 'train':
+    #         # 1) encoder 레이어들의 contextual mem 수집
+    #         contextual_memory = []
+    #         for layer in self.encoder.layers:
+    #             mem = getattr(layer.attn, 'contextual_memory', None)
+    #             if mem is not None and mem.numel() > 0:
+    #                 contextual_memory.append(mem)
+    #
+    #         # 2) 메모리 선택/보정
+    #         if len(contextual_memory) > 0:
+    #             memory = contextual_memory[-1]  # [M, D] 혹은 [B, M, D]
+    #             if memory.dim() == 2:  # [M, D] -> [B, M, D]
+    #                 memory = memory.unsqueeze(0).expand(B, -1, -1)
+    #             elif memory.dim() == 3 and memory.size(0) != B:
+    #                 # 배치 불일치 방어: 반복 확장
+    #                 memory = memory.expand(B, -1, -1)
+    #         else:
+    #             # ✅ Fallback: 인코딩 토큰 자체를 메모리로 사용
+    #             #    (lookback이 top_k보다 작아도, LMM.forward에서 k가 자동으로 줄어듦)
+    #             memory = encoded  # [B, L, D]
+    #
+    #         # 3) LMM 적용
+    #         enhanced = self.lmm(encoded, memory)  # [B, L, D]
+    #
+    #         # 4) 예측 + 트렌드 보정 + 역정규화
+    #         pred = self.output_proj(enhanced[:, -1, :])  # [B, H]
+    #         pred = pred + self.trend_corrector(enhanced)
+    #         pred = self.revin_layer(pred.unsqueeze(1), 'denorm').squeeze(1)
+    #         return pred
+    #
+    #     else:
+    #         pred = self.output_proj(encoded[:, -1, :])
+    #         pred = pred + self.trend_corrector(encoded)
+    #         pred = self.revin_layer(pred.unsqueeze(1), 'denorm').squeeze(1)
+    #         return pred
 
     def forward(self, x, mode = 'train'):
         # 입력 정규화 (Normalization)
@@ -170,7 +222,7 @@ class LMMModel(nn.Module):
             return pred
 
 class FeatureModel(nn.Module):
-    def __init__(self, config = TitanConfig, feature_dim = 7):
+    def __init__(self, config = TitanConfigMonthly, feature_dim = 7):
         super().__init__()
         # MemoryEncoder (Titan 기반 인코더)
         # - 시계열 데이터를 Transformer 기반 구조로 인코딩
