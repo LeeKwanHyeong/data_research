@@ -13,10 +13,10 @@ import mlflow.pytorch
 class TitanTrain:
     def __init__(self):
         self.titan_config = TitanConfigMonthly()
-        # mlflow.set_tracking_uri("file:///Users/igwanhyeong/mlruns")  # 또는 원하는 로컬 경로
+        mlflow.set_tracking_uri("file:///Users/igwanhyeong/mlruns")  # 또는 원하는 로컬 경로
         # mlflow.set_tracking_uri("http://<GPU서버IP>:5000")  # Docker MLflow UI 주소
-        mlflow.set_tracking_uri("http://host.docker.internal:5000")
-        mlflow.set_experiment("TitanForecasting")
+        # mlflow.set_tracking_uri("http://host.docker.internal:5000")
+        # mlflow.set_experiment("TitanForecasting")
 
 
     def base_train(self, model, train_loader, val_loader, epochs, lr = 1e-3, device = 'cuda'):
@@ -101,7 +101,7 @@ class TitanTrain:
                              val_loader,
                              epochs = 100,
                              lr = 1e-3,
-                             device = 'cuda',
+                             device = 'cuda' if torch.cuda.is_available() else 'mps',
                              tta_steps = 0,
                              patience = 30,
                              max_grad_norm = 30):
