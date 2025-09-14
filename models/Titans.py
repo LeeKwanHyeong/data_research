@@ -1,16 +1,15 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import torch.optim as optim
 
-from layers.RevIN import RevIN
-from layers.Titans_Memory import MemoryEncoder, LMM
-from layers.TrendCorrector import TrendCorrector
+from models.layers.RevIN import RevIN
+from models.layers.Titans_Memory import MemoryEncoder, LMM
+from models.layers.TrendCorrector import TrendCorrector
 
 
 class TitanConfig:
     batch_size = 128              # 한 번의 학습/추론에서 처리할 시계열 샘플 개수 (배치 크기)
-    lookback = 36                 # 입력 시계열의 과거 타임스텝 길이 (모델 입력 시 고려하는 시점 수)
+    lookback = 12                 # 입력 시계열의 과거 타임스텝 길이 (모델 입력 시 고려하는 시점 수)
     input_dim = 1                  # 각 타임스텝에서의 피처(feature) 개수 (예: 단변량=1, 다변량>1)
     d_model = 64                   # 모델 내부 임베딩 차원 (토큰/패치가 변환되는 은닉 공간의 차원)
     n_layers = 2                   # Transformer 또는 Titan 블록의 층(layer) 개수
@@ -18,7 +17,7 @@ class TitanConfig:
     d_ff = 256                     # 피드포워드 네트워크(FFN) 내부 차원 (확장된 은닉층 크기)
     contextual_mem_size = 64       # MAC(Memory-as-Context)에서 사용하는 컨텍스트 메모리 슬롯 개수
     persistent_mem_size = 16       # MAC에서 사용하는 영구 메모리(persistent memory) 슬롯 개수
-    output_horizon = 48            # 예측할 미래 타임스텝 길이 (출력 시점 수)
+    horizon = 60            # 예측할 미래 타임스텝 길이 (출력 시점 수)
 
 
 class Model(nn.Module):
@@ -50,7 +49,7 @@ class Model(nn.Module):
 
         # 출력 투영 레이어
         # - 인코더의 은닉 상태(d_model)를 미래 예측 시점(output_horizon) 길이로 변환
-        self.output_proj = nn.Linear(config.d_model, config.output_horizon)
+        self.output_proj = nn.Linear(config.d_model, config.horizon)
 
     def forward(self, x):
 
@@ -107,7 +106,7 @@ class LMMModel(nn.Module):
         # - d_model 차원을 output_horizon 길이로 변환
         # - Softplus 활성화 → 예측값이 항상 0 이상이 되도록 보장
         self.output_proj = nn.Sequential(
-            nn.Linear(config.d_model, config.output_horizon),
+            nn.Linear(config.d_model, config.horizon),
             nn.Softplus()
         )
 
@@ -116,7 +115,7 @@ class LMMModel(nn.Module):
         # - 모델이 장기적인 패턴을 안정적으로 예측하도록 보조
         self.trend_corrector = TrendCorrector(
             d_model = config.d_model,
-            output_horizon = config.output_horizon
+            output_horizon = config.horizon
         )
 
     def forward(self, x, mode = 'train'):
@@ -124,6 +123,7 @@ class LMMModel(nn.Module):
         x = self.revin_layer(x, 'norm') # [batch, seq_len, input_dim]
         # 인코딩 (Encoding)
         encoded = self.encoder(x) # [batch, seq_len, d_model]
+        B = encoded.size(0)
 
         if mode == 'train':
             # 학습 시, Encoder Layer의 Contextual Memory 수집
@@ -133,8 +133,21 @@ class LMMModel(nn.Module):
                 if mem is not None:
                     contextual_memory.append(mem)
 
-            # 가장 마지막 레이어의 Contextual Memory 수집
-            memory = contextual_memory[-1] if contextual_memory else torch.empty_like(encoded)
+            if len(contextual_memory) > 0:
+                mem = contextual_memory[-1] # [M, d_model]
+                if mem.dim() == 2:
+                    mem = mem.unsqueeze(0).expand(B, -1, -1) # [B, M, d_model]로 broadcast
+                elif mem.dim() == 3 and mem.size(0) != B:
+                    mem = mem[:1].expand(B, -1, -1)
+                memory = mem
+            else:
+                # Context Memory가 없으면, 안전한 기본값 사용
+                # Ex) 입력과 동일 차원 대체 or 0 memory 1 slot
+                memory = encoded.new_zeros(B, 1, encoded.size(-1))
+
+
+            # # 가장 마지막 레이어의 Contextual Memory 수집
+            # memory = contextual_memory[-1] if contextual_memory else torch.empty_like(encoded)
 
             # LMM(Local Memory Matching) 적용
             enhanced = self.lmm(encoded, memory) # [batch, seq_len, d_model]
@@ -178,7 +191,7 @@ class FeatureModel(nn.Module):
 
         # 출력 투영 레이어
         # - 최종 결합된 은닉 상태를 미래 시계열 길이(output_horizon)로 변환
-        self.output_proj = nn.Linear(config.d_model, config.output_horizon)
+        self.output_proj = nn.Linear(config.d_model, config.horizon)
 
     def forward(self, x, feature_x):
         # 시계열 인코딩

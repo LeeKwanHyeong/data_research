@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 
-from layers.RevIN import RevIN
+from models.layers.RevIN import RevIN
 class PatchMixerConfig:
     enc_in = 1
     lookback_window = 36
