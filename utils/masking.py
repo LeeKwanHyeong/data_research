@@ -1,6 +1,6 @@
 import torch
 
-class TriangularCasualMask():
+class TriangularCasualMask:
     def __init__(self, B, L, device = 'cpu'):
         mask_shape = [B, 1, L, L]
         with torch.no_grad():
@@ -10,7 +10,7 @@ class TriangularCasualMask():
     def mask(self):
         return self._mask
 
-class ProbMask():
+class ProbMask:
     def __init__(self, B, H, L, index, scores, device = 'cpu'):
         _mask = torch.ones(L, scores.shape[-1], dtype = torch.bool).to(device).triu(1)
         _mask_ex = _mask[None, None, :].expand(B, H, L, scores.shape[-1])

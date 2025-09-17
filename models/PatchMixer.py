@@ -1,18 +1,9 @@
 import torch
 import torch.nn as nn
 
+from model_runner.model_configs import PatchMixerConfig
 from models.layers.RevIN import RevIN
-class PatchMixerConfig:
-    enc_in = 1
-    lookback_window = 36
-    batch_size = 128
-    horizon = 48
-    patch_len = 16
-    stride = 8
-    mixer_kernel_size = 8
-    d_model = 16
-    head_dropout = 0.1
-    e_layers = 2
+
 
 # 기존 PatchMixerLayer 그대로 사용
 class PatchMixerLayer(nn.Module):

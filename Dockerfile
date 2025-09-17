@@ -1,21 +1,27 @@
-# CUDA 12.8 + PyTorch 환경 기반 이미지
-FROM nvidia/cuda:12.8.0-cudnn8-runtime-ubuntu22.04
+FROM pytorch/pytorch:2.4.1-cuda12.1-cudnn9-runtime
 
-# 필수 패키지 설치
-RUN apt update && apt install -y \
-    python3 python3-pip git curl nano
+# 시스템 패키지 설치
+RUN apt-get update && apt-get install -y \
+    git curl wget build-essential \
+    && rm -rf /var/lib/apt/lists/*
 
-# pip 업그레이드 및 ML 관련 패키지 설치
-RUN pip3 install --upgrade pip && \
-    pip3 install torch torchvision torchaudio \
-    pandas scikit-learn matplotlib \
-    mlflow fastapi uvicorn
-
-# 작업 디렉토리 지정
+# 작업 디렉토리
 WORKDIR /app
 
-# Mac에서 만든 코드 복사 예정 위치
+# 코드 복사
 COPY . /app
 
-# 컨테이너 실행 시 기본 명령어
-CMD ["python3", "train.py"]
+# 패키지 설치
+RUN pip install --upgrade pip
+RUN pip install -r requirements.txt
+
+# 실행 명령
+CMD ["python", "main.py"]
+
+
+
+
+#docker build --no-cache -t titan-trainer .
+
+#docker run --rm --gpus all -p 5000:5000 -v "C:/Users/USER/PycharmProjects/research/data:/app/data" titan-trainer
+#pytorch/pytorch:2.4.1-cuda12.1-cudnn9-runtime

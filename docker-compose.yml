@@ -1,0 +1,26 @@
+version: "3.8"
+
+services:
+  titan-trainer:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: titan-trainer
+    volumes:
+      - ./data:/app/data
+      - ./mlruns:/app/mlruns
+    environment:
+      - MLFLOW_TRACKING_URI=file:///app/mlruns
+    command: ["python", "main.py"]
+
+  mlflow-ui:
+    image: ghcr.io/mlflow/mlflow:v3.4.0rc0
+    container_name: mlflow-ui
+    ports:
+      - "5000:5000"
+    volumes:
+      - ./mlruns:/mlflow/mlruns
+    environment:
+      - MLFLOW_BACKEND_STORE_URI=/mlflow/mlruns
+      - MLFLOW_DEFAULT_ARTIFACT_ROOT=/mlflow/mlruns
+    command: mlflow ui --host 0.0.0.0 --port 5000
