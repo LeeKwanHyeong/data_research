@@ -151,7 +151,8 @@ def plot_anchored_forecasts_yyyymm(
     hist_months = DateUtil.month_seq_ending_before(plan_yyyymm, lookback)  # [L]
     fut_months = DateUtil.next_n_months_from(plan_yyyymm, H, include_anchor=include_anchor)  # [H]
 
-    mp_group = {}  # 파트별 month->value 맵 (빠른 조회)
+    # 파트별 month->value 맵 (빠른 조회)
+    mp_group = {}
     for part in set(parts[:k]):
         sdf = pdf[pdf[part_col] == part].sort_values(date_col)
         months = sdf[date_col].astype(np.int64).to_numpy()
@@ -159,62 +160,185 @@ def plot_anchored_forecasts_yyyymm(
         mp_group[part] = {int(m): float(v) for m, v in zip(months, vals)}
 
     for i, part in enumerate(parts[:k]):
-        """
-           - parts 순서와 y_hat 행 순서가 일치한다고 가정
-           - include_anchor=False: x축 미래 달력은 plan+1 ~ plan+120
-             include_anchor=True : plan ~ plan+119
-           """
-        os.makedirs(outdir, exist_ok=True)
+        mp = mp_group.get(part, {})
+        sdf = pdf[pdf[part_col] == part].sort_values(date_col)
 
-        pdf = df.to_pandas()
-        preds = y_hat.detach().cpu().numpy()
-        H = preds.shape[1]
+        # 전체 실측 (정수 YYYYMM → datetime)
+        all_m_int = sdf[date_col].astype(np.int64).to_numpy()
+        all_v = sdf[qty_col].astype(float).to_numpy()
+        all_m_dt = DateUtil.yyyymm_to_datetime(all_m_int)
 
-        # 입력 히스토리 달력(앵커 직전 L개월) & 미래 달력 (정수 → datetime으로 변환 예정)
-        hist_months = DateUtil.month_seq_ending_before(plan_yyyymm, lookback)  # [L]
-        fut_months = DateUtil.next_n_months_from(plan_yyyymm, H, include_anchor=include_anchor)  # [H]
+        # 히스토리 (정수 → datetime)
+        hist_vals = np.array([mp.get(int(m), np.nan) for m in hist_months], dtype=float)
+        hist_dt = DateUtil.yyyymm_to_datetime(hist_months)
 
-        # 파트별 month->value 맵 (빠른 조회)
-        mp_group = {}
-        for part in set(parts[:k]):
-            sdf = pdf[pdf[part_col] == part].sort_values(date_col)
-            months = sdf[date_col].astype(np.int64).to_numpy()
-            vals = sdf[qty_col].astype(float).to_numpy()
-            mp_group[part] = {int(m): float(v) for m, v in zip(months, vals)}
+        # 예측 (정수 → datetime)
+        pred = preds[i]
+        fut_dt = DateUtil.yyyymm_to_datetime(fut_months)
 
-        for i, part in enumerate(parts[:k]):
-            mp = mp_group.get(part, {})
-            sdf = pdf[pdf[part_col] == part].sort_values(date_col)
+        # 플롯 (datetime 축)
+        fig, ax = plt.subplots(figsize=(11, 4))
+        ax.plot(all_m_dt, all_v, linewidth=3.0, alpha=0.35, label="actual (full)", zorder=1)
+        ax.plot(hist_dt, hist_vals, linewidth=2.0, label=f"history (L={lookback})", zorder=2)
+        ax.plot(fut_dt, pred, linewidth=2.0, label=f"forecast (+{H})", zorder=3)
 
-            # 전체 실측 (정수 YYYYMM → datetime)
-            all_m_int = sdf[date_col].astype(np.int64).to_numpy()
-            all_v = sdf[qty_col].astype(float).to_numpy()
-            all_m_dt = DateUtil.yyyymm_to_datetime(all_m_int)
+        ax.set_title(f"oper_part_no={part} | plan={plan_yyyymm} | include_anchor={include_anchor}")
+        ax.set_xlabel("time")
+        ax.set_ylabel(qty_col)
+        ax.grid(True)
+        ax.legend()
 
-            # 히스토리 (정수 → datetime)
-            hist_vals = np.array([mp.get(int(m), np.nan) for m in hist_months], dtype=float)
-            hist_dt = DateUtil.yyyymm_to_datetime(hist_months)
+        # 날짜 축 포맷(월 단위 눈금)
+        ax.xaxis.set_major_locator(mdates.MonthLocator(interval=3))  # 3개월 간격 눈금
+        ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m"))
+        for lbl in ax.get_xticklabels():
+            lbl.set_rotation(45)
+        fig.tight_layout()
+        plt.show()
 
-            # 예측 (정수 → datetime)
-            pred = preds[i]
-            fut_dt = DateUtil.yyyymm_to_datetime(fut_months)
 
-            # 플롯 (datetime 축)
-            fig, ax = plt.subplots(figsize=(11, 4))
-            ax.plot(all_m_dt, all_v, linewidth=3.0, alpha=0.35, label="actual (full)", zorder=1)
-            ax.plot(hist_dt, hist_vals, linewidth=2.0, label=f"history (L={lookback})", zorder=2)
-            ax.plot(fut_dt, pred, linewidth=2.0, label=f"forecast (+{H})", zorder=3)
+def plot_two_preds_same_ylim(
+    x_batch: torch.Tensor,
+    y_hat_a: torch.Tensor,           # (B, H) 예: preds_anchor_ims
+    y_hat_b: torch.Tensor,           # (B, H) 예: preds_anchor_dms
+    y_true: torch.Tensor | None = None,
+    parts=None,
+    k: int = 3,
+    target_channel: int = 0,
+    outdir: str = "./plots",
+    prefix: str = "ims_vs_dms",
+    label_a: str = "IMS",
+    label_b: str = "DMS",
+    use_percentile_limits: bool = True,
+):
+    os.makedirs(outdir, exist_ok=True)
 
-            ax.set_title(f"oper_part_no={part} | plan={plan_yyyymm} | include_anchor={include_anchor}")
-            ax.set_xlabel("time")
-            ax.set_ylabel(qty_col)
-            ax.grid(True)
-            ax.legend()
+    x_cpu = x_batch.detach().cpu()
+    if x_cpu.dim() == 2:
+        x_cpu = x_cpu.unsqueeze(-1)  # [B,L] -> [B,L,1]
+    B, L, C = x_cpu.shape
 
-            # 날짜 축 포맷(월 단위 눈금)
-            ax.xaxis.set_major_locator(mdates.MonthLocator(interval=3))  # 3개월 간격 눈금
-            ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m"))
-            for lbl in ax.get_xticklabels():
-                lbl.set_rotation(45)
-            fig.tight_layout()
-            plt.show()
+    ya = y_hat_a.detach().cpu(); yb = y_hat_b.detach().cpu()
+    H = ya.shape[1]
+    assert yb.shape[1] == H, "두 예측의 horizon 길이가 달라요."
+
+    yt = y_true.detach().cpu() if (y_true is not None) else None
+    Ht = yt.shape[1] if yt is not None else None
+
+    # 공통 y축
+    vals = []
+    for i in range(min(B, k)):
+        vals.append(_finite(x_cpu[i, :, target_channel].numpy()))
+        vals.append(_finite(ya[i, :].numpy()))
+        vals.append(_finite(yb[i, :].numpy()))
+        if yt is not None:
+            vals.append(_finite(yt[i, :min(Ht, H)].numpy()))
+    all_vals = np.concatenate([v for v in vals if v.size > 0]) if vals else np.array([0.0])
+
+    if use_percentile_limits and all_vals.size > 0:
+        y_lo = np.percentile(all_vals, 1); y_hi = np.percentile(all_vals, 99)
+        if y_lo == y_hi: y_lo -= 1.0; y_hi += 1.0
+    else:
+        y_lo = np.nanmin(all_vals) if all_vals.size > 0 else -1.0
+        y_hi = np.nanmax(all_vals) if all_vals.size > 0 else 1.0
+        if not np.isfinite(y_lo): y_lo = -1.0
+        if not np.isfinite(y_hi): y_hi = 1.0
+        if y_lo == y_hi: y_lo -= 1.0; y_hi += 1.0
+
+    # 샘플 플롯
+    num = min(B, k)
+    for i in range(num):
+        hist = x_cpu[i, :, target_channel].numpy()
+        a = ya[i].numpy()
+        b = yb[i].numpy()
+        gt = yt[i].numpy() if yt is not None else None
+
+        t_hist = np.arange(L)
+        t_pred = np.arange(L, L + H)
+
+        fig, ax = plt.subplots(figsize=(10, 4))
+        ax.plot(t_hist, hist, label="history")
+        ax.plot(t_pred, a, label=f"{label_a}(+{H})")
+        ax.plot(t_pred, b, label=f"{label_b}(+{H})")
+        if gt is not None:
+            ax.plot(t_pred[:min(H, Ht)], gt[:min(H, Ht)], label="ground truth")
+
+        ax.set_ylim(y_lo, y_hi)
+        title = f"Sample {i}"
+        if parts is not None and len(parts) > i:
+            title += f" | part={parts[i]}"
+        ax.set_title(title); ax.set_xlabel("time"); ax.set_ylabel("value")
+        ax.legend(); ax.grid(True)
+        fig.tight_layout()
+
+        # fn = os.path.join(outdir, f"{prefix}_sample{i}.png")
+        # fig.savefig(fn, dpi=150); plt.show(); plt.close(fig)
+        # print(f"Saved: {fn}")
+
+def plot_anchored_forecasts_yyyymm_multi(
+    df: pl.DataFrame,
+    parts: list[str],
+    preds_dict: dict[str, torch.Tensor],  # {"IMS": (N,H), "DMS": (N,H)}
+    plan_yyyymm: int,
+    lookback: int,
+    part_col: str = "oper_part_no",
+    date_col: str = "demand_dt",
+    qty_col: str = "demand_qty",
+    k: int = 6,
+    include_anchor: bool = False,
+    outdir: str = "./plots",
+    prefix: str = "anchored_compare"
+):
+    os.makedirs(outdir, exist_ok=True)
+    pdf = df.to_pandas()
+
+    # 텐서 → numpy
+    preds_np = {lbl: t.detach().cpu().numpy() for lbl, t in preds_dict.items()}
+    # 공통 H 확인
+    Hs = {lbl: arr.shape[1] for lbl, arr in preds_np.items()}
+    H = list(Hs.values())[0]
+    assert all(h == H for h in Hs.values()), f"H mis-match {Hs}"
+
+    # 달력
+    hist_months = DateUtil.month_seq_ending_before(plan_yyyymm, lookback)
+    fut_months  = DateUtil.next_n_months_from(plan_yyyymm, H, include_anchor=include_anchor)
+
+    # 파트별 전체 시계열 캐시
+    mp_group = {}
+    for part in set(parts[:k]):
+        sdf = pdf[pdf[part_col] == part].sort_values(date_col)
+        months = sdf[date_col].astype(np.int64).to_numpy()
+        vals = sdf[qty_col].astype(float).to_numpy()
+        mp_group[part] = {int(m): float(v) for m, v in zip(months, vals)}
+
+    for i, part in enumerate(parts[:k]):
+        mp = mp_group.get(part, {})
+        sdf = pdf[pdf[part_col] == part].sort_values(date_col)
+
+        all_m_int = sdf[date_col].astype(np.int64).to_numpy()
+        all_v     = sdf[qty_col].astype(float).to_numpy()
+        all_m_dt  = DateUtil.yyyymm_to_datetime(all_m_int)
+
+        hist_vals = np.array([mp.get(int(m), np.nan) for m in hist_months], dtype=float)
+        hist_dt   = DateUtil.yyyymm_to_datetime(hist_months)
+        fut_dt    = DateUtil.yyyymm_to_datetime(fut_months)
+
+        fig, ax = plt.subplots(figsize=(11, 4))
+        ax.plot(all_m_dt, all_v, linewidth=3.0, alpha=0.35, label="actual (full)", zorder=1)
+        ax.plot(hist_dt, hist_vals, linewidth=2.0, label=f"history (L={lookback})", zorder=2)
+
+        # 여러 예측 라인
+        for lbl, arr in preds_np.items():
+            pred = arr[i]
+            ax.plot(fut_dt, pred, linewidth=2.0, label=f"{lbl} (+{H})", zorder=3)
+
+        ax.set_title(f"oper_part_no={part} | plan={plan_yyyymm} | include_anchor={include_anchor}")
+        ax.set_xlabel("time"); ax.set_ylabel(qty_col)
+        ax.grid(True); ax.legend()
+        ax.xaxis.set_major_locator(mdates.MonthLocator(interval=3))
+        ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m"))
+        for lbl in ax.get_xticklabels(): lbl.set_rotation(45)
+        fig.tight_layout()
+        # fn = os.path.join(outdir, f"{prefix}_{part}.png")
+        # fig.savefig(fn, dpi=150); plt.show(); plt.close(fig)
+        # print(f"Saved: {fn}")

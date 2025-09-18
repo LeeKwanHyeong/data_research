@@ -5,9 +5,9 @@ import polars as pl
 import sys
 
 from data_loader.TimeSeriesModule import MultiPartDataModule
-from model_runner.model_train import TitanTrain
+from model_runner.train.titanl_train import TitanTrain
 from models.Titans import TitanConfigMonthly, LMMModel
-import os
+
 # import mlflow
 # mlflow.set_tracking_uri("file:///app/mlruns")
 # mlflow.set_experiment("TitanForecasting")

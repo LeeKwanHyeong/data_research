@@ -1,9 +1,21 @@
-class PatchMixerConfig:
+class PatchMixerConfigMonthly:
     enc_in = 1
-    lookback_window = 36
+    lookback = 36
     batch_size = 128
     horizon = 48
     patch_len = 16
+    stride = 8
+    mixer_kernel_size = 8
+    d_model = 16
+    head_dropout = 0.1
+    e_layers = 2
+
+class PatchMixerConfigWeekly:
+    enc_in = 1
+    lookback = 54
+    batch_size = 128
+    horizon = 27
+    patch_len = 48
     stride = 8
     mixer_kernel_size = 8
     d_model = 16
