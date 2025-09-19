@@ -92,6 +92,107 @@ class MultiPartTrainingDataset(Dataset):
             self.part_ids[idx]
         )
 
+class MultiPartAnchoredInferenceByYYYYWW(Dataset):
+    """
+    주차(YYYYWW, ISO week) 기준 앵커드 추론 입력 생성용 Dataset.
+
+    df: pl.DataFrame({'oper_part_no': str, 'demand_wk': int(YYYYWW), 'demand_qty': float})
+    plan_yyyyww: int (예: 202252). '그 이후부터' 예측하려면,
+      - 입력은 plan_yyyyww '직전' L주
+      - 첫 예측 주차는 보통 plan_yyyyww (포함) 또는 plan+1 (이후) → 플롯/추론단에서 결정
+    fill_missing: 'ffill' | 'zero' | 'nan'
+      - 입력 윈도우 내 존재하지 않는 주를 어떻게 채울지
+    parts_filter: 특정 part만 추론하고 싶을 때 리스트/셋 전달
+    target_horizon: ffill 백트래킹 시 최대로 뒤로 거슬러갈 주 수(보호용)
+    """
+
+    def __init__(self,
+                 df: pl.DataFrame,
+                 lookback: int,
+                 plan_yyyyww: int,
+                 part_col: str = 'oper_part_no',
+                 date_col: str = 'demand_wk',     # 주차 컬럼명(정수 YYYYWW)
+                 qty_col: str = 'demand_qty',
+                 parts_filter=None,
+                 fill_missing: str = 'ffill',
+                 target_horizon: int = 104):       # 2년치 백업 탐색 기본
+        self.lookback = int(lookback)
+        self.plan_yyyyww = int(plan_yyyyww)
+        self.part_col = part_col
+        self.date_col = date_col
+        self.qty_col = qty_col
+        assert fill_missing in ('ffill', 'zero', 'nan')
+        self.fill_missing = fill_missing
+        self.target_horizon = int(target_horizon)
+
+        self.inputs: list[np.ndarray] = []     # 각 파트 입력 시퀀스 [L]
+        self.part_ids: list[str] = []          # part_no
+        self.hist_yyyyww: list[list[int]] = [] # 각 파트의 윈도우 주차 리스트
+
+        parts_set = set(parts_filter) if parts_filter is not None else None
+
+        # 파트별 그룹
+        grouped = df.partition_by(part_col)
+        for g in grouped:
+            part = g[part_col][0]
+            if parts_set is not None and part not in parts_set:
+                continue
+
+            gd = g.select([date_col, qty_col]).sort(date_col)
+            weeks = gd[date_col].to_numpy().astype(np.int64)   # YYYYWW (ISO week)
+            values = gd[qty_col].to_numpy().astype(float)
+
+            if len(weeks) == 0:
+                continue
+
+            # 입력 윈도우(앵커 직전 L주)
+            win_weeks = DateUtil.week_seq_ending_before(self.plan_yyyyww, self.lookback)  # 길이 L
+            mp = {int(w): float(v) for w, v in zip(weeks, values)}
+            earliest = int(weeks.min())
+
+            x = np.empty(self.lookback, dtype=float)
+            ok = True
+            for i, ww in enumerate(win_weeks):
+                if ww in mp:
+                    x[i] = mp[ww]
+                else:
+                    if self.fill_missing == 'zero':
+                        x[i] = 0.0
+                    elif self.fill_missing == 'nan':
+                        x[i] = np.nan
+                    else:  # ffill: 직전 관측으로 채움(없으면 0)
+                        prev = ww
+                        found = False
+                        for _ in range(self.target_horizon):
+                            prev = DateUtil.add_weeks_yyyyww(prev, -1)  # 1주 뒤로
+                            if prev < earliest:
+                                break
+                            if prev in mp:
+                                x[i] = mp[prev]
+                                found = True
+                                break
+                        if not found:
+                            x[i] = 0.0
+
+            if self.fill_missing == 'nan' and not np.any(np.isfinite(x)):
+                ok = False
+            if not ok:
+                continue
+
+            self.inputs.append(x)
+            self.part_ids.append(part)
+            self.hist_yyyyww.append(list(win_weeks))
+
+    def __len__(self):
+        return len(self.inputs)
+
+    def __getitem__(self, idx):
+        # (L,1) 텐서와 part_id 반환
+        return (
+            torch.tensor(self.inputs[idx], dtype=torch.float32).unsqueeze(-1),
+            self.part_ids[idx]
+        )
+
 
 class MultiPartAnchoredInferenceByYYYYMM(Dataset):
     """
@@ -200,9 +301,17 @@ class MultiPartDataModule:
         - Inference용 DataLoader 생성
         - 내부적으로 config 객체를 활용 (lookback, horizon 등)
     """
-    def __init__(self, df: pl.DataFrame, config, batch_size = 64, val_ratio = 0.2, shuffle = True, seed = 42):
+    def __init__(self,
+                 df: pl.DataFrame,
+                 config,
+                 is_running,
+                 batch_size = 64,
+                 val_ratio = 0.2,
+                 shuffle = True,
+                 seed = 42):
         self.df = df
         self.config = config
+        self.is_running = is_running
         self.batch_size = batch_size
         self.val_ratio = val_ratio
         self.shuffle = shuffle
@@ -265,17 +374,30 @@ class MultiPartDataModule:
         )
         return self.inference_loader
 
-    def get_inference_loader_at_plan(self, plan_yyyymm: int, parts_filter = None, fill_missing: str = 'ffill'):
-        ds = MultiPartAnchoredInferenceByYYYYMM(
-            df = self.df,
-            lookback = self.config.lookback,
-            plan_yyyymm = plan_yyyymm,
-            part_col = 'oper_part_no',
-            date_col = 'demand_dt',
-            qty_col = 'demand_qty',
-            parts_filter = parts_filter,
-            fill_missing = fill_missing
-        )
+    def get_inference_loader_at_plan(self, plan_dt: int, parts_filter = None, fill_missing: str = 'ffill'):
+        if self.is_running:
+            ds = MultiPartAnchoredInferenceByYYYYWW(
+                df = self.df,
+                lookback = self.config.lookback,
+                plan_yyyyww = plan_dt,
+                part_col = 'oper_part_no',
+                date_col = 'demand_dt',
+                qty_col = 'demand_qty',
+                parts_filter = parts_filter,
+                fill_missing = fill_missing
+            )
+
+        else:
+            ds = MultiPartAnchoredInferenceByYYYYMM(
+                df = self.df,
+                lookback = self.config.lookback,
+                plan_yyyymm = plan_dt,
+                part_col = 'oper_part_no',
+                date_col = 'demand_dt',
+                qty_col = 'demand_qty',
+                parts_filter = parts_filter,
+                fill_missing = fill_missing
+            )
 
         return DataLoader(ds, batch_size = self.batch_size, shuffle = False)
 

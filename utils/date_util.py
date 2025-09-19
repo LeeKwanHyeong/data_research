@@ -1,5 +1,7 @@
 # ==== DateUtil: YYYYMM 전용 유틸 추가 ====
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
+from typing import List, Iterable
+
 import numpy as np
 import pandas as pd
 import polars as pl
@@ -98,6 +100,83 @@ class DateUtil:
         y2 = y + m0 // 12
         m2 = (m0 % 12) + 1
         return y2 * 100 + m2
+
+    @staticmethod
+    def add_weeks_yyyyww(yyyyww: int, delta_weeks: int) -> int:
+        year = int(yyyyww) // 100
+        week = int(yyyyww) % 100
+        if week < 1 or week > 53:
+            raise ValueError(f"Invalid ISO week in yyyyww={yyyyww} (week must be 1..53)")
+        try:
+            d = date.fromisocalendar(year, week, 1)  # Monday of that ISO week
+        except ValueError as e:
+            raise ValueError(f"Invalid yyyyww={yyyyww}: {e}")
+        d2 = d + timedelta(weeks=int(delta_weeks))
+        iso = d2.isocalendar()
+        return int(iso[0]) * 100 + int(iso[1])
+
+    @staticmethod
+    def week_seq_ending_before(plan_yyyyww: int, lookback: int) -> List[int]:
+        """
+        plan_yyyyww '직전' 주부터 과거로 거슬러 올라가며 lookback개 주차(YYYYWW)를 반환.
+        반환은 오래된→최근 순 (모델 입력 히스토리와 동일한 시간 진행 방향).
+        예) plan=202452, lookback=3  => [202449, 202450, 202451]
+        """
+        if lookback <= 0:
+            return []
+        # plan 직전 주부터 시작
+        cur = DateUtil.add_weeks_yyyyww(plan_yyyyww, -1)
+        seq = [cur]
+        for _ in range(lookback - 1):
+            cur = DateUtil.add_weeks_yyyyww(cur, -1)
+            seq.append(cur)
+        seq.reverse()  # 오래된→최근
+        return seq
+
+    @classmethod
+    def next_n_weeks_from(cls,
+                          plan_yyyyww: int,
+                          n: int,
+                          include_anchor: bool = False) -> List[int]:
+        """
+        plan_yyyyww를 기준으로 미래 주차 시퀀스(길이 n)를 반환.
+        - include_anchor=False: plan+1주, plan+2주, ... 로 H개
+        - include_anchor=True : plan주, plan+1주, ... 로 H개
+        """
+        if n <= 0:
+            return []
+        cur = plan_yyyyww if include_anchor else cls.add_weeks_yyyyww(plan_yyyyww, +1)
+        seq = [cur]
+        for _ in range(n - 1):
+            cur = cls.add_weeks_yyyyww(cur, +1)
+            seq.append(cur)
+        return seq
+
+    @staticmethod
+    def yyyyww_to_datetime(weeks: Iterable[int] | int):
+        """
+        YYYYWW(ISO week) -> 해당 주의 '월요일' datetime으로 변환.
+        - 입력이 스칼라면 단일 datetime.date 반환
+        - 입력이 리스트/배열이면 numpy datetime64[D] 배열 반환
+        """
+
+        def _one(wk: int) -> date:
+            y = int(wk) // 100
+            w = int(wk) % 100
+            if w < 1 or w > 53:
+                raise ValueError(f"Invalid ISO week in yyyyww={wk} (week must be 1..53)")
+            try:
+                return date.fromisocalendar(y, w, 1)  # Monday
+            except ValueError as e:
+                raise ValueError(f"Invalid yyyyww={wk}: {e}")
+
+        if isinstance(weeks, (int, np.integer)):
+            return _one(int(weeks))
+
+        # iterable
+        dates = [_one(int(w)) for w in weeks]
+        # numpy datetime64[D]로 반환하면 matplotlib 등과 궁합이 좋습니다.
+        return np.array(dates, dtype='datetime64[D]')
 
     @staticmethod
     def months_between_yyyymm(start: int, end: int, inclusive: bool = False) -> int:

@@ -111,6 +111,7 @@ class PatchMixer_DMSForecaster:
 
         # First Block
         y0 = self._call_model(x)
+
         Hm = y0.size(-1) if y0.dim() >= 2 else y0.numel() // B
         H = int(horizon)
 

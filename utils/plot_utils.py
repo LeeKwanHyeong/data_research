@@ -342,3 +342,87 @@ def plot_anchored_forecasts_yyyymm_multi(
         # fn = os.path.join(outdir, f"{prefix}_{part}.png")
         # fig.savefig(fn, dpi=150); plt.show(); plt.close(fig)
         # print(f"Saved: {fn}")
+
+def plot_anchored_forecasts_yyyyww_multi(
+    df: pl.DataFrame,
+    parts: list[str],
+    preds_dict: dict[str, torch.Tensor],  # {"IMS": (N,H), "DMS": (N,H), ...}
+    plan_yyyyww: int,
+    lookback: int,
+    part_col: str = "oper_part_no",
+    date_col: str = "demand_dt",     # 주차 컬럼 (정수 YYYYWW)
+    qty_col: str = "demand_qty",
+    k: int = 6,
+    include_anchor: bool = False,     # False → plan+1주부터 H주, True → plan주 포함
+    outdir: str = "./plots",
+    prefix: str = "anchored_compare_weekly",
+    save: bool = True
+):
+    os.makedirs(outdir, exist_ok=True)
+    pdf = df.to_pandas()
+
+    # 텐서 → numpy
+    preds_np = {lbl: t.detach().cpu().numpy() for lbl, t in preds_dict.items()}
+
+    # 공통 H 체크
+    Hs = {lbl: arr.shape[1] for lbl, arr in preds_np.items()}
+    H = list(Hs.values())[0]
+    assert all(h == H for h in Hs.values()), f"H mis-match {Hs}"
+
+    # 주차 달력
+    hist_weeks = DateUtil.week_seq_ending_before(plan_yyyyww, lookback)            # 길이 L
+    fut_weeks  = DateUtil.next_n_weeks_from(plan_yyyyww, H, include_anchor=include_anchor)
+
+    # 파트별 전체 시계열 캐시
+    mp_group = {}
+    for part in set(parts[:k]):
+        sdf = pdf[pdf[part_col] == part].sort_values(date_col)
+        weeks = sdf[date_col].astype(np.int64).to_numpy()
+        vals  = sdf[qty_col].astype(float).to_numpy()
+        mp_group[part] = {int(w): float(v) for w, v in zip(weeks, vals)}
+
+    for i, part in enumerate(parts[:k]):
+        mp = mp_group.get(part, {})
+        sdf = pdf[pdf[part_col] == part].sort_values(date_col)
+
+        # 전체 실측 (YYYYWW → datetime)
+        all_w_int = sdf[date_col].astype(np.int64).to_numpy()
+        all_v     = sdf[qty_col].astype(float).to_numpy()
+        all_w_dt  = DateUtil.yyyyww_to_datetime(all_w_int)
+
+        # 히스토리 (YYYYWW → datetime)
+        hist_vals = np.array([mp.get(int(w), np.nan) for w in hist_weeks], dtype=float)
+        hist_dt   = DateUtil.yyyyww_to_datetime(hist_weeks)
+
+        # 미래 (YYYYWW → datetime)
+        fut_dt    = DateUtil.yyyyww_to_datetime(fut_weeks)
+
+        # 플롯
+        fig, ax = plt.subplots(figsize=(11, 4))
+        ax.plot(all_w_dt,  all_v,     linewidth=3.0, alpha=0.35, label="actual (full)", zorder=1)
+        ax.plot(hist_dt,   hist_vals, linewidth=2.0,  label=f"history (L={lookback})", zorder=2)
+
+        # 여러 예측 라인
+        for lbl, arr in preds_np.items():
+            pred = arr[i]
+            ax.plot(fut_dt, pred, linewidth=2.0, label=f"{lbl} (+{H}w)", zorder=3)
+
+        ax.set_title(f"oper_part_no={part} | plan={plan_yyyyww} | include_anchor={include_anchor}")
+        ax.set_xlabel("time"); ax.set_ylabel(qty_col)
+        ax.grid(True); ax.legend()
+
+        # 주차 데이터지만, x축은 월 단위 메이저 눈금이 보기 좋습니다.
+        ax.xaxis.set_major_locator(mdates.MonthLocator(interval=1))
+        ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m"))
+        for lbl_tick in ax.get_xticklabels():
+            lbl_tick.set_rotation(45)
+
+        fig.tight_layout()
+
+        # if save:
+        #     fn = os.path.join(outdir, f"{prefix}_{part}.png")
+        #     fig.savefig(fn, dpi=150)
+        #     print(f"Saved: {fn}")
+
+        plt.show()
+        plt.close(fig)

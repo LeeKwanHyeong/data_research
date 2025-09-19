@@ -6,14 +6,18 @@ import torch.nn as nn
 import torch.optim as optim
 from torch import GradScaler, amp
 
+from utils.helper import quantile_coverage, interval_coverage_width
 # import mlflow
 # import mlflow.pytorch
 
 # 간헐수요 가중/손실 유틸
 from utils.losses import (
+    intermittent_weights_balanced,
     intermittent_pinball_loss,
     intermittent_point_loss,
-    newsvendor_q_star
+    newsvendor_q_star,
+    pinball_plain,
+    pinball_loss_weighted_masked,
 )
 
 from models.Titans import TestTimeMemoryManager
@@ -94,28 +98,37 @@ class PatchMixerTrain:
             # pred: (B, Q, H)
             if is_val and not val_use_weights:
                 # 검증은 가중 없이 공정 평가(권장)
-                return intermittent_pinball_loss(
-                    pred, y, quantiles = quantiles, alpha_zero = alpha_zero,
-                    alpha_pos = alpha_pos, gamma_run = gamma_run, cap = cap,
-                    use_horizon_decay = False # 검증에서는 일반적으로 horizon 가중 비적용
-                ) if use_intermittent and val_use_weights else \
-                    intermittent_pinball_loss(
-                    pred, y, quantiles = quantiles, alpha_zero = alpha_zero,
-                        alpha_pos = alpha_pos, gamma_run = gamma_run,
-                    cap = cap, use_horizon_decay = False
-                ) * 0 + \
-                intermittent_pinball_loss(
-                    pred, y, quantiles = quantiles,
-                    alpha_zero = alpha_zero, alpha_pos = alpha_pos, gamma_run = gamma_run,
-                    cap = cap, use_horizon_decay = False
-                ) # 형태 유지용 (간단히 기본 핀볼 한 번 더 부르지 않고 싶다면 별도 비가중 구현 가능)
+                # return intermittent_pinball_loss(
+                #     pred, y, quantiles = quantiles, alpha_zero = alpha_zero,
+                #     alpha_pos = alpha_pos, gamma_run = gamma_run, cap = cap,
+                #     use_horizon_decay = False # 검증에서는 일반적으로 horizon 가중 비적용
+                # ) if use_intermittent and val_use_weights else \
+                #     intermittent_pinball_loss(
+                #     pred, y, quantiles = quantiles, alpha_zero = alpha_zero,
+                #         alpha_pos = alpha_pos, gamma_run = gamma_run,
+                #     cap = cap, use_horizon_decay = False
+                # ) * 0 + \
+                # intermittent_pinball_loss(
+                #     pred, y, quantiles = quantiles,
+                #     alpha_zero = alpha_zero, alpha_pos = alpha_pos, gamma_run = gamma_run,
+                #     cap = cap, use_horizon_decay = False
+                # ) # 형태 유지용 (간단히 기본 핀볼 한 번 더 부르지 않고 싶다면 별도 비가중 구현 가능)
+                return pinball_plain(pred, y, quantiles)  # 검증은 비가중
             else:
-                return intermittent_pinball_loss(
-                    pred, y, quantiles = quantiles,
-                    alpha_zero = alpha_zero if use_intermittent else 0.0, # 간헐 비활성 시 효과 거의 없음
-                    alpha_pos = alpha_pos, gamma_run = gamma_run, cap = cap,
-                    use_horizon_decay = use_horizon_decay, tau_h = tau_h
-                )
+                # return intermittent_pinball_loss(
+                #     pred, y, quantiles = quantiles,
+                #     alpha_zero = alpha_zero if use_intermittent else 0.0, # 간헐 비활성 시 효과 거의 없음
+                #     alpha_pos = alpha_pos, gamma_run = gamma_run, cap = cap,
+                #     use_horizon_decay = use_horizon_decay, tau_h = tau_h
+                # )
+                if use_intermittent:
+                    w = intermittent_weights_balanced(
+                        y, alpha_zero=alpha_zero, alpha_pos=alpha_pos,
+                        gamma_run=gamma_run, clip_run=0.5
+                    )
+                else:
+                    w = None
+                return pinball_loss_weighted_masked(pred, y, quantiles, weights=w)
         else: # point
             if is_val and not val_use_weights:
                 # 검증은 비가중 손실(공정 평가)
@@ -199,6 +212,8 @@ class PatchMixerTrain:
                 y_batch = y_batch.to(device)
 
                 optimizer.zero_grad(set_to_none = True)
+                warmup_epochs = max(1, int(0.2 * epochs))  # 처음 20% 에폭 워밍업 예시
+                alpha_zero_eff = alpha_zero * min(1.0, epoch / warmup_epochs)
                 with amp.autocast('cuda'):
                     pred = self._forward_model(model, x_batch)
                     loss = self._compute_loss(
@@ -208,7 +223,7 @@ class PatchMixerTrain:
                         q_star = q_star,
                         quantiles = quantiles,
                         use_intermittent = use_intermittent,
-                        alpha_zero = alpha_zero, alpha_pos = alpha_pos,
+                        alpha_zero = alpha_zero_eff, alpha_pos = alpha_pos,
                         gamma_run = gamma_run,
                         use_horizon_decay = use_horizon_decay,
                         tau_h = tau_h, is_val = False,
@@ -278,10 +293,35 @@ class PatchMixerTrain:
                     break
 
             current_lr = scheduler.get_last_lr()[0]
-            print(
+            # print(
+            #     f"Epoch {epoch + 1}/{epochs} | LR {current_lr:.6f}"
+            #     f"| Train {avg_train_loss:.8f} | Val {avg_val_loss:.8f} "
+            #     f"| Diff {abs(avg_train_loss - avg_val_loss):.8f}"
+            # )
+
+            # pred_val: (B, H) or (B, Q, H)
+            if pred_val.dim() == 3:
+                # 예: (0.1, 0.5, 0.9)
+                cov_dict = quantile_coverage(pred_val, y_val, quantiles=quantiles, reduce="overall")
+                iv80 = interval_coverage_width(pred_val, y_val, lower_q=0.1, upper_q=0.9, reduce="overall")
+                # 누적 통계용(에폭 평균을 찍고 싶으면 리스트에 append 후 epoch 말에 평균)
+                # 여기서는 간단히 마지막 배치 기준으로 로그(원하면 누적 평균으로 변경)
+                cov_per_q = cov_dict["coverage_per_q"].detach().cpu().numpy()
+                iv_cov = float(iv80["interval_cov"].detach().cpu())
+                iv_wid = float(iv80["interval_wid"].detach().cpu())
+            else:
+                cov_per_q, iv_cov, iv_wid = None, None, None
+
+            line = (
                 f"Epoch {epoch + 1}/{epochs} | LR {current_lr:.6f}"
-                f"| Train {avg_val_loss:.4f} | Val {avg_val_loss:.4f}"
+                f" | Train {avg_train_loss:.6f} | Val {avg_val_loss:.6f}"
+                f" | Diff {abs(avg_train_loss - avg_val_loss):.6f}"
             )
+            if pred_val.dim() == 3:
+                # 예: (0.1,0.5,0.9) 기준 coverage
+                line += f" | COV[q]: " + ",".join(f"{c:.3f}" for c in cov_per_q)
+                line += f" | I80(cov/wid): {iv_cov:.3f}/{iv_wid:.3f}"
+            print(line)
 
         model.load_state_dict(best_state)
         return model, train_losses, val_losses

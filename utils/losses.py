@@ -4,8 +4,11 @@ import torch.nn.functional as F
 import torch
 
 __all__ = [
+    "pinball_plain",
     "pinball_loss_weighted",
+    "pinball_loss_weighted_masked",
     "intermittent_weights",
+    "intermittent_weights_balanced",
     "intermittent_pinball_loss",     # 멀티-분위수용 간헐 가중 핀볼 래퍼
     "intermittent_point_loss",       # 점추정(MAE/MSE/Huber/단일핀볼)용 간헐 가중 래퍼
     "intermittent_nll_loss",         # 분포형(NLL)용 간헐 가중 래퍼
@@ -53,6 +56,66 @@ def intermittent_weights(
     if cap is not None:
         w = torch.clamp(w, max = float(cap))
     return w
+
+def intermittent_weights_balanced(target: torch.Tensor,
+                                   alpha_zero: float = 1.2,
+                                   alpha_pos: float = 1.0,
+                                   gamma_run: float = 0.6,
+                                   clip_run: float = 0.5,
+                                   eps: float = 1e-8) -> torch.Tensor:
+    """
+    zero/positive 각각 평균 1로 정규화된 가중.
+    연속 0 보너스는 norm 후 clip_run 상한으로 제한해 과도한 0-편향 예방.
+    """
+    # run-length
+    B, H = target.shape
+    run = torch.zeros_like(target)
+    for t in range(H):
+        if t == 0:
+            run[:, t] = (target[:, t] == 0).to(target.dtype)
+        else:
+            run[:, t] = torch.where(target[:, t] == 0, run[:, t-1] + 1.0, torch.zeros_like(run[:, t-1]))
+
+    norm_run = (run / max(1, H)).clamp(max=clip_run)
+
+    is_zero = (target == 0).to(target.dtype)
+    is_pos  = 1.0 - is_zero
+
+    w_zero = alpha_zero * is_zero * (1.0 + gamma_run * norm_run)
+    w_pos  = alpha_pos  * is_pos
+
+    m_zero = (w_zero.sum() / (is_zero.sum() + eps)).clamp_min(eps)
+    m_pos  = (w_pos.sum()  / (is_pos.sum()  + eps)).clamp_min(eps)
+
+    w = (w_zero / m_zero) + (w_pos / m_pos)
+    return w
+
+def pinball_plain(pred_q, y, quantiles=(0.1, 0.5, 0.9)):
+    diff = y.unsqueeze(1) - pred_q  # (B,Q,H)
+    losses = [torch.maximum(q*diff[:,i], (q-1)*diff[:,i]).mean()
+              for i, q in enumerate(quantiles)]
+    return sum(losses) / len(losses)
+
+
+def pinball_loss_weighted_masked(pred_q: torch.Tensor,
+                                  target: torch.Tensor,
+                                  quantiles: Tuple[float, ...],
+                                  weights: torch.Tensor | None = None,
+                                  eps: float = 1e-8) -> torch.Tensor:
+    """
+    하위 분위수(q<0.5)에만 가중 적용. 나머지는 비가중 평균.
+    pred_q: (B,Q,H), target: (B,H), weights: (B,H)
+    """
+    diff = target.unsqueeze(1) - pred_q
+    losses = []
+    for i, q in enumerate(quantiles):
+        e = torch.maximum(q * diff[:, i], (q - 1.0) * diff[:, i])  # (B,H)
+        if (weights is not None) and (q < 0.5):
+            e = (e * weights).sum() / (weights.sum() + eps)
+        else:
+            e = e.mean()
+        losses.append(e)
+    return sum(losses) / len(losses)
 
 # -------------------------------------------------------
 # 멀티-분위수 예측용: Weighted Pinball Loss

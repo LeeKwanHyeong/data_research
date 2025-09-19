@@ -3,7 +3,6 @@
 # -------------------------
 import copy
 
-from model_runner.model_configs import PatchMixerConfigMonthly
 import torch
 import torch.nn as nn
 
@@ -68,7 +67,7 @@ class PatchMixerBackbone(nn.Module):
     output: (B, a * d_model) # Global patch representation(mean variable concatenate)
     """
     def __init__(self,
-                 configs: PatchMixerConfigMonthly,
+                 configs,
                  revin: bool = True,
                  affine: bool = True,
                  subtract_last: bool = False,
@@ -178,7 +177,7 @@ class MultiScalePatchMixerBackbone(nn.Module):
     - 각 분기 출력 (a_i * d_model) -> per-branch Linear로 per_branch_dim 정렬 -> 융합
     """
     def __init__(self,
-                 base_configs: PatchMixerConfigMonthly,
+                 base_configs,
                  patch_cfgs: ((4, 2, 5), (8, 4, 7), (12, 6, 9)),  # (patch_len, stride, kernel)
                  per_branch_dim: int = 128,
                  fused_dim: int = 256,
@@ -245,7 +244,7 @@ class PatchMixerBackboneWithPatcher(nn.Module):
     output: (B, A*D) *변수 축 평균 집약
     """
     def __init__(self,
-                 configs: PatchMixerConfigMonthly,
+                 configs,
                  patcher: nn.Module,  # DynamicPatcherMoS or DynamicOffsetPatcher 등
                  e_layers: int | None = None,  # block 수 오버라이드 가능
                  dropout_rate: float | None = None,
