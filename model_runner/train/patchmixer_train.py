@@ -11,7 +11,7 @@ from utils.helper import quantile_coverage, interval_coverage_width
 # import mlflow.pytorch
 
 # 간헐수요 가중/손실 유틸
-from utils.losses import (
+from utils.custom_loss_utils import (
     intermittent_weights_balanced,
     intermittent_point_loss,
     newsvendor_q_star,
@@ -180,11 +180,12 @@ class PatchMixerTrain:
                    tau_h: float = 24.0,
                    # 기타
                    patience: int = 50,
-                   max_grad_norm: float = 30.0
+                   max_grad_norm: float = 30.0,
+                   t_max = 10
                    ):
         model.to(device)
         optimizer = optim.AdamW(model.parameters(), lr = lr, weight_decay = 1e-4)
-        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max = epochs)
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max = t_max)
         scaler = GradScaler()
 
         # if point pinball

@@ -336,7 +336,7 @@ def evaluate_PatchMixer(model, loader, device = 'cpu', q_use: float = 0.5, retur
     return all_preds, part_ids # (B, H) or (B, Q, H), [part_id,...]
 
 @torch.no_grad()
-def evaluate_PatchMixer_with_truth(model, loader, device = 'cpu', q_use: float = 0.5, return_full: bool = False):
+def evaluate_with_truth(model, loader, device ='cpu', q_use: float = 0.5, return_full: bool = False):
     model.to(device)
     model.eval()
 

@@ -100,10 +100,11 @@ class TitanTrain:
                              device = 'cuda' if torch.cuda.is_available() else 'cpu',
                              tta_steps = 0,
                              patience = 30,
-                             max_grad_norm = 30):
+                             max_grad_norm = 30,
+                             t_max = 10):
         model.to(device)
         optimizer = optim.AdamW(model.parameters(), lr = lr, weight_decay = 1e-4)
-        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max = epochs)
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max = t_max)
         loss_fn = nn.MSELoss()
         scaler = GradScaler()
         tta_manager = TestTimeMemoryManager(model, lr = lr)
