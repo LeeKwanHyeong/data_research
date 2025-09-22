@@ -2,14 +2,14 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 
-from model_runner.model_configs import TitanConfigMonthly
+from model_runner.model_configs import TitanConfig
 from models.layers.RevIN import RevIN
 from models.layers.Titans_Memory import MemoryEncoder, LMM
 from models.layers.TrendCorrector import TrendCorrector
 
 
 class Model(nn.Module):
-    def __init__(self, config = TitanConfigMonthly):
+    def __init__(self, config: TitanConfig):
         super().__init__()
 
         # RevIN (Reversible Instance Normalization) 레이어
@@ -42,7 +42,7 @@ class Model(nn.Module):
     def forward(self, x):
 
         # Input Normalization
-        x = self.revin_layer(x) # [batch, seq_len, input_dim]
+        x = self.revin_layer(x, 'norm') # [batch, seq_len, input_dim]
 
         # Encoding
         encoded = self.encoder(x) # [batch, seq_len, d_model]
@@ -56,7 +56,7 @@ class Model(nn.Module):
         return pred
 
 class LMMModel(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config: TitanConfig):
         super().__init__()
 
         # RevIN (Reversible Instance Normalization)
@@ -106,60 +106,61 @@ class LMMModel(nn.Module):
             output_horizon = config.horizon
         )
 
-
+    # --------------------------- Train ---------------------------
     def forward(self, x, mode = 'train'):
         # 입력 정규화 (Normalization)
         x = self.revin_layer(x, 'norm') # [batch, seq_len, input_dim]
         # 인코딩 (Encoding)
         encoded = self.encoder(x) # [batch, seq_len, d_model]
-        B = encoded.size(0)
+        B, L, D = encoded.size(0)
 
         if mode == 'train':
-            # 학습 시, Encoder Layer의 Contextual Memory 수집
-            contextual_memory = []
+            # ------ Memory 조립 강화: contextual + persistent + encoded ------
+            mem_chunks = []
+
+            # 1) contextual memory
+            ctx = None
             for layer in self.encoder.layers:
-                mem = layer.attn.contextual_memory
-                if mem is not None:
-                    contextual_memory.append(mem)
+                m = getattr(layer.attn, 'contextual_memory', None)
+                if m is not None and m.numel() > 0:
+                    ctx = m
 
-            if len(contextual_memory) > 0:
-                mem = contextual_memory[-1] # [M, d_model]
-                if mem.dim() == 2:
-                    mem = mem.unsqueeze(0).expand(B, -1, -1) # [B, M, d_model]로 broadcast
-                elif mem.dim() == 3 and mem.size(0) != B:
-                    mem = mem[:1].expand(B, -1, -1)
-                memory = mem
-            else:
-                # Context Memory가 없으면, 안전한 기본값 사용
-                # Ex) 입력과 동일 차원 대체 or 0 memory 1 slot
-                memory = encoded.new_zeros(B, 1, encoded.size(-1))
+            if ctx is not None:
+                if ctx.dim() == 2:                          # [M, D] -> [B, M, D]
+                    ctx = ctx.unsqueeze(0).expand(B, -1, -1)
+                elif ctx.dim() == 3 and ctx.size(0) != B:   # [B', M, D] -> [B, M, D]
+                    ctx = ctx.expand(B, -1, -1)
+                mem_chunks.append(ctx)
+
+            # 2) persistent memory
+            pm = getattr(self.encoder.layers[-1].attn, 'persistent_memory', None) #[M_p, D]
+            if pm is not None and pm.numel() > 0:
+                pmB = pm.unsqueeze(0).expand(B, -1, -1)
+                mem_chunks.append(pmB)
+
+            # 3) fallback: encoded token 자체도 메모리에 포함
+            mem_chunks.append(encoded)                  # [B, L, D]
+            memory = torch.cat(mem_chunks, dim = 1)     # [B, M_tot, D]
 
 
-            # # 가장 마지막 레이어의 Contextual Memory 수집
-            # memory = contextual_memory[-1] if contextual_memory else torch.empty_like(encoded)
-
-            # LMM(Local Memory Matching) 적용
-            enhanced = self.lmm(encoded, memory) # [batch, seq_len, d_model]
-
-            # 미래 시점 예측
-            pred = self.output_proj(enhanced[:, -1, :]) # [batch, output_horizon]
-
-            # 추세 보정
-            pred = pred + self.trend_corrector(enhanced)
-
-            # 역 정규화
-            pred = self.revin_layer(pred.unsqueeze(1), 'denorm').squeeze(1) # [batch, output_horizon]
+            # 4) Final Step
+            enhanced = self.lmm(encoded, memory)
+            pred = self.output_proj(enhanced[:, -1, :])
+            pred = pred + self.trend_corrector(enhanced[:, -1, :])
+            pred = self.revin_layer(pred.unsqueeze(1), 'denorm').squeeze(1)
             return pred
 
+        # --------------------------- Inference ---------------------------
         else:
-            # 추론 시, LMM 생략 -> 단순 Encoder 출력 사용
-            pred = self.output_proj(encoded[:, -1, :]) # [batch, output_horizon]
-            pred = pred + self.trend_corrector(encoded) # 추세 보정
-            pred = self.revin_layer(pred.unsqueeze(1), 'denorm').unsqueeze(1) # 역정규화
+            # 추론 시에도 Trend 보정을 위한 시퀀스가 필요하므로 encoded 전달은 유지
+            pred = self.output_proj(encoded[:, -1, :])
+            pred = pred + self.trend_corrector(encoded)
+            pred = self.revin_layer(pred.unsqueeze(1), 'denorm').squeeze(1)
             return pred
+
 
 class FeatureModel(nn.Module):
-    def __init__(self, config = TitanConfigMonthly, feature_dim = 7):
+    def __init__(self, config: TitanConfig, feature_dim = 7):
         super().__init__()
         # MemoryEncoder (Titan 기반 인코더)
         # - 시계열 데이터를 Transformer 기반 구조로 인코딩

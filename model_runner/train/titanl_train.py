@@ -5,7 +5,7 @@ import torch.nn as nn
 import torch.optim as optim
 from torch import GradScaler, amp
 
-from models.Titans import TitanConfigMonthly, TestTimeMemoryManager
+from models.Titan.Titans import TitanConfigMonthly, TestTimeMemoryManager
 # import mlflow
 # import mlflow.pytorch
 

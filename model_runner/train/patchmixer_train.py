@@ -13,14 +13,12 @@ from utils.helper import quantile_coverage, interval_coverage_width
 # 간헐수요 가중/손실 유틸
 from utils.losses import (
     intermittent_weights_balanced,
-    intermittent_pinball_loss,
     intermittent_point_loss,
     newsvendor_q_star,
     pinball_plain,
     pinball_loss_weighted_masked,
 )
 
-from models.Titans import TestTimeMemoryManager
 
 class PatchMixerTrain:
     """

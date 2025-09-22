@@ -107,22 +107,6 @@ class DMSForecaster:
         - 블록을 겹치게 여러 번 예측하고 동일 시점의 값들을 평균.
         - 윈도우 슬라이드(다음 블록 시작)에는 '첫 스텝' 예측을 사용하며,
           필요시 winsorize / multiplicative guard / damp를 적용해 안정화
-
-        :param x_init:
-        :param horizon:
-        :param device:
-        :param context_policy:
-        :param use_winsor:
-        :param use_multi_guard:
-        :param use_dampen:
-        :param clip_q:
-        :param clip_mul:
-        :param max_growth:
-        :param max_step_up:
-        :param max_step_down:
-        :param damp_min:
-        :param damp_max:
-        :return:
         """
         was_training = self.model.training
         self.model.eval()

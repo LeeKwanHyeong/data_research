@@ -2,9 +2,8 @@ import copy
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from model_runner.model_configs import PatchMixerConfigMonthly
-from models.layers.RevIN import RevIN
+
+from model_runner.model_configs import PatchMixerConfig
 from models.patchmixer.backbone import PatchMixerBackbone, MultiScalePatchMixerBackbone
 from models.patchmixer.head import DecompQuantileHead
 
@@ -18,7 +17,7 @@ class PatchMixerModel(nn.Module):
     -> MLP
     -> horizon regression
     """
-    def __init__(self, configs: PatchMixerConfigMonthly = PatchMixerConfigMonthly):
+    def __init__(self, configs: PatchMixerConfig):
         super().__init__()
         self.backbone = PatchMixerBackbone(configs = configs)
 
@@ -49,7 +48,7 @@ class PatchMixerFeatureModel(nn.Module):
     Timeseries + static/exogenous feature combined head.
     feature_input: (B, feature_dim)
     """
-    def __init__(self, configs: PatchMixerConfigMonthly = PatchMixerConfigMonthly, feature_dim: int = 4):
+    def __init__(self, configs: PatchMixerConfig, feature_dim: int = 4):
         super().__init__()
         self.backbone = PatchMixerBackbone(configs = configs)
 
@@ -99,7 +98,7 @@ class PatchMixerQuantileModel(nn.Module):
     output: (B, 3, H) # (q10, q50, q90)
     """
     def __init__(self,
-                 base_configs: PatchMixerConfigMonthly,
+                 base_configs: PatchMixerConfig,
                  patch_cfgs = ((4, 2, 5), (8, 4, 7), (12, 6, 9)),
                  fused_dim: int = 256,
                  horizon: int | None = None,
