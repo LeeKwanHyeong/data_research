@@ -1,11 +1,9 @@
-import copy
-
 import torch
 import torch.nn as nn
 
 from model_runner.model_configs import PatchMixerConfig
 from models.PatchMixer.backbone import PatchMixerBackbone, MultiScalePatchMixerBackbone
-from models.PatchMixer.head import DecompQuantileHead
+from models.PatchMixer.common.head import DecompQuantileHead
 
 
 # -------------------------
