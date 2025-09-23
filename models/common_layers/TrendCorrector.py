@@ -1,7 +1,4 @@
-import torch
 import torch.nn as nn
-import torch.nn.functional as F
-
 
 class TrendCorrector(nn.Module):
     def __init__(self, d_model, output_horizon):

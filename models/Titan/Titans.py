@@ -3,9 +3,9 @@ import torch.nn as nn
 import torch.optim as optim
 
 from model_runner.model_configs import TitanConfig
-from models.layers.RevIN import RevIN
-from models.layers.Titans_Memory import MemoryEncoder, LMM
-from models.layers.TrendCorrector import TrendCorrector
+from models.Titan.Titans_Memory import MemoryEncoder, LMM
+from models.common_layers.RevIN import RevIN
+from models.common_layers.TrendCorrector import TrendCorrector
 
 
 class Model(nn.Module):
