@@ -12,6 +12,13 @@ class TitanConfig:
     contextual_mem_size: int = 64       # MAC(Memory-as-Context)에서 사용하는 컨텍스트 메모리 슬롯 개수
     persistent_mem_size: int = 16       # MAC에서 사용하는 영구 메모리(persistent memory) 슬롯 개수
     horizon: int = 60                   # 예측할 미래 타임스텝 길이 (출력 시점 수)
+
+    # --------------- Decoder -----------------
+    n_dec_layers = 1                    # 1~2 권장
+    dec_dropout = 0.1
+    exo_dim = 0                         # 미래 외생변수 차원(없으면 0)
+    nonneg_head = True                  # 수요 비음수 보장 (Softplus)
+
     @property
     def output_horizon(self) -> int:
         return self.horizon

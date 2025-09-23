@@ -2,11 +2,15 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 
-from model_runner.model_configs import TitanConfig
-from models.Titan.Titans_Memory import MemoryEncoder, LMM
+from models.Titan.backbone import MemoryEncoder
+from models.Titan.common.configs import TitanConfig
+from models.Titan.common.decoder import TitanDecoder
+from models.Titan.common.memory import LMM
 from models.common_layers.RevIN import RevIN
 from models.common_layers.TrendCorrector import TrendCorrector
 
+def _ensure_config_instance(config):
+    return config() if isinstance(config, type) else config
 
 class Model(nn.Module):
     def __init__(self, config: TitanConfig):
@@ -158,6 +162,79 @@ class LMMModel(nn.Module):
             pred = self.revin_layer(pred.unsqueeze(1), 'denorm').squeeze(1)
             return pred
 
+# ---- Seq2Seq 모델 (Encoder + Causal Decoder) ----
+class LMMSeq2SeqModel(nn.Module):
+    """
+    MemoryEncoder + light Causal Decoder로 H-step 한 번에 출력(DMS).
+    """
+    def __init__(self, config: TitanConfig):
+        super().__init__()
+        config = _ensure_config_instance(config)
+        self.config = config
+        self.horizon = getattr(config, 'horizon', getattr(config, 'output_horizon', None))
+        assert self.horizon is not None, 'config.horizon is required'
+
+        self.revin_layer = RevIN(num_features = config.input_dim, affine = True, subtract_last = True)
+
+        self.encoder = MemoryEncoder(
+            config.input_dim,
+            config.d_model,
+            config.n_layers,
+            config.n_heads,
+            config.d_ff,
+            config.contextual_mem_size,
+            config.persistent_mem_size
+        )
+
+        n_dec_layers = getattr(config, 'n_dec_layers', 1)
+        dec_dropout = getattr(config, 'dec_dropout', 0.1)
+        exo_dim = getattr(config, 'exo_dim', 0)
+
+        self.decoder = TitanDecoder(
+            d_model = config.d_model,
+            n_layers = n_dec_layers,
+            n_heads = config.n_heads,
+            d_ff = config.d_ff,
+            dropout = dec_dropout,
+            horizon = self.horizon,
+            exo_dim = exo_dim,
+            causal = True
+        )
+
+        self.output_proj = nn.Sequential(
+            nn.Linear(config.d_model, 1),
+            nn.Softplus() if getattr(config, 'nonneg_head', True) else nn.Identity()
+        )
+
+        self.trend_corrector = TrendCorrector(
+            d_model = config.d_model,
+            output_horizon = self.horizon
+        )
+
+    def forward(self, x, future_exo: torch.Tensor | None = None, mode: str = 'train'):
+        """
+        x:          [B, L, C]
+        future_exo: [B, L, exo_dim] or None
+        return:     [B, H]
+        """
+        # 1) RevIN Normalization
+        x = self.revin_layer(x, 'norm')
+
+        # 2) Encode
+        enc = self.encoder(x)                   # [B, L, D]
+
+        # 3) Decode
+        dec = self.decoder(enc, future_exo)     # [B, H, D]
+
+        # 4) Head
+        y = self.output_proj(dec).squeeze(-1)   # [B, H]
+
+        # 5) Trend Corrector
+        y = y + self.trend_corrector(enc)       # [B, H]
+
+        # 6) RevIN Denormalization
+        y = self.revin_layer(y.unsqueeze(1), 'denorm').squeeze(1)   # [B, H]
+        return y
 
 class FeatureModel(nn.Module):
     def __init__(self, config: TitanConfig, feature_dim = 7):

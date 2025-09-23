@@ -6,7 +6,7 @@ import copy
 import torch
 import torch.nn as nn
 
-from models.layers.RevIN import RevIN
+from models.common_layers.RevIN import RevIN
 
 
 # -------------------------
@@ -76,20 +76,20 @@ class PatchMixerBackbone(nn.Module):
         self.configs = configs
 
         # basic hyperparameter
-        self.n_vals = configs.enc_in
-        self.lookback = configs.lookback
-        self.forecasting = configs.horizon
-        self.patch_size = configs.patch_len
-        self.stride = configs.stride
-        self.kernel_size = configs.mixer_kernel_size
+        self.n_vals: int = configs.enc_in
+        self.lookback: int = configs.lookback
+        self.forecasting: int = configs.horizon
+        self.patch_size: int = configs.patch_len
+        self.stride: int = configs.stride
+        self.kernel_size: int = configs.mixer_kernel_size
 
         # patch num calculation (+1은 패딩으로 1 patch 더 확보)
         base = int((self.lookback - self.patch_size) / self.stride + 1)
-        self.patch_num = base + 1
-        self.a = self.patch_num
-        self.d_model = configs.d_model
-        self.dropout_rate = configs.head_dropout
-        self.depth = configs.e_layers
+        self.patch_num: int = base + 1
+        self.a: int = self.patch_num
+        self.d_model: int = configs.d_model
+        self.dropout_rate: float = configs.head_dropout
+        self.depth: int = configs.e_layers
 
         # output dimension (representation size of backbone output)
         self.patch_repr_dim = self.a * self.d_model
