@@ -176,7 +176,7 @@ class KShapeClusteringGPU(ClusterMixin, BaseEstimator):
         self.max_iter = max_iter
 
     '''
-        Fit the K-shape clustering model to data X
+        Fit the K-shape Clustering model to data X
         Stores resulting labels_ and centroids_
     '''
     def fit(self, X, y = None):
@@ -215,7 +215,7 @@ class KShapeClusteringGPU(ClusterMixin, BaseEstimator):
         return idx, centroids
 
     '''
-        Core clustering algorithm using torch tensors
+        Core Clustering algorithm using torch tensors
     '''
     def _fit(self, x, k, centroid_init = 'zero', max_iter = 100):
         x = x.detach().clone().to(device=device).to(torch.float32)

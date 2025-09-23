@@ -1,4 +1,46 @@
 from dataclasses import dataclass, field
+from typing import Optional
+
+
+@dataclass
+class PatchTSTConfig:
+    c_in: int
+    target_dim: int
+    patch_len: int
+    stride: int
+    num_patch: int
+    lookback: int = 36
+    horizon: int = 48
+    n_layers: int = 3
+    d_model: int = 128
+    n_heads: int = 16
+    shared_embedding = True
+    d_ff: int = 256
+    norm: str = 'BatchNorm'
+    attn_dropout: float = 0.
+    dropout: float = 0.
+    act: str = 'gelu'
+    res_attention: bool = True
+    pre_norm: bool = False
+    store_attn: bool = False
+    pe: str = 'zeros'
+    learn_pe: bool = True
+    head_dropout: int = 0
+    head_type = 'prediction'
+    individual = False
+    y_range: Optional[tuple] = None
+    verbose: bool = False
+
+@dataclass
+class PatchTSTConfigMonthly(PatchTSTConfig):
+    lookback: int = 36
+    horizon: int = 48
+
+@dataclass
+class PatchTSTConfigWeekly(PatchTSTConfig):
+    lookback: int = 54
+    horizon: int = 27
+
 
 @dataclass
 class PatchMixerConfig:

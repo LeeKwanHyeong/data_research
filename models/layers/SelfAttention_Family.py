@@ -32,6 +32,63 @@ class FullAttention(nn.Module):
         else:
             return (V.contiguous(), None)
 
+class FullAttentionWithLogits(FullAttention):
+    """
+    - return_logits = True: (out, attn, logits) 반환
+    - use_realformer_residual = True: 이전 logits(prev_logits)을 현재 logits에 더함
+    """
+    def __init__(self,
+                 mask_flag = True,
+                 factor = 5,
+                 scale = None,
+                 attention_dropout = 0.1,
+                 output_attention = False,
+                 return_logits = False,
+                 use_realformer_residual = False):
+        super().__init__(
+            mask_flag = mask_flag,
+            factor = factor,
+            scale = scale,
+            attention_dropout = attention_dropout,
+            output_attention = output_attention
+        )
+        self.return_logits = return_logits
+        self.use_realformer_residual = use_realformer_residual
+
+    def forward(self, queries, keys, values, attn_mask, prev_logits = None):
+        B, L, H, E = queries.shape
+        _, S, _, D = values.shape
+
+        scale = self.scale or 1. / sqrt(E)
+        # (B, H, L, S)
+        scores = torch.einsum('blhe,bshe->bhls', queries, keys) * scale
+
+        # RealFormer-style residual on logits
+        if self.use_realformer_residual and (prev_logits is not None):
+            # prev_logits expected shape: (B, H, L, S)
+            scores = scores + prev_logits
+
+        # masking
+        if self.mask_flag:
+            if attn_mask is None:
+                attn_mask = TriangularCasualMask(B, L, device = queries.device)
+            neg_inf = torch.finfo(scores.dtype).min
+            scores = scores.masked_fill(attn_mask.mask, neg_inf)
+
+        A = torch.softmax(scores, dim = -1)
+        A = self.dropout(A)
+
+        V = torch.einsum('bhls,bshd->bhls', A, values)
+
+        if self.output_attention and self.return_logits:
+            return V.contiguous(), A, scores
+        elif self.output_attention:
+            return V.contiguous(), A
+        elif self.return_logits:
+            return V.contiguous(), None, scores
+        else:
+            return V.contiguous(), None
+
 class ProbAttention(nn.Module):
     def __init__(self, mask_flag = True, factor = 5, scale = None, attention_dropout = 0.1, output_attention = False):
         super(ProbAttention, self).__init__()
@@ -152,3 +209,38 @@ class AttentionLayer(nn.Module):
 
         out = out.view(B, L, -1)
         return self.out_projection(out), attn
+
+class AttentionLayerWithPrev(nn.Module):
+    def __init__(self,
+                 attention,
+                 d_model,
+                 n_heads,
+                 d_keys = None,
+                 d_values = None):
+        super().__init__()
+        d_keys = d_keys or (d_model // n_heads)
+        d_values = d_values or (d_model // n_heads)
+        self.inner_attention = attention
+        self.query_projection = nn.Linear(d_model, d_keys * n_heads)
+        self.key_projection = nn.Linear(d_model, d_keys * n_heads)
+        self.value_projection = nn.Linear(d_model, d_values * n_heads)
+        self.out_projection = nn.Linear(d_values * n_heads, d_model)
+        self.n_heads = n_heads
+
+    def forward(self, queries, keys, values, attn_mask, prev_logits = None):
+        B, L, _ = queries.shape
+        _, S, _ = keys.shape
+        H = self.n_heads
+
+        Q = self.query_projection(queries).reshape(B, L, H, -1)
+        K = self.key_projection(keys).reshape(B, S, H, -1)
+        V = self.value_projection(values).reshape(B, S, H, -1)
+
+        # 내부 커널이 prev_logits를 받도록 설계
+        out, attn, *maybe_scores = self.inner_attention(Q, K, V, attn_mask, prev_logits = prev_logits)
+        out = out.reshape(B, L, -1)
+        out = self.out_projection(out)
+
+        if len(maybe_scores) == 1:
+            return out, attn, maybe_scores[0] # logits
+        return out, attn
