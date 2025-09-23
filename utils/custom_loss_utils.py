@@ -278,7 +278,7 @@ def intermittent_point_loss(
         eps: float = 1e-8,
 ) -> torch.Tensor:
     """
-    점추정 모델(Titan/PatchTST_self_supervised 등)에 간헐 가중을 적용한 손실.
+    점추정 모델(Titan/self_supervised 등)에 간헐 가중을 적용한 손실.
     - mode='pinball'이면 τ-quantile 최적화(서비스 비용 기반 q* 사용 가능).
     """
     y_hat = _ensure_float(y_hat)

@@ -1,8 +1,6 @@
-import torch.nn as nn
-
 from model_runner.model_configs import PatchTSTConfig
-from models.PatchTST_self_supervised.backbone import PatchTSTEncoder
-from models.PatchTST_self_supervised.head import *
+from models.PatchTST.self_supervised.backbone import PatchTSTEncoder
+from models.PatchTST.self_supervised.head import *
 
 """
 (a) Backbone (Supervised)
@@ -29,7 +27,7 @@ from models.PatchTST_self_supervised.head import *
     - Add & Norm
 """
 
-class PatchTST(nn.Module):
+class PatchTSTModel(nn.Module):
     '''
     Output dimension:
         [bs x target_dim x nvars] for prediction
@@ -38,7 +36,7 @@ class PatchTST(nn.Module):
         [bs x num_patch x n_vars x patch_len] for pretrain
     '''
 
-    def __init__(self,config: PatchTSTConfig,):
+    def __init__(self,config: PatchTSTConfig):
         super().__init__()
 
         assert config.head_type in ['pretrain', 'prediction', 'regression', 'classification'],\
