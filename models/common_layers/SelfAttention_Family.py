@@ -3,7 +3,7 @@ import torch.nn as nn
 import numpy as np
 from math import sqrt
 
-from utils.masking import TriangularCasualMask, ProbMask
+from utils.masking import TriangularCausalMask, ProbMask
 from typing import Dict, Type, Optional, Tuple
 
 ATTN_REGISTRY: Dict[str, Type[nn.Module]] = {}
@@ -32,7 +32,7 @@ class FullAttention(nn.Module):
 
         if self.mask_flag:
             if attn_mask is None:
-                attn_mask = TriangularCasualMask(B, L, device = queries.device)
+                attn_mask = TriangularCausalMask(B, L, device = queries.device)
 
             scores.masked_fill_(attn_mask.mask, -np.inf)
 
@@ -85,7 +85,7 @@ class FullAttentionWithLogits(FullAttention):
         # masking
         if self.mask_flag:
             if attn_mask is None:
-                attn_mask = TriangularCasualMask(B, L, device = queries.device)
+                attn_mask = TriangularCausalMask(B, L, device = queries.device)
             neg_inf = torch.finfo(scores.dtype).min
             scores = scores.masked_fill(attn_mask.mask, neg_inf)
 
