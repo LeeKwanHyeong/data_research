@@ -3,6 +3,7 @@ import torch.optim as optim
 from torch import nn
 from torch.cuda.amp import GradScaler, autocast
 
+from training.adapters import DefaultAdapter
 from training.losses import LossComputer
 from training.optim import build_optimizer_and_scheduler
 
@@ -10,7 +11,7 @@ from training.optim import build_optimizer_and_scheduler
 class CommonTrainer:
     def __init__(self, cfg, adapter, *, metrics_fn = None, logger = print):
         self.cfg = cfg
-        self.adapter = adapter
+        self.adapter: DefaultAdapter = adapter
         self.logger = logger
         self.loss_comp = LossComputer(cfg)
         self.metrics_fn = metrics_fn # (pred, y) -> dict or None
@@ -63,7 +64,7 @@ class CommonTrainer:
 
         # TTA Initialize
         if self.adapter.uses_tta():
-            self.adapter.tta_rest(model)
+            self.adapter.tta_reset(model)
 
         for epoch in range(self.cfg.epochs):
             # Warming Up: 간헐 가중 alpha_zero 서서히 키우고 싶다면 여기서 cfg 동적 조절
