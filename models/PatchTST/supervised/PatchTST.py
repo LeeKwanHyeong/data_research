@@ -1,12 +1,13 @@
 from typing import Optional
 
 import torch
+from neuralforecast.models.patchtst import PatchTST_backbone
 from torch import nn
 from torch import Tensor
 import torch.nn.functional as F
 import numpy as np
 
-from model_runner.model_configs import PatchTSTConfig
+from models.PatchTST.common.configs import PatchTSTConfig
 
 
 class Model(nn.Module):

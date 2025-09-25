@@ -1,7 +1,10 @@
 from dataclasses import dataclass
 
+from training.config import TrainingConfig
+
+
 @dataclass
-class PatchMixerConfig:
+class PatchMixerConfig(TrainingConfig):
     batch_size: int = 128           # 한 번의 학습/추론에서 처리할 시계열 샘플 개수 (배치 크기)
     lookback: int = 36              # 입력 시계열의 과거 타임스텝 길이 (모델 입력 시 고려하는 시점 수)
     horizon: int = 48               # 예측할 미래 타임스텝 길이 (출력 시점 수)

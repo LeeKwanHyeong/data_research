@@ -1,11 +1,13 @@
 from typing import Optional, Literal, Tuple
 from dataclasses import dataclass, field
 
+from training.config import TrainingConfig
+
 # =========================
 # Attention (Self-Attention) 설정
 # =========================
 @dataclass
-class AttentionConfig:
+class AttentionConfig(TrainingConfig):
     """
         PatchTST의 어텐션 관련 하이퍼파라미터 묶음.
         - 'full'은 표준 Multi-Head Self-Attention
@@ -45,7 +47,7 @@ class HeadConfig:
 # PatchTST 전역 설정
 # =========================
 @dataclass
-class PatchTSTConfig:
+class PatchTSTConfig(TrainingConfig):
     """
        PatchTST의 핵심 하이퍼파라미터 구성.
 
@@ -106,7 +108,7 @@ class PatchTSTConfig:
     # ---------- 서브 설정 ----------
     attn: AttentionConfig = field(default_factory=AttentionConfig)
     head: HeadConfig = field(default_factory=HeadConfig)
-
+    decomp: DecompositionConfig = DecompositionConfig()
 
 # =========================
 # 프리셋: 월간/주간 권장 윈도우

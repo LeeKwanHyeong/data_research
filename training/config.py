@@ -3,9 +3,23 @@ from typing import Tuple, Optional, Literal
 
 LossMode = Literal['auto', 'point', 'quantile']
 
+
+@dataclass
+class DecompositionConfig:
+    type: Optional[Literal["none", "ma", "stl"]] = "none"
+    ma_window: int = 7
+    stl_period: int = 12
+    concat_mode: Literal["concat", "residual_only", "trend_only"] = "concat"
+
+
 @dataclass
 class TrainingConfig:
+    # ------------Loader------------
     device: str = 'cuda'
+    lookback: int = 36
+    horizon: int = 48
+
+    # ------------Training------------
     epochs: int = 100
     lr: float = 1e-3
     weight_decay: float = 1e-4
