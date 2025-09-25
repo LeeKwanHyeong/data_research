@@ -1,428 +1,189 @@
 import os
 import numpy as np
-import torch
 import matplotlib.pyplot as plt
-import polars as pl
-import matplotlib.dates as mdates
-from utils.date_util import DateUtil
+import torch
 
-
-def _finite(a):
-    a = np.asarray(a, dtype=float)
-    return a[np.isfinite(a)]
-
-def plot_ims_samples_same_ylim(
-    x_batch: torch.Tensor,
-    y_hat: torch.Tensor,
-    y_true: torch.Tensor | None = None,
-    parts=None,
-    k: int = 3,
-    target_channel: int = 0,
-    outdir: str = "./plots",
-    prefix: str = "ims_pred",
-    use_percentile_limits: bool = True,  # True면 p1~p99로 축 결정(이상치 영향↓)
-):
-    os.makedirs(outdir, exist_ok=True)
-
-    x_cpu = x_batch.detach().cpu()
-    if x_cpu.dim() == 2:
-        x_cpu = x_cpu.unsqueeze(-1)  # [B,L] -> [B,L,1]
-    B, L, C = x_cpu.shape
-
-    yhat_cpu = y_hat.detach().cpu()
-    H_pred = yhat_cpu.shape[1]
-
-    ytrue_cpu = None
-    H_true = None
-    if y_true is not None:
-        ytrue_cpu = y_true.detach().cpu()
-        H_true = ytrue_cpu.shape[1]
-
-    # ---- 공통 y축 범위 계산 (선택적으로 p1~p99 사용) ----
-    vals = []
-    for i in range(min(B, k)):
-        vals.append(_finite(x_cpu[i, :, target_channel].numpy()))
-        vals.append(_finite(yhat_cpu[i, :].numpy()))
-        if ytrue_cpu is not None:
-            vals.append(_finite(ytrue_cpu[i, :min(H_true, H_pred)].numpy()))
-    all_vals = np.concatenate([v for v in vals if v.size > 0]) if vals else np.array([0.0])
-
-    if use_percentile_limits and all_vals.size > 0:
-        y_lo = np.percentile(all_vals, 1)
-        y_hi = np.percentile(all_vals, 99)
-        if y_lo == y_hi:  # 완전 평탄 보호
-            y_lo -= 1.0
-            y_hi += 1.0
-    else:
-        y_lo = np.nanmin(all_vals) if all_vals.size > 0 else -1.0
-        y_hi = np.nanmax(all_vals) if all_vals.size > 0 else 1.0
-        if not np.isfinite(y_lo): y_lo = -1.0
-        if not np.isfinite(y_hi): y_hi = 1.0
-        if y_lo == y_hi:
-            y_lo -= 1.0
-            y_hi += 1.0
-
-    # ---- 샘플별 그래프 ----
-    num = min(B, k)
-    for i in range(num):
-        hist = x_cpu[i, :, target_channel].numpy()
-        pred = yhat_cpu[i].numpy()
-        gt   = ytrue_cpu[i].numpy() if ytrue_cpu is not None else None
-
-        t_hist = np.arange(L)
-        t_pred = np.arange(L, L + H_pred)
-
-        fig, ax = plt.subplots(figsize=(10, 4))
-        ax.plot(t_hist, hist, label="history")
-        ax.plot(t_pred, pred, label=f"prediction(+{H_pred})")
-        if gt is not None:
-            ax.plot(t_pred[:min(H_pred, H_true)], gt[:min(H_pred, H_true)], label="ground truth")
-
-        # 공통 y축 적용
-        ax.set_ylim(y_lo, y_hi)
-
-        # 샘플별 요약 통계(다른 값임을 제목에서 확인)
-        title = f"Sample {i}"
-        if parts is not None and len(parts) > i:
-            title += f" | part={parts[i]}"
-        title += f" | pred[min/med/max]={np.nanmin(pred):.2g}/{np.nanmedian(pred):.2g}/{np.nanmax(pred):.2g}"
-        ax.set_title(title)
-        ax.set_xlabel("time"); ax.set_ylabel("value")
-        ax.legend(); ax.grid(True)
-        fig.tight_layout()
-
-        fn = os.path.join(outdir, f"{prefix}_sample{i}.png")
-        fig.savefig(fn, dpi=150); plt.show(); plt.close(fig)
-        print(f"Saved: {fn}")
-
-def overlay_predictions(
-    y_hat: torch.Tensor,
-    parts=None,
-    idxs: list[int] | None = None,
-    outpath: str = "./plots/ims_overlay.png",
-    title: str = "Overlay of predictions"
-):
+@torch.no_grad()
+def _to_1d_history(x: torch.Tensor) -> np.ndarray:
     """
-    여러 샘플의 예측을 한 그래프에 겹쳐 비교(한 플롯).
+    x 한 샘플에서 과거 시계열(lookback)을 1D로 뽑는다.
+    추정 규칙:
+      - (1, L)            -> (L,)
+      - (1, L, C)         -> 마지막 채널 또는 첫 채널을 사용(여기선 첫 채널)
+      - (1, C, L)         -> 마지막 축이 시간이라고 보고 (L,)
+    그 외 모양이면 빈 배열 반환.
     """
-    os.makedirs(os.path.dirname(outpath), exist_ok=True)
-    y = y_hat.detach().cpu().numpy()
-    B, H = y.shape
-    if idxs is None:
-        idxs = list(range(min(5, B)))  # 기본 5개
+    x = x.squeeze(0)
+    if x.dim() == 1:             # (L,)
+        return x.cpu().numpy()
+    if x.dim() == 2:
+        # (L, C) or (C, L) 둘 다 있을 수 있어 헷갈림
+        # 시간축이 긴 쪽을 시간으로 간주
+        h, w = x.shape
+        if h >= w:
+            # (L, C) 가정 → 첫 채널 사용
+            return x[:, 0].cpu().numpy()
+        else:
+            # (C, L) 가정 → 첫 채널의 시계열
+            return x[0, :].cpu().numpy()
+    return np.array([])
 
-    fig, ax = plt.subplots(figsize=(10, 4))
-    for i in idxs:
-        lbl = f"idx {i}" + (f" ({parts[i]})" if parts is not None and len(parts) > i else "")
-        ax.plot(np.arange(H), y[i], label=lbl)
-    ax.set_title(title); ax.set_xlabel("horizon"); ax.set_ylabel("value")
-    ax.legend(); ax.grid(True)
-    fig.tight_layout(); fig.savefig(outpath, dpi=150); plt.show(); plt.close(fig)
-    print(f"Saved: {outpath}")
-
-
-
-def plot_anchored_forecasts_yyyymm(
-    df: pl.DataFrame,
-    parts: list[str],
-    y_hat: torch.Tensor,            # [N, H]
-    plan_yyyymm: int,
-    lookback: int,
-    part_col: str = "oper_part_no",
-    date_col: str = "demand_dt",
-    qty_col: str = "demand_qty",
-    k: int = 6,
-    include_anchor: bool = False,   # False → plan 다음달부터 120개월
-    outdir: str = "./plots",
-    prefix: str = "anchored_yyyymm_120"
-):
+@torch.no_grad()
+def _predict_any(model, x, device="cpu"):
     """
-    - parts 순서와 y_hat 행 순서가 일치한다고 가정
-    - include_anchor=False: x축 미래 달력은 plan+1 ~ plan+120
-      include_anchor=True : plan ~ plan+119
+    모델 출력 유형을 자동 처리:
+      - (B, H)            -> point
+      - (B, C, H)         -> C==1이면 squeeze, 아니면 첫 채널
+      - (B, Q, H)         -> quantiles로 간주 (Q==3이면 (0.1,0.5,0.9) 가정)
+    반환: dict
+      {"point": (H,),
+       "q": {"q10":(H,), "q50":(H,), "q90":(H,)}  # 있으면
+      }
     """
-    os.makedirs(outdir, exist_ok=True)
+    out = model(x.to(device))
+    if isinstance(out, (tuple, list)):
+        out = out[0]
+    if out.dim() == 2:  # (B, H)
+        return {"point": out.squeeze(0).detach().cpu().numpy()}
+    if out.dim() == 3:  # (B, A, H)
+        B, A, H = out.shape
+        arr = out.squeeze(0).detach().cpu().numpy()  # (A, H)
+        # A==1 -> point
+        if A == 1:
+            return {"point": arr[0]}
+        # A==3 -> 0.1/0.5/0.9 가정
+        if A == 3:
+            return {"point": arr[1], "q": {"q10": arr[0], "q50": arr[1], "q90": arr[2]}}
+        # 그 외엔 중앙 인덱스를 point로
+        mid = A // 2
+        return {"point": arr[mid]}
+    # (B, nvars, H) 같은 케이스
+    if out.dim() == 3 and out.size(1) == 1:
+        return {"point": out[:, 0, :].squeeze(0).detach().cpu().numpy()}
+    # 지원 외 형태
+    y = out.squeeze().detach().cpu().numpy()
+    if y.ndim == 1:
+        return {"point": y}
+    raise RuntimeError(f"Unsupported model output shape: {tuple(out.shape)}")
 
-    pdf = df.to_pandas()
-    preds = y_hat.detach().cpu().numpy()
-    H = preds.shape[1]
+def _align_len(yhat: np.ndarray, H: int):
+    """예측 길이를 H에 맞춤: 1이면 복제, 더 길면 자름, 더 짧으면 NaN 패딩"""
+    yhat = np.asarray(yhat).reshape(-1)
+    if yhat.size == H:
+        return yhat, None
+    if yhat.size == 1:
+        return np.repeat(yhat, H), "[rep]"
+    if yhat.size > H:
+        return yhat[:H], "[cut]"
+    # 1 < size < H
+    pad = np.full(H - yhat.size, np.nan)
+    return np.concatenate([yhat, pad], axis=0), "[pad]"
 
-    # 입력 히스토리 달력(앵커 직전 L개월) & 미래 달력
-    hist_months = DateUtil.month_seq_ending_before(plan_yyyymm, lookback)  # [L]
-    fut_months = DateUtil.next_n_months_from(plan_yyyymm, H, include_anchor=include_anchor)  # [H]
+@torch.no_grad()
+def plot_val_per_part(models: dict, val_loader, out_dir, device="cpu", max_plots=None):
+    """
+    models: {"PatchMixer Base": model, ...}
+    val_loader: (x, y, part_id) or (x, y)
+    - 과거 입력창(x) + 미래 실제(y_true) + 각 모델 예측을 한 그림에.
+    - 분위수 모델은 0.1~0.9 음영, 0.5 중앙선.
+    """
+    os.makedirs(out_dir, exist_ok=True)
+    seen = set()
+    n_plots = 0
 
-    # 파트별 month->value 맵 (빠른 조회)
-    mp_group = {}
-    for part in set(parts[:k]):
-        sdf = pdf[pdf[part_col] == part].sort_values(date_col)
-        months = sdf[date_col].astype(np.int64).to_numpy()
-        vals = sdf[qty_col].astype(float).to_numpy()
-        mp_group[part] = {int(m): float(v) for m, v in zip(months, vals)}
+    for batch in val_loader:
+        if len(batch) == 3:
+            xb, yb, part_ids = batch
+        else:
+            xb, yb = batch
+            part_ids = [f"idx{i}" for i in range(xb.size(0))]
 
-    for i, part in enumerate(parts[:k]):
-        mp = mp_group.get(part, {})
-        sdf = pdf[pdf[part_col] == part].sort_values(date_col)
+        B = xb.size(0)
+        for i in range(B):
+            pid = part_ids[i]
+            if pid in seen:
+                continue
+            seen.add(pid)
 
-        # 전체 실측 (정수 YYYYMM → datetime)
-        all_m_int = sdf[date_col].astype(np.int64).to_numpy()
-        all_v = sdf[qty_col].astype(float).to_numpy()
-        all_m_dt = DateUtil.yyyymm_to_datetime(all_m_int)
+            x = xb[i:i+1]
+            y_true = yb[i:i+1].cpu().numpy().reshape(-1)     # (H,)
+            H = y_true.shape[0]
 
-        # 히스토리 (정수 → datetime)
-        hist_vals = np.array([mp.get(int(m), np.nan) for m in hist_months], dtype=float)
-        hist_dt = DateUtil.yyyymm_to_datetime(hist_months)
+            # --- 과거 히스토리(lookback) ---
+            hist = _to_1d_history(x)                         # (L,) or empty
+            t_hist = np.arange(-len(hist)+1, 1) if hist.size > 0 else None
+            t_fut  = np.arange(1, H+1)
 
-        # 예측 (정수 → datetime)
-        pred = preds[i]
-        fut_dt = DateUtil.yyyymm_to_datetime(fut_months)
+            # --- 모델 예측 ---
+            preds_point = {}
+            preds_q10, preds_q50, preds_q90 = {}, {}, {}
+            for name, model in models.items():
+                p = _predict_any(model, x, device=device)
+                # point
+                yh, tag = _align_len(p["point"], H)
+                if tag: name_plot = f"{name} {tag}"
+                else:   name_plot = name
+                preds_point[name_plot] = yh
+                # quantiles 있으면 저장
+                if "q" in p:
+                    qd = p["q"]
+                    q10, _ = _align_len(qd.get("q10", qd.get("p10", qd.get("low", yh))), H)
+                    q50, _ = _align_len(qd.get("q50", qd.get("p50", yh)), H)
+                    q90, _ = _align_len(qd.get("q90", qd.get("p90", qd.get("high", yh))), H)
+                    preds_q10[name_plot] = q10
+                    preds_q50[name_plot] = q50
+                    preds_q90[name_plot] = q90
 
-        # 플롯 (datetime 축)
-        fig, ax = plt.subplots(figsize=(11, 4))
-        ax.plot(all_m_dt, all_v, linewidth=3.0, alpha=0.35, label="actual (full)", zorder=1)
-        ax.plot(hist_dt, hist_vals, linewidth=2.0, label=f"history (L={lookback})", zorder=2)
-        ax.plot(fut_dt, pred, linewidth=2.0, label=f"forecast (+{H})", zorder=3)
+            # --- 플롯 ---
+            import matplotlib.pyplot as plt
+            plt.figure(figsize=(11, 5))
 
-        ax.set_title(f"oper_part_no={part} | plan={plan_yyyymm} | include_anchor={include_anchor}")
-        ax.set_xlabel("time")
-        ax.set_ylabel(qty_col)
-        ax.grid(True)
-        ax.legend()
+            # 과거
+            if hist.size > 0:
+                plt.plot(t_hist, hist, label="History", linewidth=2, alpha=0.8)
 
-        # 날짜 축 포맷(월 단위 눈금)
-        ax.xaxis.set_major_locator(mdates.MonthLocator(interval=3))  # 3개월 간격 눈금
-        ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m"))
-        for lbl in ax.get_xticklabels():
-            lbl.set_rotation(45)
-        fig.tight_layout()
-        plt.show()
+            # 미래 실제
+            plt.plot(t_fut, y_true, label="True", linewidth=2)
 
+            # 분위수 밴드(있을 때)
+            for nm in preds_q10.keys():
+                q10 = preds_q10[nm]; q50 = preds_q50[nm]; q90 = preds_q90[nm]
+                plt.fill_between(t_fut, q10, q90, alpha=0.15, label=f"{nm} P10–P90")
+                plt.plot(t_fut, q50, linewidth=1.8, alpha=0.9, label=f"{nm} P50")
 
-def plot_two_preds_same_ylim(
-    x_batch: torch.Tensor,
-    y_hat_a: torch.Tensor,           # (B, H) 예: preds_anchor_ims
-    y_hat_b: torch.Tensor,           # (B, H) 예: preds_anchor_dms
-    y_true: torch.Tensor | None = None,
-    parts=None,
-    k: int = 3,
-    target_channel: int = 0,
-    outdir: str = "./plots",
-    prefix: str = "ims_vs_dms",
-    label_a: str = "IMS",
-    label_b: str = "DMS",
-    use_percentile_limits: bool = True,
-):
-    os.makedirs(outdir, exist_ok=True)
+            # 포인트 예측(나머지 모델)
+            for nm, yhat in preds_point.items():
+                # 분위수 중앙선을 이미 그렸다면 중복 라벨 방지
+                if nm in preds_q50:
+                    continue
+                plt.plot(t_fut, yhat, label=nm, alpha=0.9)
 
-    x_cpu = x_batch.detach().cpu()
-    if x_cpu.dim() == 2:
-        x_cpu = x_cpu.unsqueeze(-1)  # [B,L] -> [B,L,1]
-    B, L, C = x_cpu.shape
+            all_points = []
+            for nm in preds_point.keys():
+                if nm in preds_q90:  # 분위수 모델: 중앙선(P50)을 포인트로 사용
+                    base = preds_q90[nm] * 1.5
+                else:
+                    base = preds_point[nm]
+                all_points.append(base)
 
-    ya = y_hat_a.detach().cpu(); yb = y_hat_b.detach().cpu()
-    H = ya.shape[1]
-    assert yb.shape[1] == H, "두 예측의 horizon 길이가 달라요."
+            if len(all_points) > 0:
+                M = np.vstack(all_points)  # (num_models, H)
+                ens_mean = np.nanmean(M, axis=0)  # 시점별 평균
+                plt.plot(t_fut, ens_mean, linewidth=2.5, alpha=0.95, label="Ensemble mean")
 
-    yt = y_true.detach().cpu() if (y_true is not None) else None
-    Ht = yt.shape[1] if yt is not None else None
+            plt.axvline(0, color="gray", linewidth=1, alpha=0.6)  # 경계선(과거/미래)
+            plt.title(f"Validation Forecasts – part: {pid}")
+            plt.xlabel("Time (history ≤ 0 < future)")
+            plt.ylabel("Demand")
+            plt.legend(ncol=2)
+            plt.tight_layout()
 
-    # 공통 y축
-    vals = []
-    for i in range(min(B, k)):
-        vals.append(_finite(x_cpu[i, :, target_channel].numpy()))
-        vals.append(_finite(ya[i, :].numpy()))
-        vals.append(_finite(yb[i, :].numpy()))
-        if yt is not None:
-            vals.append(_finite(yt[i, :min(Ht, H)].numpy()))
-    all_vals = np.concatenate([v for v in vals if v.size > 0]) if vals else np.array([0.0])
+            fpath = os.path.join(out_dir, f"val_{pid}.png")
+            # 저장하고 화면에도 볼 거면 둘 다:
+            # plt.savefig(fpath, dpi=150)
+            plt.show()
+            plt.close()
 
-    if use_percentile_limits and all_vals.size > 0:
-        y_lo = np.percentile(all_vals, 1); y_hi = np.percentile(all_vals, 99)
-        if y_lo == y_hi: y_lo -= 1.0; y_hi += 1.0
-    else:
-        y_lo = np.nanmin(all_vals) if all_vals.size > 0 else -1.0
-        y_hi = np.nanmax(all_vals) if all_vals.size > 0 else 1.0
-        if not np.isfinite(y_lo): y_lo = -1.0
-        if not np.isfinite(y_hi): y_hi = 1.0
-        if y_lo == y_hi: y_lo -= 1.0; y_hi += 1.0
-
-    # 샘플 플롯
-    num = min(B, k)
-    for i in range(num):
-        hist = x_cpu[i, :, target_channel].numpy()
-        a = ya[i].numpy()
-        b = yb[i].numpy()
-        gt = yt[i].numpy() if yt is not None else None
-
-        t_hist = np.arange(L)
-        t_pred = np.arange(L, L + H)
-
-        fig, ax = plt.subplots(figsize=(10, 4))
-        ax.plot(t_hist, hist, label="history")
-        ax.plot(t_pred, a, label=f"{label_a}(+{H})")
-        ax.plot(t_pred, b, label=f"{label_b}(+{H})")
-        if gt is not None:
-            ax.plot(t_pred[:min(H, Ht)], gt[:min(H, Ht)], label="ground truth")
-
-        ax.set_ylim(y_lo, y_hi)
-        title = f"Sample {i}"
-        if parts is not None and len(parts) > i:
-            title += f" | part={parts[i]}"
-        ax.set_title(title); ax.set_xlabel("time"); ax.set_ylabel("value")
-        ax.legend(); ax.grid(True)
-        fig.tight_layout()
-
-        # fn = os.path.join(outdir, f"{prefix}_sample{i}.png")
-        # fig.savefig(fn, dpi=150); plt.show(); plt.close(fig)
-        # print(f"Saved: {fn}")
-
-def plot_anchored_forecasts_yyyymm_multi(
-    df: pl.DataFrame,
-    parts: list[str],
-    preds_dict: dict[str, torch.Tensor],  # {"IMS": (N,H), "DMS": (N,H)}
-    plan_yyyymm: int,
-    lookback: int,
-    part_col: str = "oper_part_no",
-    date_col: str = "demand_dt",
-    qty_col: str = "demand_qty",
-    k: int = 6,
-    include_anchor: bool = False,
-    outdir: str = "./plots",
-    prefix: str = "anchored_compare"
-):
-    os.makedirs(outdir, exist_ok=True)
-    pdf = df.to_pandas()
-
-    # 텐서 → numpy
-    preds_np = {lbl: t.detach().cpu().numpy() for lbl, t in preds_dict.items()}
-    # 공통 H 확인
-    Hs = {lbl: arr.shape[1] for lbl, arr in preds_np.items()}
-    H = list(Hs.values())[0]
-    assert all(h == H for h in Hs.values()), f"H mis-match {Hs}"
-
-    # 달력
-    hist_months = DateUtil.month_seq_ending_before(plan_yyyymm, lookback)
-    fut_months  = DateUtil.next_n_months_from(plan_yyyymm, H, include_anchor=include_anchor)
-
-    # 파트별 전체 시계열 캐시
-    mp_group = {}
-    for part in set(parts[:k]):
-        sdf = pdf[pdf[part_col] == part].sort_values(date_col)
-        months = sdf[date_col].astype(np.int64).to_numpy()
-        vals = sdf[qty_col].astype(float).to_numpy()
-        mp_group[part] = {int(m): float(v) for m, v in zip(months, vals)}
-
-    for i, part in enumerate(parts[:k]):
-        mp = mp_group.get(part, {})
-        sdf = pdf[pdf[part_col] == part].sort_values(date_col)
-
-        all_m_int = sdf[date_col].astype(np.int64).to_numpy()
-        all_v     = sdf[qty_col].astype(float).to_numpy()
-        all_m_dt  = DateUtil.yyyymm_to_datetime(all_m_int)
-
-        hist_vals = np.array([mp.get(int(m), np.nan) for m in hist_months], dtype=float)
-        hist_dt   = DateUtil.yyyymm_to_datetime(hist_months)
-        fut_dt    = DateUtil.yyyymm_to_datetime(fut_months)
-
-        fig, ax = plt.subplots(figsize=(11, 4))
-        ax.plot(all_m_dt, all_v, linewidth=3.0, alpha=0.35, label="actual (full)", zorder=1)
-        ax.plot(hist_dt, hist_vals, linewidth=2.0, label=f"history (L={lookback})", zorder=2)
-
-        # 여러 예측 라인
-        for lbl, arr in preds_np.items():
-            pred = arr[i]
-            ax.plot(fut_dt, pred, linewidth=2.0, label=f"{lbl} (+{H})", zorder=3)
-
-        ax.set_title(f"oper_part_no={part} | plan={plan_yyyymm} | include_anchor={include_anchor}")
-        ax.set_xlabel("time"); ax.set_ylabel(qty_col)
-        ax.grid(True); ax.legend()
-        ax.xaxis.set_major_locator(mdates.MonthLocator(interval=3))
-        ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m"))
-        for lbl in ax.get_xticklabels(): lbl.set_rotation(45)
-        fig.tight_layout()
-        # fn = os.path.join(outdir, f"{prefix}_{part}.png")
-        # fig.savefig(fn, dpi=150); plt.show(); plt.close(fig)
-        # print(f"Saved: {fn}")
-
-def plot_anchored_forecasts_yyyyww_multi(
-    df: pl.DataFrame,
-    parts: list[str],
-    preds_dict: dict[str, torch.Tensor],  # {"IMS": (N,H), "DMS": (N,H), ...}
-    plan_yyyyww: int,
-    lookback: int,
-    part_col: str = "oper_part_no",
-    date_col: str = "demand_dt",     # 주차 컬럼 (정수 YYYYWW)
-    qty_col: str = "demand_qty",
-    k: int = 6,
-    include_anchor: bool = False,     # False → plan+1주부터 H주, True → plan주 포함
-    outdir: str = "./plots",
-    prefix: str = "anchored_compare_weekly",
-    save: bool = True
-):
-    os.makedirs(outdir, exist_ok=True)
-    pdf = df.to_pandas()
-
-    # 텐서 → numpy
-    preds_np = {lbl: t.detach().cpu().numpy() for lbl, t in preds_dict.items()}
-
-    # 공통 H 체크
-    Hs = {lbl: arr.shape[1] for lbl, arr in preds_np.items()}
-    H = list(Hs.values())[0]
-    assert all(h == H for h in Hs.values()), f"H mis-match {Hs}"
-
-    # 주차 달력
-    hist_weeks = DateUtil.week_seq_ending_before(plan_yyyyww, lookback)            # 길이 L
-    fut_weeks  = DateUtil.next_n_weeks_from(plan_yyyyww, H, include_anchor=include_anchor)
-
-    # 파트별 전체 시계열 캐시
-    mp_group = {}
-    for part in set(parts[:k]):
-        sdf = pdf[pdf[part_col] == part].sort_values(date_col)
-        weeks = sdf[date_col].astype(np.int64).to_numpy()
-        vals  = sdf[qty_col].astype(float).to_numpy()
-        mp_group[part] = {int(w): float(v) for w, v in zip(weeks, vals)}
-
-    for i, part in enumerate(parts[:k]):
-        mp = mp_group.get(part, {})
-        sdf = pdf[pdf[part_col] == part].sort_values(date_col)
-
-        # 전체 실측 (YYYYWW → datetime)
-        all_w_int = sdf[date_col].astype(np.int64).to_numpy()
-        all_v     = sdf[qty_col].astype(float).to_numpy()
-        all_w_dt  = DateUtil.yyyyww_to_datetime(all_w_int)
-
-        # 히스토리 (YYYYWW → datetime)
-        hist_vals = np.array([mp.get(int(w), np.nan) for w in hist_weeks], dtype=float)
-        hist_dt   = DateUtil.yyyyww_to_datetime(hist_weeks)
-
-        # 미래 (YYYYWW → datetime)
-        fut_dt    = DateUtil.yyyyww_to_datetime(fut_weeks)
-
-        # 플롯
-        fig, ax = plt.subplots(figsize=(11, 4))
-        ax.plot(all_w_dt,  all_v,     linewidth=3.0, alpha=0.35, label="actual (full)", zorder=1)
-        ax.plot(hist_dt,   hist_vals, linewidth=2.0,  label=f"history (L={lookback})", zorder=2)
-
-        # 여러 예측 라인
-        for lbl, arr in preds_np.items():
-            pred = arr[i]
-            ax.plot(fut_dt, pred, linewidth=2.0, label=f"{lbl} (+{H}w)", zorder=3)
-
-        ax.set_title(f"oper_part_no={part} | plan={plan_yyyyww} | include_anchor={include_anchor}")
-        ax.set_xlabel("time"); ax.set_ylabel(qty_col)
-        ax.grid(True); ax.legend()
-
-        # 주차 데이터지만, x축은 월 단위 메이저 눈금이 보기 좋습니다.
-        ax.xaxis.set_major_locator(mdates.MonthLocator(interval=1))
-        ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m"))
-        for lbl_tick in ax.get_xticklabels():
-            lbl_tick.set_rotation(45)
-
-        fig.tight_layout()
-
-        # if save:
-        #     fn = os.path.join(outdir, f"{prefix}_{part}.png")
-        #     fig.savefig(fn, dpi=150)
-        #     print(f"Saved: {fn}")
-
-        plt.show()
-        plt.close(fig)
+            n_plots += 1
+            if (max_plots is not None) and (n_plots >= max_plots):
+                return

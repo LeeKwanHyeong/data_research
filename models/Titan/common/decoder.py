@@ -84,7 +84,7 @@ class TitanDecoder(nn.Module):
 
         # future query(learned) + pos emb ( + exo)
         tgt = self.query_embed.expand(B, H, D) + self.pos_embed.expand(B, H, D)
-        if (self.exp_proj is not None) and (future_exo is not None):
+        if (self.exo_proj is not None) and (future_exo is not None):
             tgt = tgt + self.exo_proj(future_exo)
 
         x = tgt

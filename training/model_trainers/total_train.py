@@ -6,7 +6,7 @@ from models.PatchMixer.common.configs import PatchMixerConfigMonthly
 from models.PatchTST.common.configs import PatchTSTConfigMonthly
 from models.Titan.common.configs import TitanConfigMonthly
 from models.model_builder import build_patch_mixer_base, build_patch_mixer_quantile, build_titan_base, build_titan_lmm, \
-    build_patchTST_base
+    build_patchTST_base, build_titan_seq2seq
 from training.metrics import quantile_metrics
 from training.model_trainers.patchmixer_train import train_patchmixer
 from training.model_trainers.patchtst_train import train_patchtst
@@ -30,7 +30,7 @@ def run_total_train_monthly(train_loader, val_loader, device = 'cuda'):
     best_pm_base = train_patchmixer(
         pm_base_model,
         train_loader, val_loader,
-        epochs = 1, lr = 1e-3, loss_mode = 'quantile',
+        lr = 1e-3, loss_mode = 'quantile',
         quantiles = (0.1, 0.5, 0.9), use_intermittent = True
     )
     results['PatchMixer Base'] = best_pm_base
@@ -38,7 +38,7 @@ def run_total_train_monthly(train_loader, val_loader, device = 'cuda'):
     best_pm_quantile = train_patchmixer(
         pm_quantile_model,
         train_loader, val_loader,
-        epochs = 1, lr = 1e-3, loss_mode = 'quantile',
+        lr = 1e-3, loss_mode = 'quantile',
         quantiles = (0.1, 0.5, 0.9), use_intermittent = True
     )
     results['PatchMixer Quantile'] = best_pm_quantile
@@ -52,7 +52,7 @@ def run_total_train_monthly(train_loader, val_loader, device = 'cuda'):
 
     ti_base = build_titan_base(ti_config)
     ti_lmm = build_titan_lmm(ti_config)
-    ti_seq2seq = build_titan_lmm(ti_config)
+    ti_seq2seq = build_titan_seq2seq(ti_config)
 
     best_ti_base = train_titan(
         ti_base,
@@ -73,7 +73,7 @@ def run_total_train_monthly(train_loader, val_loader, device = 'cuda'):
         train_loader, val_loader,
         lr = 1e-3, loss_mode = 'point', tta_steps = 3
     )
-    results['Titan Seq2seq'] = best_ti_seq2seq
+    results['Titan Seq2Seq'] = best_ti_seq2seq
 
     # ---------------- PatchTST(Quantile + point) ----------------
     pt_config = PatchTSTConfigMonthly(
