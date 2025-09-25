@@ -27,6 +27,7 @@ def run_total_train_monthly(train_loader, val_loader, device = 'cuda'):
     pm_base_model = build_patch_mixer_base(pm_config)
     pm_quantile_model = build_patch_mixer_quantile(pm_config)
 
+    print('PatchMixer Base')
     best_pm_base = train_patchmixer(
         pm_base_model,
         train_loader, val_loader,
@@ -35,6 +36,7 @@ def run_total_train_monthly(train_loader, val_loader, device = 'cuda'):
     )
     results['PatchMixer Base'] = best_pm_base
 
+    print('PatchMixer Quantile')
     best_pm_quantile = train_patchmixer(
         pm_quantile_model,
         train_loader, val_loader,
@@ -54,6 +56,7 @@ def run_total_train_monthly(train_loader, val_loader, device = 'cuda'):
     ti_lmm = build_titan_lmm(ti_config)
     ti_seq2seq = build_titan_seq2seq(ti_config)
 
+    print('Titan Base')
     best_ti_base = train_titan(
         ti_base,
         train_loader, val_loader,
@@ -61,6 +64,7 @@ def run_total_train_monthly(train_loader, val_loader, device = 'cuda'):
     )
     results['Titan Base'] = best_ti_base
 
+    print('Titan LMM')
     best_ti_lmm = train_titan(
         ti_lmm,
         train_loader, val_loader,
@@ -68,6 +72,7 @@ def run_total_train_monthly(train_loader, val_loader, device = 'cuda'):
     )
     results['Titan LMM'] = best_ti_lmm
 
+    print('Titan Seq2Seq')
     best_ti_seq2seq = train_titan(
         ti_seq2seq,
         train_loader, val_loader,
@@ -84,6 +89,7 @@ def run_total_train_monthly(train_loader, val_loader, device = 'cuda'):
 
     pt_base = build_patchTST_base(pt_config)
 
+    print('PatchTST Base')
     best_pt_base = train_patchtst(
         pt_base,
         train_loader, val_loader,
