@@ -1,3 +1,5 @@
+import inspect
+
 import torch
 import torch.nn as nn
 import numpy as np
@@ -24,25 +26,37 @@ class FullAttention(nn.Module):
         self.output_attention = output_attention
         self.dropout = nn.Dropout(attention_dropout)
 
-    def forward(self, queries, keys, values, attn_mask):
+    def forward(self, queries, keys, values, attn_mask, prev_logits=None):
         B, L, H, E = queries.shape
         _, S, _, D = values.shape
+
         scale = self.scale or 1. / sqrt(E)
-        scores = torch.einsum('blhe,bshe->bhls', queries, keys)
+        # (B, H, L, S)
+        scores = torch.einsum('blhe,bshe->bhls', queries, keys) * scale
+
+        if self.use_realformer_residual and (prev_logits is not None):
+            scores = scores + prev_logits  # (B,H,L,S)
 
         if self.mask_flag:
             if attn_mask is None:
-                attn_mask = TriangularCausalMask(B, L, device = queries.device)
+                attn_mask = TriangularCausalMask(B, L, device=queries.device)
+            neg_inf = torch.finfo(scores.dtype).min
+            scores = scores.masked_fill(attn_mask.mask, neg_inf)
 
-            scores.masked_fill_(attn_mask.mask, -np.inf)
+        A = torch.softmax(scores, dim=-1)
+        A = self.dropout(A)
 
-        A = self.dropout(torch.softmax(scale * scores, dim = -1))
+        # ✅ out shape 은 (B, L, H, d_v) 이어야 함
         V = torch.einsum('bhls,bshd->blhd', A, values)
 
-        if self.output_attention:
-            return (V.contiguous(), A)
+        if self.output_attention and self.return_logits:
+            return V.contiguous(), A, scores
+        elif self.output_attention:
+            return V.contiguous(), A
+        elif self.return_logits:
+            return V.contiguous(), None, scores
         else:
-            return (V.contiguous(), None)
+            return V.contiguous(), None
 
 
 @register_attention('fullwithlogits')
@@ -262,30 +276,44 @@ class AttentionLayerWithPrev(nn.Module):
 
 class MultiHeadAttention(nn.Module):
     """
-    MHA 래퍼: 입력 (B,L,D) -> 출력 (B,L,D), 내부 코어는 (B,L,H,Dh) 표준 사용
+    MHA 래퍼: 입력 (B,L,D) -> 출력 (B,L,D)
+    - 코어(attn_core)는 (B,L,H,Dh) 입출력 컨벤션
+    - 여분의 키워드 인자(**kwargs)는 받아서 무시 (호출 측 유연성 확보)
     """
-    def __init__(self, *, d_model, n_heads, d_k=None, d_v=None,
-                 proj_dropout=0.0, attn_core: nn.Module):
+    def __init__(self, *,
+                 d_model: int,
+                 n_heads: int,
+                 d_k: int | None = None,
+                 d_v: int | None = None,
+                 proj_dropout: float = 0.0,
+                 attn_core: nn.Module,
+                 **_):  # ← 여분 키워드는 무시 (attn_dropout/causal/... 등)
         super().__init__()
         d_k = (d_model // n_heads) if d_k is None else d_k
         d_v = (d_model // n_heads) if d_v is None else d_v
-        self.n_heads, self.d_k, self.d_v = n_heads, d_k, d_v
 
+        self.n_heads, self.d_k, self.d_v = n_heads, d_k, d_v
         self.W_Q = nn.Linear(d_model, n_heads * d_k, bias=True)
         self.W_K = nn.Linear(d_model, n_heads * d_k, bias=True)
         self.W_V = nn.Linear(d_model, n_heads * d_v, bias=True)
 
         self.core = attn_core
+        # 코어가 prev_logits를 받는지 자동 감지
+        self.core_accepts_prev = 'prev_logits' in inspect.signature(self.core.forward).parameters
+
         self.to_out = nn.Sequential(
             nn.Linear(n_heads * d_v, d_model),
             nn.Dropout(proj_dropout)
         )
 
-    def forward(self, Q, K=None, V=None,
-                attn_mask: Optional[torch.Tensor] = None,
-                prev_logits: Optional[torch.Tensor] = None):
+    def forward(self,
+                Q: torch.Tensor,
+                K: torch.Tensor | None = None,
+                V: torch.Tensor | None = None,
+                attn_mask: torch.Tensor | None = None,
+                prev_logits: torch.Tensor | None = None):
         # Q,K,V: (B,L,D)
-        B, L, Dm = Q.shape
+        B, L, _ = Q.shape
         if K is None: K = Q
         if V is None: V = Q
         S = K.size(1)
@@ -295,30 +323,66 @@ class MultiHeadAttention(nn.Module):
         k = self.W_K(K).reshape(B, S, self.n_heads, self.d_k)
         v = self.W_V(V).reshape(B, S, self.n_heads, self.d_v)
 
-        out, attn, logits = self.core(q, k, v, attn_mask=attn_mask, prev_logits=prev_logits)
-        out = out.reshape(B, L, self.n_heads * self.d_v)
+        # 코어 호출 (prev_logits 지원 여부에 따라 분기)
+        if self.core_accepts_prev:
+            core_out = self.core(q, k, v, attn_mask, prev_logits=prev_logits)
+        else:
+            core_out = self.core(q, k, v, attn_mask)
+
+        # 코어 출력 정규화: (out, attn) 또는 (out, attn, logits) 모두 허용
+        if isinstance(core_out, tuple):
+            if len(core_out) == 3:
+                out_b_l_h_d, attn, logits = core_out
+            else:
+                out_b_l_h_d, attn = core_out
+                logits = None
+        else:
+            out_b_l_h_d, attn, logits = core_out, None, None
+
+        out = out_b_l_h_d.reshape(B, L, self.n_heads * self.d_v)
         out = self.to_out(out)
         return out, attn, logits
 
 
 def build_attention(cfg) -> MultiHeadAttention:
-    core_cls = ATTN_REGISTRY[cfg.type]
-    kwargs = dict(
-        mask_flag=cfg.causal,
-        attention_dropout=cfg.attn_dropout,
-        output_attention=cfg.output_attention,
-        residual_logits=cfg.residual_logits
-    )
-    # ProbSparse 전용 파라미터 예시
-    if cfg.type == 'probsparse':
-        kwargs.update(dict(factor=cfg.factor))
+    # 1) core 선택 로직
+    core_name = cfg.type
+    if cfg.type == 'full' and getattr(cfg, 'residual_logits', False):
+        core_name = 'fullwithlogits'
 
-    core = core_cls(**kwargs)
+    core_cls = ATTN_REGISTRY[core_name]
+
+    # 2) core kwargs (허용된 키만)
+    core_kwargs = dict(
+        mask_flag = getattr(cfg, 'causal', True),
+        attention_dropout = cfg.attn_dropout,
+        output_attention = getattr(cfg, 'output_attention', False),
+    )
+    if core_name == 'probsparse':
+        core_kwargs['factor'] = cfg.factor
+    if core_name == 'fullwithlogits':
+        # 로짓 잔차 활성화
+        core_kwargs['use_realformer_residual'] = True
+        # 필요 시 로짓 반환 (분석/시각화용)
+        core_kwargs['return_logits'] = getattr(cfg, 'output_attention', False)
+
+    core = core_cls(**core_kwargs)
+
+    # 3) d_k/d_v 기본값 계산
+    d_k = cfg.d_k if cfg.d_k is not None else cfg.d_model // cfg.n_heads
+    d_v = cfg.d_v if cfg.d_v is not None else cfg.d_model // cfg.n_heads
+
     return MultiHeadAttention(
         d_model=cfg.d_model,
         n_heads=cfg.n_heads,
-        d_k=cfg.d_k,
-        d_v=cfg.d_v,
+        d_k=d_k,
+        d_v=d_v,
+        attn_dropout=cfg.attn_dropout,
         proj_dropout=cfg.proj_dropout,
+        causal=getattr(cfg, 'causal', True),
+        residual_logits=getattr(cfg, 'residual_logits', False),  # 래퍼 레벨에서 보관만(현재 미사용)
+        output_attention=getattr(cfg, 'output_attention', False),
+        factor=getattr(cfg, 'factor', 5),
+        lsa=getattr(cfg, 'lsa', False),
         attn_core=core
     )

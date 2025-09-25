@@ -30,7 +30,7 @@ class TrainingConfig:
     # ------------Loss-------------
     loss_mode: LossMode = 'auto'
     point_loss: Literal['mae', 'mse', 'huber', 'pinball'] = 'mse'
-    huber_delta: float = 1.0
+    huber_delta: float = 2.0
     q_star: float = 0.5             # point=pinball
     use_cost_q_star: bool = False
     Cu: float = 1.0; Co: float = 1.0 # newsvendor

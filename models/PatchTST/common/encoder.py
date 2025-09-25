@@ -95,7 +95,7 @@ class TSTEncoder(nn.Module):
                     mha = mha,
                     pre_norm = cfg.pre_norm,
                     store_attn = cfg.store_attn,
-                    use_residual_logits = cfg.atth.residual_logits
+                    use_residual_logits = cfg.attn.residual_logits
                 )
             )
 
@@ -130,6 +130,6 @@ class TSTiEncoder(nn.Module): # channel-independent
         u = self.dropout(u + self.W_pos)                # PE 추가
 
         z = self.encoder(u)                             # [B * n_vars, N, d_model]
-        z = z.reshape(B, n_vars, x.size(1), z.size(2))  # [B, n_vars, N, d_model]
+        z = z.reshape(B, n_vars, x.size(2), z.size(2))  # [B, n_vars, N, d_model]
         z = z.permute(0, 1, 3, 2)                       # [B, n_vars, d_model, N]
         return z

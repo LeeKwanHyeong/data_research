@@ -1,7 +1,8 @@
 from typing import Optional, Literal, Tuple
 from dataclasses import dataclass, field
 
-from training.config import TrainingConfig
+from training.config import TrainingConfig, DecompositionConfig
+
 
 # =========================
 # Attention (Self-Attention) 설정
@@ -104,11 +105,16 @@ class PatchTSTConfig(TrainingConfig):
     affine: bool = True                 # RevIN affine 사용 여부
     subtract_last: bool = False         # RevIN 마지막값 기준 보정
     verbose: bool = False               # 상세 로그
+    head_type = 'regression'
+    head_dropout: float = 0.
+    individual = False
+
+
 
     # ---------- 서브 설정 ----------
     attn: AttentionConfig = field(default_factory=AttentionConfig)
     head: HeadConfig = field(default_factory=HeadConfig)
-    decomp: DecompositionConfig = DecompositionConfig()
+    decomp: DecompositionConfig = field(default_factory=DecompositionConfig)
 
 # =========================
 # 프리셋: 월간/주간 권장 윈도우

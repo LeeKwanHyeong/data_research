@@ -33,6 +33,9 @@ def build_titan_feature(cfg: TitanConfig):
     from models.Titan.Titans import FeatureModel
     return FeatureModel(cfg)
 
-# def build_patchTST_base(cfg: PatchTSTConfig):
-#     from models.PatchTST.supervised.PatchTST import
+def build_patchTST_base(cfg: PatchTSTConfig):
+    from models.PatchTST.supervised.PatchTST import Model
+    return Model(cfg)
+
+
 

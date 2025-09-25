@@ -13,7 +13,7 @@ def quantile_coverage(
     reduce: str = "overall"  # "overall" | "per_h" | "per_q"
 ) -> Dict[str, torch.Tensor]:
     """
-    각 분위수 q에 대해 coverage = mean( y <= \hat{y}_q ).
+    각 분위수 q에 대해 coverage = mean( y <= y_hat_q ).
     reduce:
       - "overall": 스칼라(분위수별)
       - "per_h"  : (H,) 각 시점별 coverage

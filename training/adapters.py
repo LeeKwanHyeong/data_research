@@ -1,7 +1,7 @@
 from typing import Protocol, Any, Optional
 import torch
 import torch.nn as nn
-
+PREFERRED_KEYS = ("pred", "yhat", "output", "logits")
 class ModelAdapter(Protocol):
     '''
     모델별로 서로 다른 Inference/Normalization/Test Time Adaptation(TTA) 전략을 통일된 인터페이스로
@@ -15,11 +15,16 @@ class ModelAdapter(Protocol):
     - tta_adapt(model, x_val, y_val, steps): Validation Set을 활용해 TTA 적응 수행.
       적응 과정의 Scalar Loss 등 반환할 수 있음
     '''
+
     def forward(self, model: nn.Module, x_batch: Any) -> torch.Tensor: ...
+
     def reg_loss(self, model: nn.Module) -> Optional[torch.Tensor]: ...
+
     def uses_tta(self) -> bool: ...
+
     def tta_reset(self, model: nn.Module): ...
-    def tta_adapt(self, model: nn.Module, x_val: torch.Tensor, y_val: torch.Tensor, steps: int) -> Optional[torch.Tensor]: ...
+
+    def tta_adapt(self, model: nn.Module, x_val: torch.Tensor, y_val: torch.Tensor, steps: int) -> Optional[float]: ...
 
 class DefaultAdapter:
     '''
@@ -27,11 +32,41 @@ class DefaultAdapter:
     - 입력이 (tuple/list)면 unpacking -> model(*x_batch) 호출, 아니면 model(x_batch) 호출
     - 별도의 정규화 손실이나 TTA를 사용하지 않는 가장 단순한 형태.
     '''
+
+    def _call_model(self, model, x):
+        # 입력이 (ts, feat) 튜플일 수도 있음
+        if isinstance(x, (tuple, list)):
+            return model(*x)
+        return model(x)
+
+    def _as_tensor(self, out):
+        # tuple/list → 첫 번째 텐서
+        if isinstance(out, (tuple, list)):
+            for item in out:
+                if torch.is_tensor(item):
+                    return item
+            # 텐서가 없으면 실패
+            raise TypeError(f"Model returned tuple/list without a Tensor: {type(out)}")
+        # dict → 우선키 탐색
+        if isinstance(out, dict):
+            for k in PREFERRED_KEYS:
+                v = out.get(k, None)
+                if torch.is_tensor(v):
+                    return v
+            # dict의 값들 중 첫 텐서
+            for v in out.values():
+                if torch.is_tensor(v):
+                    return v
+            raise TypeError(f"Model returned dict without a Tensor value: keys={list(out.keys())}")
+        # 텐서
+        if torch.is_tensor(out):
+            return out
+        raise TypeError(f"Model output is not a Tensor/tuple/dict: {type(out)}")
+
     def forward(self, model, x_batch):
         # 모델에 전달할 입력 형식 통일: (x, mask, ...) 형태면 unpacking
-        if isinstance(x_batch, (tuple, list)):
-            return model(*x_batch)
-        return model(x_batch)
+        out = self._call_model(model, x_batch)
+        return self._as_tensor(out)
 
     def reg_loss(self, model):
         # 추가 정규화 손실이 없는 경우 None

@@ -36,6 +36,14 @@ class LossComputer:
         """
         self.cfg = cfg
 
+    def _as_tensor(self, x, like: torch.Tensor):
+        # 어떤 유틸이 float/None을 리턴하더라도 여기서 텐서 보장
+        if x is None:
+            return None
+        if torch.is_tensor(x):
+            return x
+        return torch.as_tensor(x, dtype=like.dtype, device=like.device)
+
     def _q_star(self):
         """
         point 손실이 'pinball'일 때 사용할 단일 분위수 q*를 결정
@@ -68,7 +76,13 @@ class LossComputer:
 
         if mode == 'quantile':
             if is_val and not self.cfg.val_use_weights:
-                return pinball_plain(pred, y, self.cfg.quantiles)
+                loss = pinball_plain(pred, y, self.cfg.quantiles)
+                loss = self._as_tensor(loss, y)
+                if loss is None:
+                    # 극단적 방어: median 기준 MAE
+                    qidx = self.cfg.quantiles.index(0.5) if 0.5 in self.cfg.quantiles else 0
+                    loss = (pred[:, qidx, :] - y).abs().mean()
+                return loss
 
             weights: Optional[torch.Tensor] = None
             if self.cfg.use_intermittent:
@@ -82,6 +96,12 @@ class LossComputer:
                     gamma_run = self.cfg.gamma_run,
                     clip_run = 0.5
                 )
+
+                wsum = weights.sum()
+                if wsum == 0:
+                    weights = torch.ones_like(weights) * 1e-6
+
+
             return pinball_loss_weighted_masked(pred, y, self.cfg.quantiles, weights)
 
         # point

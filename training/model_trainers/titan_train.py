@@ -5,7 +5,12 @@ from training.engine import CommonTrainer
 
 
 def train_titan(model, train_loader, val_loader, *, tta_steps=0, **overrides):
-    cfg = TrainingConfig(loss_mode="point", point_loss="mse", **overrides)
+
+    base = dict(
+        loss_mode="point", point_loss="huber",
+    )
+    base.update(**overrides)
+    cfg = TrainingConfig(**base)
 
     def factory(m): return TestTimeMemoryManager(m, lr=cfg.lr)  # 기존 로직
     adapter = TitanAdapter(tta_manager_factory=factory)

@@ -51,6 +51,9 @@ class Model(nn.Module):
         # Encoding
         encoded = self.encoder(x) # [batch, seq_len, d_model]
 
+        if encoded.dim() != 3:
+            raise RuntimeError(f"Encoder must return (B,L,D). Got {tuple(encoded.shape)}")
+
         # 마지막 타임스텝(hidden state)만 사용하여 예측
         pred = self.output_proj(encoded[:, -1, :]) # [batch, output_horizon]
 
@@ -107,7 +110,7 @@ class LMMModel(nn.Module):
         # - 모델이 장기적인 패턴을 안정적으로 예측하도록 보조
         self.trend_corrector = TrendCorrector(
             d_model = config.d_model,
-            output_horizon = config.horizon
+            out_dim = config.horizon
         )
 
     # --------------------------- Train ---------------------------
@@ -116,7 +119,19 @@ class LMMModel(nn.Module):
         x = self.revin_layer(x, 'norm') # [batch, seq_len, input_dim]
         # 인코딩 (Encoding)
         encoded = self.encoder(x) # [batch, seq_len, d_model]
-        B, L, D = encoded.size(0)
+        if encoded.dim() != 3:
+            raise RuntimeError(f"Encoder must return (B,L,D). Got {tuple(encoded.shape)}")
+        B, L, D = encoded.shape
+
+        # (선택) 안전 가드: 만약 인코더가 [B, D, L]을 주는 구현이라면 전치
+        if encoded.dim() != 3:
+            raise RuntimeError(f"Encoder output must be 3D [B,L,D], got shape={tuple(encoded.shape)}")
+
+        # 예: [B, D, L]로 오는 케이스 방어
+        if L < D and hasattr(self, "d_model") and D != getattr(self, "d_model"):
+            # 인코더가 [B, D, L]을 반환한 것으로 추정 → 전치
+            encoded = encoded.transpose(1, 2)  # [B, L, D]
+            B, L, D = encoded.shape
 
         if mode == 'train':
             # ------ Memory 조립 강화: contextual + persistent + encoded ------
@@ -148,9 +163,9 @@ class LMMModel(nn.Module):
 
 
             # 4) Final Step
-            enhanced = self.lmm(encoded, memory)
-            pred = self.output_proj(enhanced[:, -1, :])
-            pred = pred + self.trend_corrector(enhanced[:, -1, :])
+            enhanced = self.lmm(encoded, memory)  # (B, L, D)
+            pred = self.output_proj(enhanced[:, -1, :])  # (B, out_dim)
+            pred = pred + self.trend_corrector(enhanced[:, -1, :])  # 2D 입력 허용
             pred = self.revin_layer(pred.unsqueeze(1), 'denorm').squeeze(1)
             return pred
 
@@ -208,7 +223,7 @@ class LMMSeq2SeqModel(nn.Module):
 
         self.trend_corrector = TrendCorrector(
             d_model = config.d_model,
-            output_horizon = self.horizon
+            out_dim = self.horizon
         )
 
     def forward(self, x, future_exo: torch.Tensor | None = None, mode: str = 'train'):
@@ -221,16 +236,20 @@ class LMMSeq2SeqModel(nn.Module):
         x = self.revin_layer(x, 'norm')
 
         # 2) Encode
-        enc = self.encoder(x)                   # [B, L, D]
+        encoded = self.encoder(x)                   # [B, L, D]
+
+        if encoded.dim() != 3:
+            raise RuntimeError(f"Encoder must return (B,L,D). Got {tuple(encoded.shape)}")
+
 
         # 3) Decode
-        dec = self.decoder(enc, future_exo)     # [B, H, D]
+        decoded = self.decoder(encoded, future_exo)     # [B, H, D]
 
         # 4) Head
-        y = self.output_proj(dec).squeeze(-1)   # [B, H]
+        y = self.output_proj(decoded).squeeze(-1)   # [B, H]
 
         # 5) Trend Corrector
-        y = y + self.trend_corrector(enc)       # [B, H]
+        y = y + self.trend_corrector(encoded)       # [B, H]
 
         # 6) RevIN Denormalization
         y = self.revin_layer(y.unsqueeze(1), 'denorm').squeeze(1)   # [B, H]
@@ -264,6 +283,10 @@ class FeatureModel(nn.Module):
         # 시계열 인코딩
         # - 입력 시계열 x → [batch, seq_len, d_model]
         encoded = self.encoder(x)
+
+        if encoded.dim() != 3:
+            raise RuntimeError(f"Encoder must return (B,L,D). Got {tuple(enc.shape)}")
+
 
         # 부가 피처 인코딩
         # - feature_x → [batch, feature_dim]

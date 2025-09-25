@@ -1,6 +1,14 @@
-from model_runner.model_configs import PatchTSTConfig
-from models.PatchTST.self_supervised.backbone import PatchTSTEncoder
-from models.PatchTST.self_supervised.head import *
+import math
+from typing import Tuple
+
+import torch.nn as nn
+import torch
+from models.PatchTST.common.configs import PatchTSTConfig
+from models.PatchTST.common.heads.classification_head import ClassificationHead
+from models.PatchTST.common.heads.prediction_head import PredictionHead
+from models.PatchTST.common.heads.regression_head import RegressionHead
+from models.PatchTST.self_supervised.backbone import SelfSupervisedBackbone
+from models.PatchTST.supervised.backbone import SupervisedBackbone
 
 """
 (a) Backbone (Supervised)
@@ -27,81 +35,124 @@ from models.PatchTST.self_supervised.head import *
     - Add & Norm
 """
 
+# ---------------------------------------
+# 유틸: 패치 개수 계산 (lookback, patch_len, stride, padding)
+# ---------------------------------------
+def _num_patches(lookback: int, patch_len: int, stride: int, padding_patch: str | None) -> int:
+    if padding_patch == "end":
+        # 패딩으로 마지막 패치 하나를 더 확보
+        return math.floor((lookback - 1) / stride) + 1
+    # 일반 케이스: 정확히 끊어지지 않으면 마지막 일부는 버림
+    return max(1, math.floor((lookback - patch_len) / stride) + 1)
+
+# ---------------------------------------
+# 유틸: head 타입/하이퍼 해석 (HeadConfig 우선, 폴백은 top-level)
+# ---------------------------------------
+def _resolve_head(cfg: PatchTSTConfig) -> Tuple[str, bool, float, tuple | None]:
+    # type
+    htype = getattr(cfg, "head", None).type if getattr(cfg, "head", None) else None
+    if htype is None or htype == "flatten":
+        # flatten은 프로젝트 내 구현 차가 크니 prediction/regression/classification 중 하나로 맵핑
+        # top-level 레거시 값이 있으면 우선
+        htype = getattr(cfg, "head_type", None) or "regression"
+    # individual
+    individual = getattr(cfg, "head", None).individual if getattr(cfg, "head", None) else getattr(cfg, "individual", False)
+    # dropout
+    head_dropout = getattr(cfg, "head", None).head_dropout if getattr(cfg, "head", None) else getattr(cfg, "head_dropout", 0.0)
+    # y_range (회귀 한정)
+    y_range = getattr(cfg, "head", None).y_range if getattr(cfg, "head", None) else None
+    return htype, bool(individual), float(head_dropout), y_range
+
 class PatchTSTModel(nn.Module):
-    '''
-    Output dimension:
-        [bs x target_dim x nvars] for prediction
-        [bs x target_dim] for regression
-        [bs x target_dim] for classification
-        [bs x num_patch x n_vars x patch_len] for pretrain
-    '''
-
-    def __init__(self,config: PatchTSTConfig):
+    """
+    출력 규약:
+      - prediction : [bs, target_dim, nvars]
+      - regression : [bs, target_dim]
+      - classification : [bs, target_dim]
+      - pretrain  : [bs, num_patch, nvars, patch_len]
+    입력 규약(백본 구현에 따름):
+      - 보통 (B, L, C) 원시시계열을 받아 내부에서 패칭합니다.
+      - 현재 프로젝트 백본 입력이 [bs, num_patch, patch_len]이라면 그 형식을 그대로 사용하세요.
+    """
+    def __init__(self, config: PatchTSTConfig):
         super().__init__()
+        self.cfg = config
 
-        assert config.head_type in ['pretrain', 'prediction', 'regression', 'classification'],\
-        'head type should be either pretrain, prediction, or regression'
+        # --------- 파생 하이퍼 계산 ----------
+        self.n_vars = self.cfg.c_in
+        self.num_patch = _num_patches(self.cfg.lookback, self.cfg.patch_len, self.cfg.stride, self.cfg.padding_patch)
 
-        self.config = config
+        # Head 해석(HeadConfig 우선)
+        self.head_type, self.individual, self.head_dropout, self.y_range = _resolve_head(self.cfg)
 
-        # Backbone
-        self.backbone = PatchTSTEncoder(
-            self.config.c_in,
-            num_patch = self.config.num_patch,
-            patch_len = self.config.patch_len,
-            n_layers = self.config.n_layers,
-            d_model = self.config.d_model,
-            n_heads = self.config.n_heads,
-            shared_embedding = self.config.shared_embedding,
-            d_ff = self.config.d_ff,
-            attn_dropout = self.config.attn_dropout,
-            dropout = self.config.dropout,
-            act = self.config.act,
-            res_attention = self.config.res_attention,
-            pre_norm = self.config.pre_norm,
-            store_attn = self.config.store_attn,
-            pe = self.config.pe,
-            learn_pe = self.config.learn_pe,
-            verbose = self.config.verbose)
+        # --------- Backbone 선택 ----------
+        if self.head_type == "pretrain":
+            # 자기지도(마스킹 재구성) 백본
+            self.backbone = SelfSupervisedBackbone(self.cfg)
+        else:
+            # 감독 학습 백본
+            self.backbone = SupervisedBackbone(self.cfg)
 
-        # Head
-        self.n_vars = self.config.c_in
-        self.head_type = self.config.head_type
+        # --------- Head 구성 ----------
+        if self.head_type == "pretrain":
+            from models.PatchTST.common.heads.pretrain_head import PretrainHead
+            self.head = PretrainHead(
+                self.cfg.d_model,
+                self.cfg.patch_len,
+                self.cfg.dropout
+            )
+        elif self.head_type == "prediction":
+            # 다변량 예측: [bs, target_dim, nvars]
+            self.head = PredictionHead(
+                self.individual,
+                self.n_vars,
+                self.cfg.d_model,
+                self.num_patch,
+                self.cfg.target_dim,
+                self.head_dropout
+            )
+        elif self.head_type == "regression":
+            # 전역 회귀: [bs, target_dim]
+            self.head = RegressionHead(
+                self.n_vars,
+                self.cfg.d_model,
+                self.cfg.target_dim,
+                self.head_dropout,
+                self.y_range
+            )
+        elif self.head_type == "classification":
+            # 분류: [bs, target_dim]
+            self.head = ClassificationHead(
+                self.n_vars,
+                self.cfg.d_model,
+                self.cfg.target_dim,
+                self.head_dropout
+            )
+        else:
+            raise ValueError(f"Unknown head type: {self.head_type}")
 
-        match self.config.head_type:
-            case 'pretrain':
-                self.head = PretrainHead(
-                    self.config.d_model, self.config.patch_len,
-                    self.config.head_dropout
-                ) # Custom head passed as a partial func with all its kwargs
-            case 'prediction':
-                self.head = PredictionHead(
-                    self.config.individual, self.n_vars,
-                    self.config.d_model, self.config.num_patch,
-                    self.config.target_dim, self.config.head_dropout
-                )
-            case 'regression':
-                self.head = RegressionHead(
-                    self.n_vars, self.config.d_model,
-                    self.config.target_dim, self.config.head_dropout,
-                    self.config.y_range)
-            case 'classification':
-                self.head = ClassificationHead(
-                    self.n_vars, self.config.d_model,
-                    self.config.target_dim, self.config.head_dropout
-                )
+        # (선택) Decomposition 훅을 백본 밖에서 처리하고 싶다면 여기서 구성
+        # if self.cfg.decomp and self.cfg.decomp.type != "none":
+        #     from models.components.decomposition import CausalMovingAverage1D
+        #     self.decomp = CausalMovingAverage1D(window=self.cfg.decomp.ma_window)
+        #     self.decomp_mode = self.cfg.decomp.concat_mode  # 'concat'|'residual_only'|'trend_only'
+        # else:
+        #     self.decomp, self.decomp_mode = None, None
 
-    def forward(self, z):
-        '''
-        z: tensor [bs x num_patch x patch_len]
-        '''
-        z = self.backbone(z)
-        z = self.head(z)
-        # z: [bs x target_dim x nvars] for prediction
-        #    [bs x target_dim] for regression
-        #    [bs x target_dim] for classification
-        #    [bs x num_patch x n_vars x patch_len] for pretrain
-        return z
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
+        """
+        z: 백본이 기대하는 입력 텐서 형식으로 전달.
+           - SupervisedBackbone이 (B,L,C)를 받도록 구현되어 있다면 그 형식으로 넘기고,
+           - SelfSupervisedBackbone이 (B, num_patch, patch_len)를 받도록 구현되어 있으면 그 형식으로 넘기세요.
+        """
+        # (선택) 분해 훅이 외부라면 여기서 적용
+        # if self.decomp is not None and z.dim() == 3 and z.shape[1] == self.cfg.lookback:
+        #     # 예: (B,L,C) → (B,C,L) 변환 후 분해/concat/맵핑 등
+        #     ...
+
+        feats = self.backbone(z)    # 백본 출력 형식은 각 헤드가 기대하는 토큰/표현
+        out = self.head(feats)
+        return out
 
 
 

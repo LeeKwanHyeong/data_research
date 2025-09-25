@@ -12,15 +12,16 @@ class SupervisedBackbone(BasePatchTSTBackbone):
         self.head = self.build_head()
         cfg = self.cfg
 
-    def build_head(self) -> nn.Module:
+    def build_head(self):
+        # cfg: PatchTSTConfig
         return Flatten_Head(
-            individual = self.cfg.head.individual,
-            n_vars = self.cfg.c_in,
-            nf = self.head_nf,
-            target_window = self.cfg.horizon,
-            head_dropout = self.cfg.head.head_dropout
+            d_model=self.cfg.d_model,
+            patch_num=self.patch_num,
+            horizon=self.cfg.horizon,
+            n_vars=self.cfg.c_in,
+            individual=getattr(self.cfg, "individual", False),
+            dropout=getattr(self.cfg, "head_dropout", 0.0),
         )
-
     def head_forward(self, z):
         # z: [B, nvars, d_model, patch_num] -> [B, nvars, horizon]
         return self.head(z)

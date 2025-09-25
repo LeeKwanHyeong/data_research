@@ -1,7 +1,7 @@
-import copy, torch
-import torch.optim as optim
-from torch import nn
-from torch.cuda.amp import GradScaler, autocast
+import copy
+import torch
+
+from torch.amp import autocast, GradScaler
 
 from training.adapters import DefaultAdapter
 from training.losses import LossComputer
@@ -16,11 +16,26 @@ class CommonTrainer:
         self.loss_comp = LossComputer(cfg)
         self.metrics_fn = metrics_fn # (pred, y) -> dict or None
 
+        self.amp_enabled = (self.cfg.amp_device == "cuda" and torch.cuda.is_available())
+
+
+    def _to_tensor(self, x, device):
+        if x is None:
+            raise RuntimeError(
+                "[Loss None] loss is None. Check LossComputer.compute() and model output.\n"
+                f"- amp_device={self.cfg.amp_device}, device={device}"
+            )
+        if torch.is_tensor(x):
+            return x
+        return torch.as_tensor(x, dtype=torch.float32, device=device)
+
     def _run_epoch(self, model, loader, *, train: bool):
         device = self.cfg.device
         total = 0.0
         if train: model.train()
         else: model.eval()
+
+
         with torch.set_grad_enabled(train):
             for batch in loader:
                 if len(batch) == 3:
@@ -33,7 +48,7 @@ class CommonTrainer:
                 if train:
                     self.opt.zero_grad(set_to_none=True)
 
-                with autocast(self.cfg.amp_device):
+                with autocast(self.cfg.amp_device, enabled = self.amp_enabled):
                     pred = self.adapter.forward(model, x)
                     loss = self.loss_comp.compute(pred, y, is_val = not train)
                     r = self.adapter.reg_loss(model)
@@ -41,8 +56,11 @@ class CommonTrainer:
                         loss = loss + r
 
                 if train:
-                    if torch.isnan(loss):
-                        self.logger("[Warn] Nan loss. step skipped.")
+                    # loss가 텐서가 아닐 가능성(예: float)도 방어
+                    loss_t = self._to_tensor(loss, device)
+                    # NaN 방지
+                    if torch.isnan(loss_t):
+                        self.logger("[Warn] NaN loss. step skipped.")
                         continue
                     self.scaler.scale(loss).backward()
                     self.scaler.unscale_(self.opt)
@@ -56,7 +74,7 @@ class CommonTrainer:
         device = self.cfg.device
         model.to(device)
         self.opt, self.sched = build_optimizer_and_scheduler(model, self.cfg)
-        self.scaler = GradScaler()
+        self.scaler = GradScaler(self.cfg.amp_device)
 
         best_loss = float('inf')
         best_state = copy.deepcopy(model.state_dict())
@@ -86,19 +104,19 @@ class CommonTrainer:
                         loss = self.adapter.tta_adapt(model, x_val, y_val, steps = tta_steps)
                         if loss is None:
                             # fallback: 일반 검증
-                            with autocast(self.cfg.amp_device):
+                            with autocast(self.cfg.amp_device, enabled = self.amp_enabled):
                                 pred = self.adapter.forward(model, x_val)
                                 loss = self.loss_comp.compute(pred, y_val, is_val = True)
                                 loss = float(loss.detach())
                         val_total += loss
                     else:
-                        with autocast(self.cfg.amp_device):
+                        with autocast(self.cfg.amp_device, enabled = self.amp_enabled):
                             pred = self.adapter.forward(model, x_val)
                             vloss = self.loss_comp.compute(pred, y_val, is_val = True)
                             val_total += float(vloss.detach())
 
                     if self.metrics_fn:
-                        m = self.metrics_fn(pred, y_val)
+                        _ = self.metrics_fn(pred, y_val)
             val_loss = val_total / max(1, len(val_loader))
 
             # Scheduler

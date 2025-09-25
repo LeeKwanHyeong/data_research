@@ -24,14 +24,18 @@ def mape(pred, true):
 def mspe(pred, true):
     return np.mean(np.square((pred - true) / true))
 
+def smape(y, yhat, eps=1e-8):
+    return float(np.mean(2.0 * np.abs(y - yhat) / (np.abs(y) + np.abs(yhat) + eps)))
+
 def metric(pred, true):
     o_mae = mae(pred, true)
     o_mse = mse(pred, true)
     o_rmse = rmse(pred, true)
     o_mape = mape(pred, true)
     o_mspe = mspe(pred, true)
+    o_smape = smape(pred, true)
     o_rse = rse(pred, true)
     o_corr = corr(pred, true)
-    return o_mae, o_mse, o_rmse, o_mape, o_mspe, o_rse, o_corr
+    return o_mae, o_mse, o_rmse, o_mape, o_mspe, o_smape, o_rse, o_corr
 
 

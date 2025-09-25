@@ -1,11 +1,10 @@
 import torch
 import torch.nn as nn
 
-from configs import PatchTSTConfig
-from encoder import TSTiEncoder
-from models.layers.RevIN import RevIN
-from patching import compute_patch_num, do_patch
-
+from models.PatchTST.common.configs import PatchTSTConfig
+from models.PatchTST.common.encoder import TSTiEncoder
+from models.PatchTST.common.patching import compute_patch_num, do_patch
+from models.common_layers.RevIN import RevIN
 
 class BasePatchTSTBackbone(nn.Module):
     """공통: RevIN, patching, encoder 조립. Head는 서브클래스에서 구현."""
