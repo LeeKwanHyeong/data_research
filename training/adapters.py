@@ -34,7 +34,11 @@ class DefaultAdapter:
     '''
 
     def _call_model(self, model, x):
-        # 입력이 (ts, feat) 튜플일 수도 있음
+        # dict는 model(**x)로
+        if isinstance(x, dict):
+            return model(**x)
+
+        # 기존 로직 유지
         if isinstance(x, (tuple, list)):
             return model(*x)
         return model(x)

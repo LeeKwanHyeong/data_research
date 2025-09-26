@@ -9,15 +9,16 @@ from training.optim import build_optimizer_and_scheduler
 
 
 class CommonTrainer:
-    def __init__(self, cfg, adapter, *, metrics_fn = None, logger = print):
+    def __init__(self, cfg, adapter, *, metrics_fn=None, logger=print,
+                 future_exo_cb=None):  # 추가: exo 콜백
         self.cfg = cfg
         self.adapter: DefaultAdapter = adapter
         self.logger = logger
         self.loss_comp = LossComputer(cfg)
-        self.metrics_fn = metrics_fn # (pred, y) -> dict or None
+        self.metrics_fn = metrics_fn
+        self.future_exo_cb = future_exo_cb  # 저장
 
         self.amp_enabled = (self.cfg.amp_device == "cuda" and torch.cuda.is_available())
-
 
     def _to_tensor(self, x, device):
         if x is None:
@@ -29,18 +30,37 @@ class CommonTrainer:
             return x
         return torch.as_tensor(x, dtype=torch.float32, device=device)
 
+    def _pack_input(self, x, y, *, device):
+        """
+        ✅ future_exo_cb가 있으면 (x, exo)로, 없으면 x 그대로 반환.
+        exo shape: (B, H, exo_dim) — 여기서 H = y.size(1)
+        """
+        if self.future_exo_cb is None:
+            return x
+
+        B = x.size(0)
+        H = y.size(1)  # 타깃 horizon과 동일 길이
+
+        # t0는 필요시 데이터셋에서 꺼내도록 인터페이스를 열어두되, 기본은 0
+        t0 = 0
+        exo = self.future_exo_cb(t0, H, device=device)   # (H, exo_dim)
+        exo = exo.unsqueeze(0).expand(B, -1, -1).to(device)  # (B, H, exo_dim)
+
+        # 1) 튜플로 넘기기 → model(x, exo)
+        return (x, exo)
+
+        # 만약 dict로 넘기고 싶으면 아래처럼:
+        # return {"x": x, "future_exo": exo}
+
     def _run_epoch(self, model, loader, *, train: bool):
         device = self.cfg.device
         total = 0.0
-        if train: model.train()
-        else: model.eval()
-
+        model.train() if train else model.eval()
 
         with torch.set_grad_enabled(train):
             for batch in loader:
                 if len(batch) == 3:
                     x, y, _ = batch
-
                 else:
                     x, y = batch
                 x, y = x.to(device), y.to(device)
@@ -48,25 +68,26 @@ class CommonTrainer:
                 if train:
                     self.opt.zero_grad(set_to_none=True)
 
-                with autocast(self.cfg.amp_device, enabled = self.amp_enabled):
-                    pred = self.adapter.forward(model, x)
-                    loss = self.loss_comp.compute(pred, y, is_val = not train)
+                x_in = self._pack_input(x, y, device=device)  # exo 포함 입력 패킹
+
+                with autocast(self.cfg.amp_device, enabled=self.amp_enabled):
+                    pred = self.adapter.forward(model, x_in)
+                    loss = self.loss_comp.compute(pred, y, is_val=not train)
                     r = self.adapter.reg_loss(model)
                     if r is not None:
                         loss = loss + r
 
                 if train:
-                    # loss가 텐서가 아닐 가능성(예: float)도 방어
                     loss_t = self._to_tensor(loss, device)
-                    # NaN 방지
                     if torch.isnan(loss_t):
                         self.logger("[Warn] NaN loss. step skipped.")
                         continue
-                    self.scaler.scale(loss).backward()
+                    self.scaler.scale(loss_t).backward()
                     self.scaler.unscale_(self.opt)
                     torch.nn.utils.clip_grad_norm_(model.parameters(), self.cfg.max_grad_norm)
                     self.scaler.step(self.opt)
                     self.scaler.update()
+
                 total += float(loss.detach())
         return total / max(1, len(loader))
 
@@ -80,13 +101,11 @@ class CommonTrainer:
         best_state = copy.deepcopy(model.state_dict())
         counter = 0
 
-        # TTA Initialize
         if self.adapter.uses_tta():
             self.adapter.tta_reset(model)
 
         for epoch in range(self.cfg.epochs):
-            # Warming Up: 간헐 가중 alpha_zero 서서히 키우고 싶다면 여기서 cfg 동적 조절
-            train_loss = self._run_epoch(model, train_loader, train = True)
+            train_loss = self._run_epoch(model, train_loader, train=True)
 
             # ---- Validation ----
             model.eval()
@@ -99,30 +118,28 @@ class CommonTrainer:
                         x_val, y_val = batch
                     x_val, y_val = x_val.to(device), y_val.to(device)
 
+                    x_in = self._pack_input(x_val, y_val, device=device)  # exo 포함
+
                     if tta_steps > 0 and self.adapter.uses_tta():
-                        # Titan: Memory-as-Context
-                        loss = self.adapter.tta_adapt(model, x_val, y_val, steps = tta_steps)
+                        loss = self.adapter.tta_adapt(model, x_in, y_val, steps=tta_steps)  # TTA도 x_in 전달을 원하면 어댑터 쪽에서 처리 필요
                         if loss is None:
-                            # fallback: 일반 검증
-                            with autocast(self.cfg.amp_device, enabled = self.amp_enabled):
-                                pred = self.adapter.forward(model, x_val)
-                                loss = self.loss_comp.compute(pred, y_val, is_val = True)
+                            with autocast(self.cfg.amp_device, enabled=self.amp_enabled):
+                                pred = self.adapter.forward(model, x_in)
+                                loss = self.loss_comp.compute(pred, y_val, is_val=True)
                                 loss = float(loss.detach())
                         val_total += loss
                     else:
-                        with autocast(self.cfg.amp_device, enabled = self.amp_enabled):
-                            pred = self.adapter.forward(model, x_val)
-                            vloss = self.loss_comp.compute(pred, y_val, is_val = True)
+                        with autocast(self.cfg.amp_device, enabled=self.amp_enabled):
+                            pred = self.adapter.forward(model, x_in)
+                            vloss = self.loss_comp.compute(pred, y_val, is_val=True)
                             val_total += float(vloss.detach())
 
                     if self.metrics_fn:
                         _ = self.metrics_fn(pred, y_val)
-            val_loss = val_total / max(1, len(val_loader))
 
-            # Scheduler
+            val_loss = val_total / max(1, len(val_loader))
             self.sched.step()
 
-            # Early Stopping
             if val_loss < best_loss:
                 best_loss, counter = val_loss, 0
                 best_state = copy.deepcopy(model.state_dict())

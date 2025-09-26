@@ -64,7 +64,7 @@ class TitanDecoder(nn.Module):
         self.exo_dim = exo_dim
 
         self.query_embed = nn.Parameter(torch.randn(1, horizon, d_model) * 0.02)
-        self.pos_embed = nn.Parameter(torch.randn(1, horizon, d_model) * 0.02)
+        self.pos_embed   = nn.Parameter(torch.randn(1, horizon, d_model) * 0.02)
 
         self.exo_proj = nn.Linear(exo_dim, d_model) if exo_dim > 0 else None
 
@@ -73,23 +73,24 @@ class TitanDecoder(nn.Module):
             for _ in range(n_layers)
         ])
 
-    def forward(self, memory: torch.Tensor, future_exo: torch.Tensor | None = None):
-        """
-        memory:     [B, L, D] (encoder output)
-        future_exo: [B, H, exo_dim] or None
-        return:     [B, H, D]
-        """
+    def forward(self,
+                memory: torch.Tensor,                 # [B, L, D]
+                future_exo: torch.Tensor | None=None # [B, H, exo_dim] or None
+                ):
         B, L, D = memory.shape
         H = self.horizon
 
-        # future query(learned) + pos emb ( + exo)
+        # 기본 target query + pos
         tgt = self.query_embed.expand(B, H, D) + self.pos_embed.expand(B, H, D)
+
+        # 달력 exo 있으면 투영 후 더해줌
         if (self.exo_proj is not None) and (future_exo is not None):
+            # future_exo: [B, H, exo_dim]
             tgt = tgt + self.exo_proj(future_exo)
 
         x = tgt
-
         for layer in self.layers:
-            x = layer(x, memory)
-        return x # [B, H, D]
+            x = layer(x, memory)   # [B, H, D]
+
+        return x
 

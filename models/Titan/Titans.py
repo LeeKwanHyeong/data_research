@@ -285,7 +285,7 @@ class FeatureModel(nn.Module):
         encoded = self.encoder(x)
 
         if encoded.dim() != 3:
-            raise RuntimeError(f"Encoder must return (B,L,D). Got {tuple(enc.shape)}")
+            raise RuntimeError(f"Encoder must return (B,L,D). Got {tuple(encoded.shape)}")
 
 
         # 부가 피처 인코딩

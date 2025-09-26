@@ -19,7 +19,7 @@ class TitanConfig(TrainingConfig):
     # --------------- Decoder -----------------
     n_dec_layers = 1                    # 1~2 권장
     dec_dropout = 0.1
-    exo_dim = 0                         # 미래 외생변수 차원(없으면 0)
+    exo_dim = 2                         # 미래 외생변수 차원(없으면 0)
     nonneg_head = True                  # 수요 비음수 보장 (Softplus)
 
     @property
@@ -30,6 +30,7 @@ class TitanConfig(TrainingConfig):
 class TitanConfigMonthly(TitanConfig):
     lookback: int = 36
     horizon: int = 48
+    exo_dim: int = 2
 
 @dataclass
 class TitanConfigWeekly(TitanConfig):
