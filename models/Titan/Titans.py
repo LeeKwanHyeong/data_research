@@ -43,7 +43,18 @@ class Model(nn.Module):
         # - 인코더의 은닉 상태(d_model)를 미래 예측 시점(output_horizon) 길이로 변환
         self.output_proj = nn.Linear(config.d_model, config.horizon)
 
-    def forward(self, x):
+        # exo가 있을 경우: (H, exo_dim) -> (H)로 만ㅁ드는 작은 헤드
+        self.exo_dim = getattr(config, 'exo_dim', 0)
+        if self.exo_dim > 0:
+            self.exo_head = nn.Sequential(
+                nn.Linear(self.exo_dim, config.d_model),
+                nn.GELU(),
+                nn.Linear(config.d_model, 1)    # time-distributed: 마지막에 squeeze(-1)
+            )
+        else:
+            self.exo_head = None
+
+    def forward(self, x, future_exo: torch.Tensor | None = None):
 
         # Input Normalization
         x = self.revin_layer(x, 'norm') # [batch, seq_len, input_dim]
@@ -54,8 +65,15 @@ class Model(nn.Module):
         if encoded.dim() != 3:
             raise RuntimeError(f"Encoder must return (B,L,D). Got {tuple(encoded.shape)}")
 
+
         # 마지막 타임스텝(hidden state)만 사용하여 예측
-        pred = self.output_proj(encoded[:, -1, :]) # [batch, output_horizon]
+        pred = self.output_proj(encoded[:, -1, :])  # [batch, output_horizon]
+
+        if (self.self.exo_head is not None) and (future_exo is not None):
+            # future_exo : [B, H, exo_dim]
+            exo_term = self.exo_head(future_exo).squeeze(-1)    # [B, H]
+            pred = pred + exo_term
+
 
         # 예측값 역정규화 (Denormalization)
         pred = self.revin_layer(pred.unsqueeze(1), 'denorm').squeeze(1) # [batch, output_horizon]
@@ -113,8 +131,18 @@ class LMMModel(nn.Module):
             out_dim = config.horizon
         )
 
+        self.exo_dim = getattr(config, 'exo_dim', 0)
+        if self.exo_dim > 0:
+            self.exo_head = nn.Sequential(
+                nn.Linear(self.exo_dim, config.d_model),
+                nn.GELU(),
+                nn.Linear(config.d_model, 1)
+            )
+        else:
+            self.exo_head = None
+
     # --------------------------- Train ---------------------------
-    def forward(self, x, mode = 'train'):
+    def forward(self, x, future_exo: torch.Tensor, mode = 'train'):
         # 입력 정규화 (Normalization)
         x = self.revin_layer(x, 'norm') # [batch, seq_len, input_dim]
         # 인코딩 (Encoding)
@@ -166,16 +194,21 @@ class LMMModel(nn.Module):
             enhanced = self.lmm(encoded, memory)  # (B, L, D)
             pred = self.output_proj(enhanced[:, -1, :])  # (B, out_dim)
             pred = pred + self.trend_corrector(enhanced[:, -1, :])  # 2D 입력 허용
-            pred = self.revin_layer(pred.unsqueeze(1), 'denorm').squeeze(1)
-            return pred
 
         # --------------------------- Inference ---------------------------
         else:
             # 추론 시에도 Trend 보정을 위한 시퀀스가 필요하므로 encoded 전달은 유지
             pred = self.output_proj(encoded[:, -1, :])
             pred = pred + self.trend_corrector(encoded)
-            pred = self.revin_layer(pred.unsqueeze(1), 'denorm').squeeze(1)
-            return pred
+
+        if (self.exo_head is not None) and (future_exo is not None):
+            exo_term = self.exo_head(future_exo).squeeze(-1)
+            pred = pred + exo_term
+
+        y = self.revin_layer(pred.unsqueeze(1), 'denorm').squeeze(1)
+        return y
+
+
 
 # ---- Seq2Seq 모델 (Encoder + Causal Decoder) ----
 class LMMSeq2SeqModel(nn.Module):

@@ -4,6 +4,7 @@ import torch.nn as nn
 from models.PatchMixer.backbone import PatchMixerBackbone, MultiScalePatchMixerBackbone
 from models.PatchMixer.common.configs import PatchMixerConfig
 from models.PatchMixer.common.head import DecompQuantileHead
+from models.common_layers.TrendCorrector import TrendCorrector
 
 
 # -------------------------
@@ -15,7 +16,7 @@ class PatchMixerModel(nn.Module):
     -> MLP
     -> horizon regression
     """
-    def __init__(self, configs: PatchMixerConfig):
+    def __init__(self, configs: PatchMixerConfig, exo_dim: int = 0):
         super().__init__()
         self.backbone = PatchMixerBackbone(configs = configs)
 
@@ -32,10 +33,25 @@ class PatchMixerModel(nn.Module):
             nn.Linear(64, configs.horizon)
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        self.horizon = configs.horizon
+        self.exo_dim = exo_dim
+        self.exo_head = None
+        if self.exo_dim > 0:
+            self.exo_head = nn.Sequential(
+                nn.Linear(self.exo_dim, 64),
+                nn.GELU(),
+                nn.Linear(64, 1)
+            )
+
+    def forward(self, x: torch.Tensor, future_exo: torch.Tensor | None = None) -> torch.Tensor:
         patch_repr = self.backbone(x)       # (B, a * d_model)
         patch_repr = self.proj(patch_repr)  # (B, 128)
         out = self.fc(patch_repr)           # (B, H)
+
+        if (self.exo_head is not None) and (future_exo is not None):
+            # (B, H, exo_dim) -> (B, H, 1) -> (B, H)
+            ex = self.exo_head(future_exo).squeeze(-1)
+            out = out + ex
         return out
 
 # -------------------------
@@ -46,7 +62,7 @@ class PatchMixerFeatureModel(nn.Module):
     Timeseries + static/exogenous feature combined head.
     feature_input: (B, feature_dim)
     """
-    def __init__(self, configs: PatchMixerConfig, feature_dim: int = 4):
+    def __init__(self, configs: PatchMixerConfig, feature_dim: int = 4, exo_dim: int = 0):
         super().__init__()
         self.backbone = PatchMixerBackbone(configs = configs)
 
@@ -74,7 +90,20 @@ class PatchMixerFeatureModel(nn.Module):
             nn.Linear(64, configs.horizon)
         )
 
-    def forward(self, ts_input: torch.Tensor, feature_input: torch.Tensor) -> torch.Tensor:
+        self.exo_dim = exo_dim
+        self.exo_head = None
+        if self.exo_dim > 0:
+            self.exo_head = nn.Sequential(
+                nn.Linear(self.exo_dim, 64),
+                nn.GELU(),
+                nn.Linear(64, 1),  # -> time-distributed scalar
+            )
+
+    def forward(self,
+                ts_input: torch.Tensor,
+                feature_input: torch.Tensor,
+                future_exo: torch.Tensor | None = None
+                ) -> torch.Tensor:
         """
         ts_input: (B, L, N)
         feature_input: (B, F)
@@ -85,6 +114,12 @@ class PatchMixerFeatureModel(nn.Module):
         feature_repr = self.feature_mlp(feature_input)                    # (B, feature_out_dim)
         combined = torch.cat([patch_repr, feature_repr], dim = 1)  # (B, 128 + feature_out_dim)
         out = self.fc(combined)
+
+        if (self.exo_dim is not None) and (future_exo is not None):
+            # (B, H, exo_dim) -> (B, H, 1) -> (B, H)
+            ex = self.exo_head(future_exo).squeeze(-1)
+            out = out + ex
+
         return out
 
 # -------------------------
@@ -103,6 +138,7 @@ class PatchMixerQuantileModel(nn.Module):
                  per_branch_dim: int = 128,
                  fusion: str = 'concat',
                  n_harmonics: int = 4,
+                 exo_dim: int = 0
                  ):
         super().__init__()
         H = horizon if horizon is not None else base_configs.horizon
@@ -119,14 +155,27 @@ class PatchMixerQuantileModel(nn.Module):
             quantiles=(0.1, 0.5, 0.9),
             n_harmonics=n_harmonics,
         )
+        self.horizon = H
+        self.exo_dim = exo_dim
+        self.exo_head = None
+        if self.exo_dim > 0:
+            self.exo_head = nn.Sequential(
+                nn.Linear(self.exo_dim, 64),
+                nn.GELU(),
+                nn.Linear(64, 1)
+            )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, future_exo: torch.Tensor | None = None) -> torch.Tensor:
         """
         x: (B, L, N)
         return: (B, 3, H)
         """
-        z = self.backbone(x)
-        q = self.head(z)
+        z = self.backbone(x)    # (B, fused_dim)
+        q = self.head(z)        # (B, 3, H)
+
+        if (self.exo_head is not None) and (future_exo is not None):
+            ex = self.exo_head(future_exo).squeeze(-1)  # (B, H)
+            q = q + ex[:, None, :]                      # shift all quantiles equally
         return q
 
 

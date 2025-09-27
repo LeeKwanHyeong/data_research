@@ -16,7 +16,14 @@ class ModelAdapter(Protocol):
       적응 과정의 Scalar Loss 등 반환할 수 있음
     '''
 
-    def forward(self, model: nn.Module, x_batch: Any) -> torch.Tensor: ...
+    def forward(
+            self,
+            model: nn.Module,
+            x_batch: Any,
+            *,
+            future_exo: Optional[torch.Tensor] = None,
+            mode: Optional[str] = None,
+    ) -> torch.Tensor: ...
 
     def reg_loss(self, model: nn.Module) -> Optional[torch.Tensor]: ...
 
@@ -33,58 +40,74 @@ class DefaultAdapter:
     - 별도의 정규화 손실이나 TTA를 사용하지 않는 가장 단순한 형태.
     '''
 
-    def _call_model(self, model, x):
-        # dict는 model(**x)로
+    def _call_model(self, model, x, *, future_exo=None, mode=None):
+        # dict 입력이면 키를 병합해서 모델에 그대로 전달
         if isinstance(x, dict):
-            return model(**x)
+            d = dict(x)
+            if future_exo is not None and "future_exo" not in d:
+                d["future_exo"] = future_exo
+            if mode is not None and "mode" not in d:
+                d["mode"] = mode
+            return model(**d)
 
-        # 기존 로직 유지
+        # tuple/list 입력 → 다양한 시그니처를 안전하게 시도
         if isinstance(x, (tuple, list)):
+            try:
+                return model(*x, future_exo=future_exo, mode=mode)
+            except TypeError:
+                pass
+            try:
+                if future_exo is not None:
+                    return model(*x, future_exo=future_exo)
+            except TypeError:
+                pass
+            try:
+                if mode is not None:
+                    return model(*x, mode=mode)
+            except TypeError:
+                pass
             return model(*x)
+
+        # 텐서/기타 단일 입력
+        try:
+            return model(x, future_exo=future_exo, mode=mode)
+        except TypeError:
+            pass
+        try:
+            if future_exo is not None:
+                return model(x, future_exo=future_exo)
+        except TypeError:
+            pass
+        try:
+            if mode is not None:
+                return model(x, mode=mode)
+        except TypeError:
+            pass
         return model(x)
 
     def _as_tensor(self, out):
-        # tuple/list → 첫 번째 텐서
         if isinstance(out, (tuple, list)):
             for item in out:
-                if torch.is_tensor(item):
-                    return item
-            # 텐서가 없으면 실패
+                if torch.is_tensor(item): return item
             raise TypeError(f"Model returned tuple/list without a Tensor: {type(out)}")
-        # dict → 우선키 탐색
         if isinstance(out, dict):
             for k in PREFERRED_KEYS:
                 v = out.get(k, None)
-                if torch.is_tensor(v):
-                    return v
-            # dict의 값들 중 첫 텐서
+                if torch.is_tensor(v): return v
             for v in out.values():
-                if torch.is_tensor(v):
-                    return v
+                if torch.is_tensor(v): return v
             raise TypeError(f"Model returned dict without a Tensor value: keys={list(out.keys())}")
-        # 텐서
-        if torch.is_tensor(out):
-            return out
+        if torch.is_tensor(out): return out
         raise TypeError(f"Model output is not a Tensor/tuple/dict: {type(out)}")
 
-    def forward(self, model, x_batch):
-        # 모델에 전달할 입력 형식 통일: (x, mask, ...) 형태면 unpacking
-        out = self._call_model(model, x_batch)
+    def forward(self, model, x_batch, *, future_exo=None, mode=None):
+        out = self._call_model(model, x_batch, future_exo=future_exo, mode=mode)
         return self._as_tensor(out)
 
-    def reg_loss(self, model):
-        # 추가 정규화 손실이 없는 경우 None
-        return None
-
-    def uses_tta(self):
-        # Default Adapter는 TTA 사용 안함
-        return False
-    def tta_reset(self, model):
-        # TTA 상태 초기화가 필요 없으므로 pass
-        pass
-    def tta_adapt(self, model, x_val, y_val, steps):
-        # TTA를 사용하지 않으므로 적응 수행 없이 None 반환
-        return None
+    def reg_loss(self, model): return None
+    def uses_tta(self): return False
+    def tta_reset(self, model): pass
+    def tta_adapt(self, model, x_val, y_val, steps): return None
 
 class PatchMixerAdapter(DefaultAdapter):
     '''

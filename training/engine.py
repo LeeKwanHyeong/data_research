@@ -10,13 +10,13 @@ from training.optim import build_optimizer_and_scheduler
 
 class CommonTrainer:
     def __init__(self, cfg, adapter, *, metrics_fn=None, logger=print,
-                 future_exo_cb=None):  # 추가: exo 콜백
+                 future_exo_cb=None):  # exo 콜백
         self.cfg = cfg
         self.adapter: DefaultAdapter = adapter
         self.logger = logger
         self.loss_comp = LossComputer(cfg)
         self.metrics_fn = metrics_fn
-        self.future_exo_cb = future_exo_cb  # 저장
+        self.future_exo_cb = future_exo_cb
 
         self.amp_enabled = (self.cfg.amp_device == "cuda" and torch.cuda.is_available())
 
@@ -30,27 +30,20 @@ class CommonTrainer:
             return x
         return torch.as_tensor(x, dtype=torch.float32, device=device)
 
-    def _pack_input(self, x, y, *, device):
+    def _make_future_exo(self, x, y, *, device):
         """
-        ✅ future_exo_cb가 있으면 (x, exo)로, 없으면 x 그대로 반환.
-        exo shape: (B, H, exo_dim) — 여기서 H = y.size(1)
+        future_exo_cb가 있으면 (B, H, exo_dim) 텐서를 만들어 반환.
+           없으면 None.
+        H는 타깃 y의 길이로 맞춥니다.
         """
         if self.future_exo_cb is None:
-            return x
-
+            return None
         B = x.size(0)
-        H = y.size(1)  # 타깃 horizon과 동일 길이
-
-        # t0는 필요시 데이터셋에서 꺼내도록 인터페이스를 열어두되, 기본은 0
-        t0 = 0
-        exo = self.future_exo_cb(t0, H, device=device)   # (H, exo_dim)
+        H = y.size(1)  # 타깃 horizon
+        t0 = 0  # 필요 시 데이터셋에서 시작 인덱스를 꺼내도록 확장 가능
+        exo = self.future_exo_cb(t0, H, device=device)     # (H, exo_dim)
         exo = exo.unsqueeze(0).expand(B, -1, -1).to(device)  # (B, H, exo_dim)
-
-        # 1) 튜플로 넘기기 → model(x, exo)
-        return (x, exo)
-
-        # 만약 dict로 넘기고 싶으면 아래처럼:
-        # return {"x": x, "future_exo": exo}
+        return exo
 
     def _run_epoch(self, model, loader, *, train: bool):
         device = self.cfg.device
@@ -68,10 +61,17 @@ class CommonTrainer:
                 if train:
                     self.opt.zero_grad(set_to_none=True)
 
-                x_in = self._pack_input(x, y, device=device)  # exo 포함 입력 패킹
+                # exo 생성 (필요 시)
+                future_exo = self._make_future_exo(x, y, device=device)
 
                 with autocast(self.cfg.amp_device, enabled=self.amp_enabled):
-                    pred = self.adapter.forward(model, x_in)
+                    # kwarg로 안전 전달
+                    pred = self.adapter.forward(
+                        model,
+                        x,
+                        future_exo=future_exo,
+                        mode=("train" if train else "eval"),
+                    )
                     loss = self.loss_comp.compute(pred, y, is_val=not train)
                     r = self.adapter.reg_loss(model)
                     if r is not None:
@@ -118,19 +118,27 @@ class CommonTrainer:
                         x_val, y_val = batch
                     x_val, y_val = x_val.to(device), y_val.to(device)
 
-                    x_in = self._pack_input(x_val, y_val, device=device)  # exo 포함
+                    # exo 생성 (검증 시에도 동일하게)
+                    future_exo = self._make_future_exo(x_val, y_val, device=device)
 
                     if tta_steps > 0 and self.adapter.uses_tta():
-                        loss = self.adapter.tta_adapt(model, x_in, y_val, steps=tta_steps)  # TTA도 x_in 전달을 원하면 어댑터 쪽에서 처리 필요
+                        # TTA는 기본적으로 x만 사용 (필요하면 어댑터/TTM 쪽 확장)
+                        loss = self.adapter.tta_adapt(model, x_val, y_val, steps=tta_steps)
                         if loss is None:
                             with autocast(self.cfg.amp_device, enabled=self.amp_enabled):
-                                pred = self.adapter.forward(model, x_in)
+                                pred = self.adapter.forward(
+                                    model, x_val,
+                                    future_exo=future_exo, mode="eval"
+                                )
                                 loss = self.loss_comp.compute(pred, y_val, is_val=True)
                                 loss = float(loss.detach())
                         val_total += loss
                     else:
                         with autocast(self.cfg.amp_device, enabled=self.amp_enabled):
-                            pred = self.adapter.forward(model, x_in)
+                            pred = self.adapter.forward(
+                                model, x_val,
+                                future_exo=future_exo, mode="eval"
+                            )
                             vloss = self.loss_comp.compute(pred, y_val, is_val=True)
                             val_total += float(vloss.detach())
 

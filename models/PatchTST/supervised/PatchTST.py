@@ -12,7 +12,7 @@ class Model(nn.Module):
     입력:  x (B, L, C)  - Batch, Lookback, Channels
     출력:  ŷ (B, H, C)  - Batch, Horizon, Channels (외부 파이프라인 정합을 위해 통일)
     """
-    def __init__(self, configs: PatchTSTConfig):
+    def __init__(self, configs: PatchTSTConfig, exo_dim: int | None = None):
         super().__init__()
         self.configs = configs
 
@@ -36,6 +36,20 @@ class Model(nn.Module):
         else:
             self.input_mapper = nn.Identity()
 
+        # ----- Future EXO ------
+        # 우선 config.exo_dim을 우선, 인자로 덮어쓰기
+        self.exo_dim = int(getattr(configs, 'exo_dim', 0) if exo_dim is None else exo_dim)
+        self.horizon = configs.horizon
+
+        # exo_dim > 0이면 (B, H, exo_dim) -> (B, H, 1) time-distributed 가산항
+        self.exo_head = None
+        if self.exo_dim > 0:
+            self.exo_head = nn.Sequential(
+                nn.Linear(self.exo_dim, 64),
+                nn.GELU(),
+                nn.Linear(64, 1)    # (B, H, exo_dim) -> (B, H, 1)
+            )
+
     def _apply_decomposition(self, x_bcl: Tensor) -> Tensor:
         """x_bcl: (B, C, L) -> (B, C or 2C, L)"""
         if not self.decomp:
@@ -49,7 +63,7 @@ class Model(nn.Module):
             x_bcl = residual
         return x_bcl
 
-    def forward(self, x: Tensor) -> Tensor:
+    def forward(self, x: Tensor, future_exo: Tensor | None = None) -> Tensor:
         """
         x: (B, L, C)  -> permute -> (B, C, L) -> [decomp] -> input_mapper -> backbone
         backbone 출력: (B, nvars, H) -> permute -> (B, H, nvars)
@@ -69,4 +83,11 @@ class Model(nn.Module):
 
         # 5) 출력 차원 정규화
         y = y.permute(0, 2, 1)  # (B, H, nvars)
+
+        # 6) EXO 가산 - 모든 변수에 같은 시간별 shift 덧셈
+        if (self.exo_head is not None) and (future_exo is not None):
+            # future_exo: (B, H, exo_dim) -> (B, H, 1) -> (B, H, 1) broadcast
+            ex = self.exo_head(future_exo).squeeze(-1)  # (B, H)
+            y = y + ex.unsqueeze(-1)                    # (B, H, 1) + (B, H, C)
+
         return y
