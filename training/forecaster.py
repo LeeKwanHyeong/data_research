@@ -9,6 +9,8 @@ def make_calendar_exo(start_idx: int, H: int, period: int = 12, device = 'cpu'):
     exo = torch.stack([torch.sin(2*torch.pi*t/period), torch.cos(2*torch.pi*t/period)], dim = -1) # (H, 2)
     return exo # (H, 2)
 
+
+
 def _prepare_next_input(
         x: torch.Tensor,
         y_step: torch.Tensor,
@@ -139,6 +141,37 @@ class DMSForecaster:
     - global_t0: 예측 시작의 '절대 인덱스' (필요시 호출 전 세팅)
     """
 
+    def _probe_hm(self, x: torch.Tensor, B: int) -> int:
+        """
+        모델의 실제 출력 길이(Hm)를 안전하게 프로빙.
+        - model(x)
+        - model(x, mode=...)
+        - model(x, future_exo=None)
+        - model(x, future_exo=None, mode=...)
+        순으로 시도해서 첫 성공 출력의 size(1)를 반환.
+        """
+        # 1) model(x)
+        try:
+            y = self.model(x);
+            return self._normalize_out(y, B).size(1)
+        except TypeError:
+            pass
+        # 2) model(x, mode=...)
+        try:
+            y = self.model(x, mode=(self.lmm_mode or "eval"))
+            return self._normalize_out(y, B).size(1)
+        except TypeError:
+            pass
+        # 3) model(x, future_exo=None)
+        try:
+            y = self.model(x, future_exo=None)
+            return self._normalize_out(y, B).size(1)
+        except TypeError:
+            pass
+        # 4) model(x, future_exo=None, mode=...)
+        y = self.model(x, future_exo=None, mode=(self.lmm_mode or "eval"))
+        return self._normalize_out(y, B).size(1)
+
     def __init__(self,
                  model: torch.nn.Module,
                  target_channel: int = 0,
@@ -199,7 +232,14 @@ class DMSForecaster:
             try:
                 y_full = self.model(x)
             except TypeError:
-                y_full = self.model(x, mode=(self.lmm_mode or "eval"))
+                # 먼저 mode, 안되면 None exo, 마지막으로 None+mode
+                try:
+                    y_full = self.model(x, mode=(self.lmm_mode or "eval"))
+                except TypeError:
+                    try:
+                        y_full = self.model(x, future_exo=None)
+                    except TypeError:
+                        y_full = self.model(x, future_exo=None, mode=(self.lmm_mode or "eval"))
         return self._normalize_out(y_full, B)
 
     def _try_model_call(self, x, future_exo, B):
@@ -246,7 +286,8 @@ class DMSForecaster:
                              max_step_up: float = 0.10,
                              max_step_down: float = 0.30,
                              damp_min: float = 0.2,
-                             damp_max: float = 0.6) -> torch.Tensor:
+                             damp_max: float = 0.6,
+                             ) -> torch.Tensor:
         """
         여러 블록의 DMS를 겹치게 예측하여 동일 시점 평균(시점별 앙상블).
         윈도우 전진에는 각 블록의 첫 스텝 예측을 사용(옵션 가드/댐핑 적용).
@@ -265,6 +306,16 @@ class DMSForecaster:
             if context_policy == 'once':
                 self.ttm.add_context(self._context_features(x))
 
+        # # exo-aware 프로빙
+        # # 콜백이 없으면 기존대로, 있으면 대략 길이 추정 뒤 exo 끼워서 호출
+        # if self.future_exo_cb is None:
+        #     print('future_exo_cb is None')
+        #     Hm = self._call_model(x, B).size(1)
+        # else:
+        #     print('future_exo_cb is not None')
+        #     guess = getattr(self.model, "horizon", 120)
+        #     Hm = self._call_with_exo(x, B, guess, step_offset=0).size(1)
+        Hm = self._probe_hm(x, B)
         # 모델 출력 길이(Hm) probe
         Hm = self._call_model(x, B).size(1)
         H = int(horizon)
@@ -355,7 +406,10 @@ class DMSForecaster:
         H = Hm if horizon is None else int(horizon)
 
         # DMS 1회 (미래 exo 포함)
-        y_block = self._call_with_exo(x, B, Hm, step_offset=0)  # [B,Hm]
+        # y_block = self._call_with_exo(x, B, Hm, step_offset=0)  # [B,Hm]
+
+        # TODO: 추가적으로 확인해봐야할 사항
+        Hm = self._probe_hm(x, B)
 
         outputs = []
         use_tf = (y_true is not None) and (teacher_forcing_ratio > 0.0)

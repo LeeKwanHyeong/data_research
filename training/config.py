@@ -1,6 +1,6 @@
 from dataclasses import dataclass, field
 from typing import Tuple, Optional, Literal
-
+import torch
 LossMode = Literal['auto', 'point', 'quantile']
 
 
@@ -10,6 +10,13 @@ class DecompositionConfig:
     ma_window: int = 7
     stl_period: int = 12
     concat_mode: Literal["concat", "residual_only", "trend_only"] = "concat"
+
+def make_calendar_exo(start_idx: int, H: int, period: int = 12, device = 'cpu'):
+    t = torch.arange(start_idx, start_idx + H, device = device, dtype = torch.float32)
+    # 월 주기 sin/cos
+    exo = torch.stack([torch.sin(2*torch.pi*t/period), torch.cos(2*torch.pi*t/period)], dim = -1) # (H, 2)
+    return exo # (H, 2)
+
 
 
 @dataclass
@@ -45,3 +52,4 @@ class TrainingConfig:
     tau_h: float = 24.0
     # ------------Validation Weight-------------
     val_use_weights: bool = False    # 공정평가면 False
+    # ------------Exogenous Value --------------

@@ -69,7 +69,7 @@ class Model(nn.Module):
         # 마지막 타임스텝(hidden state)만 사용하여 예측
         pred = self.output_proj(encoded[:, -1, :])  # [batch, output_horizon]
 
-        if (self.self.exo_head is not None) and (future_exo is not None):
+        if (self.exo_head is not None) and (future_exo is not None):
             # future_exo : [B, H, exo_dim]
             exo_term = self.exo_head(future_exo).squeeze(-1)    # [B, H]
             pred = pred + exo_term

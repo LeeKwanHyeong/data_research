@@ -1,3 +1,4 @@
+import math
 import os
 import numpy as np
 import matplotlib.pyplot as plt
@@ -82,6 +83,40 @@ def _align_len(yhat: np.ndarray, H: int):
     # 1 < size < H
     pad = np.full(H - yhat.size, np.nan)
     return np.concatenate([yhat, pad], axis=0), "[pad]"
+
+@torch.no_grad()
+def _safe_forward(model, x, future_exo=None, mode="eval"):
+    """
+    모델 시그니처가 다 달라도 안전하게 호출을 시도한다.
+    우선 (x)로 호출 → 안되면 (x, future_exo=...) → 안되면 (x, mode=...) → 마지막 (x, future_exo=..., mode=...).
+    """
+    # 1) model(x)
+    try:
+        return model(x)
+    except TypeError:
+        pass
+    # 2) model(x, future_exo=...)
+    try:
+        return model(x, future_exo=future_exo)
+    except TypeError:
+        pass
+    # 3) model(x, mode=...)
+    try:
+        return model(x, mode=mode)
+    except TypeError:
+        pass
+    # 4) model(x, future_exo=..., mode=...)
+    return model(x, future_exo=future_exo, mode=mode)
+
+@torch.no_grad()
+def _infer_horizon(model, default=120):
+    for k in ("horizon", "output_horizon", "H", "Hm"):
+        if hasattr(model, k):
+            try:
+                return int(getattr(model, k))
+            except Exception:
+                pass
+    return default
 
 @torch.no_grad()
 def plot_val_per_part(models: dict, val_loader, out_dir, device="cpu", max_plots=None):
@@ -193,27 +228,41 @@ def plot_val_per_part(models: dict, val_loader, out_dir, device="cpu", max_plots
                 return
 
 @torch.no_grad()
-def _probe_output(model, x1, device="cpu"):
-    """모델 한 번만 호출해서 출력 타입/길이 확인."""
+def _probe_output(model, x1, device="cpu", future_exo_cb=None):
+    """
+    모델 한 번만 호출해서 출력 타입/길이 확인.
+    exo가 필요하면 model.horizon 추정 뒤 exo를 만들어서 전달.
+    """
     model = model.to(device).eval()
-    out = model(x1.to(device))
+
+    # 1) 먼저 exo 없이 시도
+    try:
+        out = _safe_forward(model, x1.to(device), future_exo=None)
+    except Exception:
+        # 2) 실패하면 horizon 추정 → exo 생성해서 시도
+        Hm = _infer_horizon(model, default=120)
+        exo = None
+        if future_exo_cb is not None:
+            exo = future_exo_cb(0, Hm, device=device)  # (H, D)
+            exo = exo.unsqueeze(0).expand(x1.size(0), -1, -1)
+        out = _safe_forward(model, x1.to(device), future_exo=exo)
+
     if isinstance(out, (tuple, list)):
-        out = out[0]
+        for t in out:
+            if torch.is_tensor(t):
+                out = t
+                break
     return out  # Tensor
 
 @torch.no_grad()
-def _predict_120_any(model, x1, device="cpu"):
+def _predict_120_any(model, x1, device="cpu", future_exo_cb=None):
     """
     모델에 따라 120개월 예측을 얻는다.
-    - (B,Q,Hm) 형태(분위수)면 q10/q50/q90를 반환 (Hm != 120이면 자르거나 NaN 패딩)
-    - 그 외(포인트형)면 DMS/IMS로 120개월 point 예측
-    반환:
-      {
-        "point": (120,),
-        "q": {"q10":(120,), "q50":(120,), "q90":(120,)}  # 분위수가 있으면
-      }
+    - (B,Q,Hm) 형태(분위수)면 q10/q50/q90를 반환
+    - 그 외(포인트형)면 DMS로 120개월 point 예측
     """
-    out = _probe_output(model, x1, device=device)
+    out = _probe_output(model, x1, device=device, future_exo_cb=future_exo_cb)
+
     # ---- 분위수 모델 ----
     if out.dim() == 3 and out.size(1) >= 3:   # (B,Q,Hm)
         arr = out.squeeze(0).detach().cpu().numpy()   # (Q,Hm)
@@ -228,9 +277,30 @@ def _predict_120_any(model, x1, device="cpu"):
         return {"point": q50, "q": {"q10": q10, "q50": q50, "q90": q90}}
 
     # ---- 포인트형 모델: DMS로 120개월 ----
-    f = DMSForecaster(model, target_channel=0, fill_mode="copy_last",
-                      lmm_mode="eval", predict_fn=None, ttm=None)
-    y120 = f.forecast(x1, horizon=120, device=device, extend='ims', context_policy='once')  # (1,120)
+    f = DMSForecaster(
+        model,
+        target_channel=0,
+        fill_mode="copy_last",
+        lmm_mode="eval",
+        predict_fn=None,
+        ttm=None,
+        future_exo_cb=future_exo_cb  # 콜백 연결
+    )
+    # y120 = f.forecast(
+    #     x1,
+    #     horizon=120,
+    #     device=device,
+    #     extend='ims',
+    #     context_policy='once',
+    #     # 필요 시 안정화 옵션도 여기서 끌 수 있음
+    #     # use_winsor=False, use_multi_guard=False, use_dampen=False
+    # )  # (1,120)
+    y120 = f.forecast_overlap_avg(
+        x1,
+        horizon = 120,
+        device = device,
+        context_policy = 'once'
+    )
     return {"point": y120.squeeze(0).detach().cpu().numpy()}
 
 @torch.no_grad()
@@ -240,11 +310,12 @@ def plot_120_months_many(models: dict,
                          use_truth=True,
                          max_plots=100,
                          out_dir=None,
-                         show=True):
+                         show=True,
+                         future_exo_cb=None):
     if out_dir:
         os.makedirs(out_dir, exist_ok=True)
 
-    # probe 하나 빼두기 (일부 모델은 shape에 민감할 수 있으니 [1,L,1] 보장)
+    # probe 유지
     probe_batch = next(iter(val_loader))
     xb_probe = probe_batch[0]
     if xb_probe.dim() == 2:
@@ -276,18 +347,16 @@ def plot_120_months_many(models: dict,
                 y_true = yb[i:i+1].cpu().numpy().reshape(-1)
 
             # ---- 각 모델 120개월 예측 수집 ----
-            preds_point = {}       # 모델별 point (또는 q50)
+            preds_point = {}
             preds_q10, preds_q50, preds_q90 = {}, {}, {}
 
             for name, mdl in models.items():
-                p = _predict_120_any(mdl, x1, device=device)
-                preds_point[name] = p["point"]  # 항상 존재
-
+                p = _predict_120_any(mdl, x1, device=device, future_exo_cb=future_exo_cb)
+                preds_point[name] = p["point"]
                 if "q" in p:
-                    qd = p["q"]
-                    preds_q10[name] = qd["q10"]
-                    preds_q50[name] = qd["q50"]
-                    preds_q90[name] = qd["q90"]
+                    preds_q10[name] = p["q"]["q10"]
+                    preds_q50[name] = p["q"]["q50"]
+                    preds_q90[name] = p["q"]["q90"]
 
             # ---- 히스토리 & 축 ----
             hist = _to_1d_history(x1)  # (L,)
@@ -312,24 +381,18 @@ def plot_120_months_many(models: dict,
 
             # 2) 포인트 모델(혹은 분위수 없는 모델)의 라인
             for nm, yhat in preds_point.items():
-                if nm in preds_q50:  # 이미 중앙선 그림
+                if nm in preds_q50:
                     continue
                 plt.plot(t_fut, yhat, label=nm, alpha=0.9)
 
             # 3) 최종 앙상블: “q90 기반”
-            #    - 분위수 있는 모델은 q90 사용
-            #    - 분위수 없는 모델은 point 사용(보수적으로 q90 대용)
             stack_for_ens = []
             for nm in preds_point.keys():
-                if nm in preds_q90:
-                    base = preds_q90[nm]      # q90
-                else:
-                    base = preds_point[nm]    # 대체
+                base = preds_q90[nm] if nm in preds_q90 else preds_point[nm]
                 stack_for_ens.append(base)
-
             if stack_for_ens:
-                M = np.vstack(stack_for_ens)         # (num_models, 120)
-                ens_q90_mean = np.nanmean(M, axis=0) # 시간별 평균
+                M = np.vstack(stack_for_ens)
+                ens_q90_mean = np.nanmean(M, axis=0)
                 plt.plot(t_fut, ens_q90_mean, linewidth=2.8, alpha=0.95, label="Ensemble (q90-based)")
 
             plt.axvline(0, color="gray", linewidth=1, alpha=0.6)
