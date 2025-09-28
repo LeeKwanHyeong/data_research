@@ -5,6 +5,7 @@ from models.PatchMixer.backbone import PatchMixerBackbone, MultiScalePatchMixerB
 from models.PatchMixer.common.configs import PatchMixerConfig
 from models.PatchMixer.common.head import DecompQuantileHead
 from models.common_layers.TrendCorrector import TrendCorrector
+from utils.exogenous_utils import _apply_exo_shift_linear
 
 
 # -------------------------
@@ -44,15 +45,25 @@ class PatchMixerModel(nn.Module):
             )
 
     def forward(self, x: torch.Tensor, future_exo: torch.Tensor | None = None) -> torch.Tensor:
-        patch_repr = self.backbone(x)       # (B, a * d_model)
+        """
+                x: (B, L, N)
+                future_exo: (B, Hx, exo_dim) | None
+                mode/kwargs: 무시(호출자 호환성)
+                """
+        patch_repr = self.backbone(x)  # (B, a * d_model)
         patch_repr = self.proj(patch_repr)  # (B, 128)
-        out = self.fc(patch_repr)           # (B, H)
+        out = self.fc(patch_repr)  # (B, H)
 
         if (self.exo_head is not None) and (future_exo is not None):
-            # (B, H, exo_dim) -> (B, H, 1) -> (B, H)
-            ex = self.exo_head(future_exo).squeeze(-1)
+            ex = _apply_exo_shift_linear(
+                self.exo_head, future_exo,
+                horizon=self.horizon,
+                out_dtype=out.dtype,
+                out_device=out.device
+            )  # (B, H)
             out = out + ex
-        return out
+
+        return out  # (B, H)
 
 # -------------------------
 # Simple PatchMixer + Feature Branch
@@ -60,7 +71,9 @@ class PatchMixerModel(nn.Module):
 class PatchMixerFeatureModel(nn.Module):
     """
     Timeseries + static/exogenous feature combined head.
-    feature_input: (B, feature_dim)
+    ts_input:      (B, L, N)
+    feature_input: (B, F)
+    future_exo:    (B, Hx, exo_dim) | None
     """
     def __init__(self, configs: PatchMixerConfig, feature_dim: int = 4, exo_dim: int = 0):
         super().__init__()
@@ -90,13 +103,14 @@ class PatchMixerFeatureModel(nn.Module):
             nn.Linear(64, configs.horizon)
         )
 
-        self.exo_dim = exo_dim
+        self.horizon = int(configs.horizon)
+        self.exo_dim = int(exo_dim)
         self.exo_head = None
         if self.exo_dim > 0:
             self.exo_head = nn.Sequential(
                 nn.Linear(self.exo_dim, 64),
                 nn.GELU(),
-                nn.Linear(64, 1),  # -> time-distributed scalar
+                nn.Linear(64, 1),  # (B, Hx, 1)
             )
 
     def forward(self,
@@ -115,20 +129,24 @@ class PatchMixerFeatureModel(nn.Module):
         combined = torch.cat([patch_repr, feature_repr], dim = 1)  # (B, 128 + feature_out_dim)
         out = self.fc(combined)
 
-        if (self.exo_dim is not None) and (future_exo is not None):
-            # (B, H, exo_dim) -> (B, H, 1) -> (B, H)
-            ex = self.exo_head(future_exo).squeeze(-1)
+        if (self.exo_head is not None) and (future_exo is not None):
+            ex = _apply_exo_shift_linear(
+                self.exo_head, future_exo,
+                horizon=self.horizon,
+                out_dtype=out.dtype,
+                out_device=out.device
+            )  # (B, H)
             out = out + ex
 
-        return out
-
+        return out  # (B, H)
 # -------------------------
 # Simple PatchMixer + Decomposition Quantile Head
 # -------------------------
 class PatchMixerQuantileModel(nn.Module):
     """
     Multi-Scale PatchMixer Backbone + Decomposition Quantile Head
-    output: (B, 3, H) # (q10, q50, q90)
+    output: (B, 3, H)  # (q10, q50, q90)
+    + (선택) exogenous shift를 모든 quantile에 동일 적용
     """
     def __init__(self,
                  base_configs: PatchMixerConfig,
@@ -174,8 +192,13 @@ class PatchMixerQuantileModel(nn.Module):
         q = self.head(z)        # (B, 3, H)
 
         if (self.exo_head is not None) and (future_exo is not None):
-            ex = self.exo_head(future_exo).squeeze(-1)  # (B, H)
-            q = q + ex[:, None, :]                      # shift all quantiles equally
-        return q
+            ex = _apply_exo_shift_linear(
+                self.exo_head, future_exo,
+                horizon=self.horizon,
+                out_dtype=q.dtype,
+                out_device=q.device
+            )  # (B, H)
+            q = q + ex.unsqueeze(1)  # (B, 1, H) → 모든 분위수에 동일 shift
 
+        return q  # (B, 3, H)
 

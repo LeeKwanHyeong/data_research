@@ -9,8 +9,6 @@ def make_calendar_exo(start_idx: int, H: int, period: int = 12, device = 'cpu'):
     exo = torch.stack([torch.sin(2*torch.pi*t/period), torch.cos(2*torch.pi*t/period)], dim = -1) # (H, 2)
     return exo # (H, 2)
 
-
-
 def _prepare_next_input(
         x: torch.Tensor,
         y_step: torch.Tensor,
@@ -152,7 +150,7 @@ class DMSForecaster:
         """
         # 1) model(x)
         try:
-            y = self.model(x);
+            y = self.model(x)
             return self._normalize_out(y, B).size(1)
         except TypeError:
             pass
@@ -212,17 +210,33 @@ class DMSForecaster:
     # ---------- 공통 유틸 ----------
 
     def _normalize_out(self, y_full: torch.Tensor, B: int) -> torch.Tensor:
-        """모델 출력형상 정규화 -> [B, H]."""
+        # 최종 형태는 [B, H]
         if y_full.dim() == 1:
             return y_full.view(B, -1)
         if y_full.dim() == 2:
-            return y_full
+            return y_full  # [B, H]
+
         if y_full.dim() == 3:
-            if y_full.size(1) == 1:
-                return y_full[:, 0, :]
-            if y_full.size(-1) == 1:
-                return y_full[:, :, 0]
-            return y_full.reshape(B, -1)
+            # 두 축 길이
+            d1, d2 = y_full.size(1), y_full.size(2)
+
+            # 1) (B, 1, H)
+            if d1 == 1:
+                return y_full[:, 0, :]  # -> [B, H]
+            # 2) (B, H, 1)
+            if d2 == 1:
+                return y_full[:, :, 0]  # -> [B, H]
+
+            # 3) (B, C, H) vs (B, H, C) 추정:
+            #    일반적으로 '시간축'이 더 김. 더 긴 쪽을 H로 간주
+            if d2 >= d1:  # (B, H, C)로 가정
+                ch = min(self.target_channel, d2 - 1)  # 안전 인덱스
+                return y_full[:, :, ch]  # -> [B, H]
+            else:  # (B, C, H)로 가정
+                ch = min(self.target_channel, d1 - 1)
+                return y_full[:, ch, :]  # -> [B, H]
+
+        # fallback
         return y_full.reshape(B, -1)
 
     def _call_model(self, x: torch.Tensor, B: int) -> torch.Tensor:
@@ -269,11 +283,11 @@ class DMSForecaster:
         return self._normalize_out(y_full, B)
 
     # ---------- Overlap-DMS ----------
-
     @torch.no_grad()
     def forecast_overlap_avg(self,
                              x_init: torch.Tensor,
                              horizon: int,
+                             block_stride: int = 1,
                              device: Optional[torch.device] = None,
                              context_policy: str = 'once',
                              # 안정화 토글 & 파라미터
@@ -286,11 +300,13 @@ class DMSForecaster:
                              max_step_up: float = 0.10,
                              max_step_down: float = 0.30,
                              damp_min: float = 0.2,
-                             damp_max: float = 0.6,
-                             ) -> torch.Tensor:
+                             damp_max: float = 0.6) -> torch.Tensor:
         """
-        여러 블록의 DMS를 겹치게 예측하여 동일 시점 평균(시점별 앙상블).
-        윈도우 전진에는 각 블록의 첫 스텝 예측을 사용(옵션 가드/댐핑 적용).
+        Overlapped DMS averaging:
+        - horizon 길이 만큼을 목표로, DMS 블록을 겹치게 예측하여 동일 시점 평균.
+        - 각 블록 시작 → Hm 길이의 예측(y_block) 생성 → 해당 구간 누적/카운트
+        - 다음 블록으로 전진할 때는 y_block의 앞쪽 'advance'개(= stride) 1-step 값을
+          순차적으로 사용해 입력 윈도우를 업데이트(옵션 가드/댐핑 적용).
         """
         was_training = self.model.training
         self.model.eval()
@@ -298,7 +314,7 @@ class DMSForecaster:
         device = device or next(self.model.parameters()).device
         x = x_init.to(device).float().clone()
         if x.dim() == 2:
-            x = x.unsqueeze(-1)
+            x = x.unsqueeze(-1)  # [B,L] -> [B,L,1]
         B = x.size(0)
 
         # TTM context
@@ -306,56 +322,71 @@ class DMSForecaster:
             if context_policy == 'once':
                 self.ttm.add_context(self._context_features(x))
 
-        # # exo-aware 프로빙
-        # # 콜백이 없으면 기존대로, 있으면 대략 길이 추정 뒤 exo 끼워서 호출
-        # if self.future_exo_cb is None:
-        #     print('future_exo_cb is None')
-        #     Hm = self._call_model(x, B).size(1)
-        # else:
-        #     print('future_exo_cb is not None')
-        #     guess = getattr(self.model, "horizon", 120)
-        #     Hm = self._call_with_exo(x, B, guess, step_offset=0).size(1)
-        Hm = self._probe_hm(x, B)
-        # 모델 출력 길이(Hm) probe
-        Hm = self._call_model(x, B).size(1)
+        # --- Hm probe (exo 필수 모델도 안전하게) ---
+        try:
+            Hm = self._call_model(x, B).size(1)
+        except Exception:
+            # exo가 필요한 모델일 수 있으므로 exo 포함 호출로 추정
+            H_guess = int(getattr(self.model, 'horizon',
+                                  getattr(self.model, 'output_horizon', 120)))
+            Hm = self._call_with_exo(x, B, H_guess, step_offset=0).size(1)
+
         H = int(horizon)
+        stride = max(1, int(block_stride))
 
         # 첫 블록(미래 exo 포함)
-        y_block0 = self._call_with_exo(x, B, Hm, step_offset=0)
+        y_block0 = self._call_with_exo(x, B, Hm, step_offset=0)  # [B,Hm]
 
         pred_sum = torch.zeros(B, H, device=device)
         pred_cnt = torch.zeros(B, H, device=device)
-        num_blocks = max(1, H - Hm + 1)
 
-        for bidx in range(num_blocks):
+        # 블록 시작 인덱스들(0..H-Hm, stride 간격) — H<Hm이면 starts=[0]
+        if H >= Hm:
+            starts = list(range(0, H - Hm + 1, stride))
+        else:
+            starts = [0]
+
+        # Block loop
+        for bi, b_start in enumerate(starts):
             if (self.ttm is not None) and (context_policy == 'per_step'):
                 self.ttm.add_context(self._context_features(x))
 
-            y_block = y_block0 if bidx == 0 else self._call_with_exo(x, B, Hm, step_offset=bidx)
-            max_t = min(Hm, H - bidx)
-            pred_sum[:, bidx:bidx + max_t] += y_block[:, :max_t]
-            pred_cnt[:, bidx:bidx + max_t] += 1.0
+            # 첫 블록 재활용, 이후는 step_offset=b_start로 DMS 호출
+            y_block = y_block0 if bi == 0 else self._call_with_exo(x, B, Hm, step_offset=b_start)
 
-            # 다음 블록을 위한 윈도우 전진: 첫 스텝 예측 사용(+안정화 옵션)
-            if bidx < num_blocks - 1:
-                hist = x[:, :, self.target_channel]   # [B,L]
-                last = hist[:, -1]
-                y_step = y_block[:, 0]
+            # 누적/카운트
+            max_t = min(Hm, H - b_start)
+            pred_sum[:, b_start:b_start + max_t] += y_block[:, :max_t]
+            pred_cnt[:, b_start:b_start + max_t] += 1.0
 
-                if use_winsor:
-                    y_step = _winsorize_clamp(hist, y_step,
-                                              nonneg=True, clip_q=winsor_q,
-                                              clip_mul=winsor_mul, max_growth=winsor_growth)
-                if use_multi_guard:
-                    y_step = _guard_multiplicative(last, y_step,
-                                                  max_step_up=max_step_up, max_step_down=max_step_down)
-                if use_dampen:
-                    w = float(damp_min + (damp_max - damp_min) * (bidx / max(1, num_blocks - 1)))
-                    y_step = _dampen_to_last(last, y_step, damp=w)
+            # 다음 블록을 위해 입력 윈도우 전진
+            if bi < len(starts) - 1:
+                advance = starts[bi + 1] - starts[bi]  # 보폭(= stride)
+                advance = max(1, advance)
 
-                x = _prepare_next_input(x, y_step,
-                                        target_channel=self.target_channel,
-                                        fill_mode=self.fill_mode)
+                # y_block의 앞쪽 advance개를 순서대로 사용해 한 스텝씩 전진
+                for s in range(advance):
+                    hist = x[:, :, self.target_channel]  # [B,L]
+                    last = hist[:, -1]
+                    y_step = y_block[:, s]  # 해당 시점의 1-step 예측
+
+                    if use_winsor:
+                        y_step = _winsorize_clamp(hist, y_step,
+                                                  nonneg=True, clip_q=winsor_q,
+                                                  clip_mul=winsor_mul, max_growth=winsor_growth)
+                    if use_multi_guard:
+                        y_step = _guard_multiplicative(last, y_step,
+                                                       max_step_up=max_step_up,
+                                                       max_step_down=max_step_down)
+                    if use_dampen:
+                        # 블록 진행도에 따른 가중(선형): bi 기준으로 완만히 증가
+                        w = float(damp_min + (damp_max - damp_min) *
+                                  (bi / max(1, len(starts) - 1)))
+                        y_step = _dampen_to_last(last, y_step, damp=w)
+
+                    x = _prepare_next_input(x, y_step,
+                                            target_channel=self.target_channel,
+                                            fill_mode=self.fill_mode)
 
         y_hat = pred_sum / torch.clamp(pred_cnt, min=1.0)
 
@@ -364,28 +395,28 @@ class DMSForecaster:
         return y_hat
 
     # ---------- DMS + (필요시) IMS 확장 ----------
-
     @torch.no_grad()
-    def forecast(self,
-                 x_init: torch.Tensor,
-                 horizon: Optional[int] = None,
-                 device: Optional[torch.device] = None,
-                 extend: str = "ims",        # "ims" | "error"
-                 context_policy: str = "once",
-                 y_true: Optional[torch.Tensor] = None,
-                 teacher_forcing_ratio: float = 0.0,
-                 # 안정화 토글 & 파라미터
-                 use_winsor: bool = True,
-                 use_multi_guard: bool = False,   # DMS 본구간은 보통 끔(원하면 켜기)
-                 use_dampen: bool = True,
-                 winsor_q: tuple = (0.05, 0.95),
-                 winsor_mul: float = 4.0,
-                 winsor_growth: float = 3.0,
-                 max_step_up: float = 0.10,
-                 max_step_down: float = 0.40,
-                 damp: float = 0.5) -> torch.Tensor:
+    def forecast_DMS_to_IMS(self,
+                            x_init: torch.Tensor,
+                            horizon: Optional[int] = None,
+                            device: Optional[torch.device] = None,
+                            extend: str = "ims",  # "ims" | "error"
+                            context_policy: str = "once",
+                            y_true: Optional[torch.Tensor] = None,
+                            teacher_forcing_ratio: float = 0.0,
+                            # 안정화 토글 & 파라미터
+                            use_winsor: bool = True,
+                            use_multi_guard: bool = False,  # DMS 본구간은 보통 끔(원하면 켜기)
+                            use_dampen: bool = True,
+                            winsor_q: tuple = (0.05, 0.95),
+                            winsor_mul: float = 4.0,
+                            winsor_growth: float = 3.0,
+                            max_step_up: float = 0.10,
+                            max_step_down: float = 0.40,
+                            damp: float = 0.5) -> torch.Tensor:
         """
-        DMS 한 번으로 Hm까지 생성하고, horizon>Hm 이면 IMS로 이어붙임(옵션).
+        DMS 한 번으로 Hm까지 생성하고, horizon>Hm 이면 IMS로 이어붙임.
+        future_exo_cb가 필요한 모델도 안전하게 Hm을 추정해 동작.
         """
         was_training = self.model.training
         self.model.eval()
@@ -393,37 +424,42 @@ class DMSForecaster:
         device = device or next(self.model.parameters()).device
         x = x_init.to(device).float().clone()
         if x.dim() == 2:
-            x = x.unsqueeze(-1)
+            x = x.unsqueeze(-1)  # [B,L] -> [B,L,1]
         B = x.size(0)
 
-        # TTM context
+        # 0) TTM context
         if (self.ttm is not None) and (context_policy in ("once", "per_step")):
             if context_policy == "once":
                 self.ttm.add_context(self._context_features(x))
 
-        # probe로 Hm 파악
-        Hm = self._call_model(x, B).size(1)
+        # 1) Hm probe (exo 없이 먼저 시도, 실패 시 exo 포함 시도로 백업)
+        def _probe_hm_safe() -> int:
+            try:
+                return self._call_model(x, B).size(1)
+            except Exception:
+                H_guess = int(getattr(self.model, "horizon",
+                                      getattr(self.model, "output_horizon", 120)))
+                return self._call_with_exo(x, B, H_guess, step_offset=0).size(1)
+
+        Hm = _probe_hm_safe()
         H = Hm if horizon is None else int(horizon)
 
-        # DMS 1회 (미래 exo 포함)
-        # y_block = self._call_with_exo(x, B, Hm, step_offset=0)  # [B,Hm]
-
-        # TODO: 추가적으로 확인해봐야할 사항
-        Hm = self._probe_hm(x, B)
+        # 2) DMS 1회 (미래 exo 포함) → y_block:[B,Hm]
+        y_block = self._call_with_exo(x, B, Hm, step_offset=0)
 
         outputs = []
         use_tf = (y_true is not None) and (teacher_forcing_ratio > 0.0)
         if use_tf:
             y_true = y_true.to(device).float()
 
-        # 1) Hm 이내 구간: DMS 결과를 스텝별로 취하되(원하면 가드/댐핑)
+        # 3) 본구간: min(Hm, H) 만큼 스텝별 취득(안정화/TF 적용)
         use_len = min(Hm, H)
         for t in range(use_len):
             if (self.ttm is not None) and (context_policy == "per_step"):
                 self.ttm.add_context(self._context_features(x))
 
             if use_tf and (t < (y_true.shape[1] if y_true.dim() > 1 else 0)) and \
-               (torch.rand(1).item() < teacher_forcing_ratio):
+                    (torch.rand(1).item() < teacher_forcing_ratio):
                 y_step = y_true[:, t]
             else:
                 hist = x[:, :, self.target_channel]
@@ -436,7 +472,8 @@ class DMSForecaster:
                                               clip_mul=winsor_mul, max_growth=winsor_growth)
                 if use_multi_guard:
                     y_step = _guard_multiplicative(last, y_step,
-                                                  max_step_up=max_step_up, max_step_down=max_step_down)
+                                                   max_step_up=max_step_up,
+                                                   max_step_down=max_step_down)
                 if use_dampen:
                     y_step = _dampen_to_last(last, y_step, damp=damp)
 
@@ -445,14 +482,14 @@ class DMSForecaster:
                                     target_channel=self.target_channel,
                                     fill_mode=self.fill_mode)
 
-        # 2) 필요 없으면 반환
+        # 4) H <= Hm 이면 바로 반환
         if H <= Hm:
             y_hat = torch.cat(outputs, dim=1)  # [B,H]
             if was_training:
                 self.model.train()
             return y_hat
 
-        # 3) H>Hm: IMS로 초과 구간 생성
+        # 5) H > Hm: IMS로 초과 구간 생성
         if extend not in ("ims", "error"):
             raise ValueError("extend must be 'ims' or 'error'")
         if extend == "error":
@@ -464,23 +501,23 @@ class DMSForecaster:
             if (self.ttm is not None) and (context_policy == "per_step"):
                 self.ttm.add_context(self._context_features(x))
 
-            # 매 스텝 미래 exo 반영 (step_offset = use_len + t)
+            # step_offset = 이미 생성한 길이(use_len) + IMS의 상대 step t
             y_full = self._call_with_exo(x, B, Hm, step_offset=(use_len + t))
             y_raw = y_full[:, 0]
 
             hist = x[:, :, self.target_channel]
             last = hist[:, -1]
-
             y_step = y_raw
+
             if use_winsor:
                 y_step = _winsorize_clamp(hist, y_step,
                                           nonneg=True, clip_q=winsor_q,
                                           clip_mul=winsor_mul, max_growth=winsor_growth)
             if use_multi_guard:
                 y_step = _guard_multiplicative(last, y_step,
-                                              max_step_up=max_step_up, max_step_down=max_step_down)
+                                               max_step_up=max_step_up,
+                                               max_step_down=max_step_down)
             if use_dampen:
-                # IMS 구간은 고정 폭댐핑 대신 부드럽게 하고 싶으면 별도 스케줄을 넣어도 됨
                 y_step = _dampen_to_last(last, y_step, damp=damp)
 
             outputs.append(y_step.unsqueeze(1))
@@ -488,7 +525,7 @@ class DMSForecaster:
                                     target_channel=self.target_channel,
                                     fill_mode=self.fill_mode)
 
-        y_hat = torch.cat(outputs, dim=1)
+        y_hat = torch.cat(outputs, dim=1)  # [B,H]
 
         if was_training:
             self.model.train()
