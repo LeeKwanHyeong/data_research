@@ -1,6 +1,7 @@
 from training.adapters import DefaultAdapter
 from training.config import TrainingConfig
 from training.engine import CommonTrainer
+from utils.exogenous_utils import calendar_cb
 
 
 def train_patchtst(model, train_loader, val_loader, **overrides):
@@ -15,6 +16,6 @@ def train_patchtst(model, train_loader, val_loader, **overrides):
     cfg = TrainingConfig(**base)
 
     # PatchTST는 보통 forward 단항, 별도 reg 없음 → DefaultAdapter
-    trainer = CommonTrainer(cfg, DefaultAdapter())
+    trainer = CommonTrainer(cfg, DefaultAdapter(), future_exo_cb = calendar_cb)
     best_model = trainer.fit(model, train_loader, val_loader)
     return best_model

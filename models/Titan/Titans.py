@@ -259,6 +259,16 @@ class LMMSeq2SeqModel(nn.Module):
             out_dim = self.horizon
         )
 
+        self.exo_dim = getattr(config, 'exo_dim', 0)
+        if self.exo_dim > 0:
+            self.exo_head = nn.Sequential(
+                nn.Linear(self.exo_dim, config.d_model),
+                nn.GELU(),
+                nn.Linear(config.d_model, 1)
+            )
+        else:
+            self.exo_head = None
+
     def forward(self, x, future_exo: torch.Tensor | None = None, mode: str = 'train'):
         """
         x:          [B, L, C]
@@ -279,14 +289,18 @@ class LMMSeq2SeqModel(nn.Module):
         decoded = self.decoder(encoded, future_exo)     # [B, H, D]
 
         # 4) Head
-        y = self.output_proj(decoded).squeeze(-1)   # [B, H]
+        pred = self.output_proj(decoded).squeeze(-1)   # [B, H]
 
         # 5) Trend Corrector
-        y = y + self.trend_corrector(encoded)       # [B, H]
+        pred = pred + self.trend_corrector(encoded)       # [B, H]
+
+        if (self.exo_head is not None) and (future_exo is not None):
+            exo_term = self.exo_head(future_exo).squeeze(-1)
+            pred = pred + exo_term
 
         # 6) RevIN Denormalization
-        y = self.revin_layer(y.unsqueeze(1), 'denorm').squeeze(1)   # [B, H]
-        return y
+        pred = self.revin_layer(pred.unsqueeze(1), 'denorm').squeeze(1)   # [B, H]
+        return pred
 
 class FeatureModel(nn.Module):
     def __init__(self, config: TitanConfig, feature_dim = 7):

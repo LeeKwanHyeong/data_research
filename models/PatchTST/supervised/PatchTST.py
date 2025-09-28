@@ -79,15 +79,33 @@ class Model(nn.Module):
         x = self.input_mapper(x)
 
         # 4) 백본 통과
-        y = self.backbone(x)  # (B, nvars, H)
+        pred = self.backbone(x)  # (B, nvars, H)
 
         # 5) 출력 차원 정규화
-        y = y.permute(0, 2, 1)  # (B, H, nvars)
+        pred = pred.permute(0, 2, 1).contiguous()  # (B, H, nvars)
 
-        # 6) EXO 가산 - 모든 변수에 같은 시간별 shift 덧셈
+        # 6) EXO 가산 (옵션)
         if (self.exo_head is not None) and (future_exo is not None):
-            # future_exo: (B, H, exo_dim) -> (B, H, 1) -> (B, H, 1) broadcast
-            ex = self.exo_head(future_exo).squeeze(-1)  # (B, H)
-            y = y + ex.unsqueeze(-1)                    # (B, H, 1) + (B, H, C)
+            pred = pred.contiguous()
+            B, Hm, C = pred.shape
 
-        return y
+            # device/dtype 정렬
+            future_exo = future_exo.to(pred.device, dtype=pred.dtype)
+
+            # 길이 정합: (B, Hm, exo_dim)로 맞추기
+            if future_exo.size(1) != Hm:
+                Hx = future_exo.size(1)
+                exo_dim = future_exo.size(2)
+                if Hx > Hm:  # 잘라냄
+                    future_exo = future_exo[:, :Hm, :]
+                else:  # 0 패딩
+                    pad = torch.zeros(B, Hm - Hx, exo_dim, device=pred.device, dtype=pred.dtype)
+                    future_exo = torch.cat([future_exo, pad], dim=1)
+
+            # (B, Hm, 1) → broadcast add
+            ex = self.exo_head(future_exo).squeeze(-1)  # (B, Hm)
+            pred = pred + ex.unsqueeze(-1)  # (B, Hm, C)
+
+
+
+        return pred

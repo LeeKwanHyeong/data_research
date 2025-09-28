@@ -9,8 +9,14 @@ from training.optim import build_optimizer_and_scheduler
 
 
 class CommonTrainer:
-    def __init__(self, cfg, adapter, *, metrics_fn=None, logger=print,
-                 future_exo_cb=None):  # exo 콜백
+    def __init__(self,
+                 cfg,
+                 adapter,
+                 *,
+                 metrics_fn=None,
+                 logger=print,
+                 future_exo_cb=None
+                 ):  # exo 콜백
         self.cfg = cfg
         self.adapter: DefaultAdapter = adapter
         self.logger = logger

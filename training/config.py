@@ -53,3 +53,6 @@ class TrainingConfig:
     # ------------Validation Weight-------------
     val_use_weights: bool = False    # 공정평가면 False
     # ------------Exogenous Value --------------
+    exo_dim = 2  # 미래 외생변수 차원(없으면 0)
+    nonneg_head = True  # 수요 비음수 보장 (Softplus)
+

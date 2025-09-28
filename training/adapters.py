@@ -41,48 +41,38 @@ class DefaultAdapter:
     '''
 
     def _call_model(self, model, x, *, future_exo=None, mode=None):
-        # dict 입력이면 키를 병합해서 모델에 그대로 전달
-        if isinstance(x, dict):
-            d = dict(x)
-            if future_exo is not None and "future_exo" not in d:
-                d["future_exo"] = future_exo
-            if mode is not None and "mode" not in d:
-                d["mode"] = mode
-            return model(**d)
+        """
+                모델 시그니처가 제각각이라 안전하게 호출을 시도한다.
+                - 주어진 인자가 None이면 그 조합은 건너뜀
+                - 시도 순서: (x, future_exo, mode) -> (x, future_exo) -> (x, mode) -> (x)
+                """
+        # 1) (x, future_exo, mode)
+        if future_exo is not None and mode is not None:
+            try:
+                return model(x, future_exo=future_exo, mode=mode)
+            except TypeError as e:
+                # 모델이 mode를 지원 안 할 수 있음
+                # print(f"[Adapter] call (x, future_exo, mode) failed: {e}")
+                pass
 
-        # tuple/list 입력 → 다양한 시그니처를 안전하게 시도
-        if isinstance(x, (tuple, list)):
+        # 2) (x, future_exo)
+        if future_exo is not None:
             try:
-                return model(*x, future_exo=future_exo, mode=mode)
-            except TypeError:
-                pass
-            try:
-                if future_exo is not None:
-                    return model(*x, future_exo=future_exo)
-            except TypeError:
-                pass
-            try:
-                if mode is not None:
-                    return model(*x, mode=mode)
-            except TypeError:
-                pass
-            return model(*x)
-
-        # 텐서/기타 단일 입력
-        try:
-            return model(x, future_exo=future_exo, mode=mode)
-        except TypeError:
-            pass
-        try:
-            if future_exo is not None:
                 return model(x, future_exo=future_exo)
-        except TypeError:
-            pass
-        try:
-            if mode is not None:
+            except TypeError as e:
+                # 모델이 future_exo를 지원 안 할 수 있음
+                print(f"[Adapter] call (x, future_exo) failed: {e}")
+                pass
+
+        # 3) (x, mode)
+        if mode is not None:
+            try:
                 return model(x, mode=mode)
-        except TypeError:
-            pass
+            except TypeError as e:
+                print(f"[Adapter] call (x, mode) failed: {e}")
+                pass
+
+        # 4) (x)
         return model(x)
 
     def _as_tensor(self, out):
@@ -101,8 +91,33 @@ class DefaultAdapter:
         raise TypeError(f"Model output is not a Tensor/tuple/dict: {type(out)}")
 
     def forward(self, model, x_batch, *, future_exo=None, mode=None):
-        out = self._call_model(model, x_batch, future_exo=future_exo, mode=mode)
+        # x_batch가 dict/tuple일 수도 있으면 여기서 분기
+        if isinstance(x_batch, dict):
+            # dict 입력을 그대로 넘기되, exo/mode는 위의 안전 호출 경로 사용
+            # -> dict 사용 모델이라면 보통 여기서 끝나므려 (x, ...)경로는 안탐
+
+            try:
+                return model(**x_batch)
+            except TypeError as e:
+                print(f"[Adapter] call (x, future_exo) failed: {e}")
+                # dict 방식이 아니면 안전 호출로 재시도
+                x_batch = x_batch.get('x', x_batch)
+
+        if isinstance(x_batch, (tuple, list)):
+            try:
+                return model(*x_batch)
+            except TypeError as e:
+                print(f"[Adapter] call (x, future_exo) failed: {e}")
+                # tuple이 (x, exo) 구조일 수 있으니 자동 분해 시도
+                if len(x_batch) == 2 and future_exo is None:
+                    x_only, exo = x_batch
+                    return self._call_model(model, x_only, future_exo = exo, mode = mode)
+                # 마지막 fallback로 첫 번째만 x로 간주
+                x_batch = x_batch[0]
+
+        out = self._call_model(model, x_batch, future_exo = future_exo, mode = mode)
         return self._as_tensor(out)
+
 
     def reg_loss(self, model): return None
     def uses_tta(self): return False

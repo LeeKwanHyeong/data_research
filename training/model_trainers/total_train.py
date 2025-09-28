@@ -32,7 +32,7 @@ def run_total_train_monthly(train_loader, val_loader, device = 'cuda'):
         pm_base_model,
         train_loader, val_loader,
         lr = 1e-3, loss_mode = 'quantile',
-        quantiles = (0.1, 0.5, 0.9), use_intermittent = True
+        quantiles = (0.1, 0.5, 0.9), use_intermittent = True,
     )
     results['PatchMixer Base'] = best_pm_base
 
