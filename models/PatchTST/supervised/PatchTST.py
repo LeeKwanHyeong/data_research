@@ -1,3 +1,5 @@
+from typing import Sequence
+
 import torch
 from torch import Tensor
 from torch import nn
@@ -7,7 +9,7 @@ from models.PatchTST.supervised.backbone import SupervisedBackbone
 from models.components.decomposition import CausalMovingAverage1D
 
 
-class Model(nn.Module):
+class BaseModel(nn.Module):
     """
     입력:  x (B, L, C)  - Batch, Lookback, Channels
     출력:  ŷ (B, H, C)  - Batch, Horizon, Channels (외부 파이프라인 정합을 위해 통일)
@@ -106,6 +108,81 @@ class Model(nn.Module):
             ex = self.exo_head(future_exo).squeeze(-1)  # (B, Hm)
             pred = pred + ex.unsqueeze(-1)  # (B, Hm, C)
 
-
-
         return pred
+
+class QuantileModel(nn.Module):
+    def __init__(
+             self,
+             configs: PatchTSTConfig,
+             quantiles: Sequence[float] = (0.1, 0.5, 0.9),
+             target_channel: int = 0,
+             q_hidden: int = 64,
+             monotonic: bool = True,
+             use_exo_in_head: bool = False,
+             exo_dim: int | None = None
+         ):
+        super().__init__(configs, exo_dim = exo_dim)
+        self.quantiles = tuple(float(q) for q in quantiles)
+        self.Q = len(self.quantiles)
+        self.target_channel = int(target_channel)
+        self.monotonic = bool(monotonic)
+        self.use_exo_in_head = bool(use_exo_in_head)
+
+        # q_head input dimension = 1 (point scalar) + (optional) exo_dim
+        in_dim = 1 + (self.exo_dim if self.use_exo_in_head and self.exo_dim > 0 else 0)
+
+        self.q_head = nn.Sequential(
+            nn.Linear(in_dim, q_hidden),
+            nn.GELU(),
+            nn.Linear(q_hidden, self.Q)
+        )
+
+    def _align_exo_len(self, exo: Tensor, Hm: int, device, dtype) -> Tensor:
+        """
+        exo: (B, H, exo_dim) -> (B, Hm, exo_dim)
+        """
+        B, Hx, E = exo.size()
+        exo = exo.to(device = device, dtype = dtype)
+        if Hx == Hm:
+            return exo
+        if Hx > Hm:
+            return exo[:, :Hm, :]
+
+        pad = torch.zeros(B, Hm -Hx, E, device = device, dtype = dtype)
+        return torch.cat([exo, pad], dim = 1)
+
+    def forward(self, x: Tensor, future_exo: Tensor | None = None) -> Tensor:
+        """
+        return: (B, Q, H) - target_channel에 대한 분위수들
+        """
+        # 1) Base point 예측: (B, H, C) (exo 가산은 BaseModel 내부에서 수행)
+        pred_bhc = super().forward(x, future_exo) # (B, H, C)
+        B, Hm, C = pred_bhc.shape
+
+        # 2) target channel scalar만 추출: (B, H)
+        if C == 1:
+            pred_bh = pred_bhc.squeeze(-1) # (B, H)
+        else:
+            if not (0 <= self.target_channel < C):
+                raise IndexError(f"target_channel = {self.target_channel} out of range [0, {C-1}]")
+            pred_bh = pred_bhc[..., self.target_channel]
+
+        # 3) q_head 입력 구성: (B, H, iin_dim)
+        feats = pred_bh.unsqueeze(-1)   # (B, H, 1)
+        if self.use_exo_in_head and (future_exo is not None) and (self.exo_dim > 0):
+            future_exo = self._align_exo_len(
+                future_exo,
+                Hm,
+                device = pred_bh.device,
+                dtype = pred_bh.dtype
+            )
+            feats = torch.cat([feats, future_exo], dim = -1) # (B, H, 1 + exo_dim)
+
+        # 4) time-distributed MLP -> (B, H, Q) -> (B, Q, H)
+        q = self.q_head(feats.reshape(B * Hm, -1)).reshape(B, Hm, self.Q)   # (B, H, Q)
+        q = q.permute(0, 2, 1).contiguous() # (B, Q, H)
+
+        # 5) (optional) q10 <= q50 <= q90
+        if self.monotonic:
+            q, _ = torch.sort(q, dim = 1)
+        return q

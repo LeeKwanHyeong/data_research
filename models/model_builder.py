@@ -6,16 +6,16 @@ from models.Titan.common.configs import TitanConfig
 
 
 def build_patch_mixer_base(cfg: PatchMixerConfig):
-    from models.PatchMixer.PatchMixer import PatchMixerModel
-    return PatchMixerModel(cfg)
+    from models.PatchMixer.PatchMixer import BaseModel
+    return BaseModel(cfg)
 
 def build_patch_mixer_feature(cfg: PatchMixerConfig):
-    from models.PatchMixer.PatchMixer import PatchMixerFeatureModel
-    return PatchMixerFeatureModel(cfg)
+    from models.PatchMixer.PatchMixer import FeatureModel
+    return FeatureModel(cfg)
 
 def build_patch_mixer_quantile(cfg: PatchMixerConfig):
-    from models.PatchMixer.PatchMixer import PatchMixerQuantileModel
-    return PatchMixerQuantileModel(cfg)
+    from models.PatchMixer.PatchMixer import QuantileModel
+    return QuantileModel(cfg)
 
 def build_titan_base(cfg: TitanConfig):
     from models.Titan.Titans import Model
@@ -34,8 +34,12 @@ def build_titan_feature(cfg: TitanConfig):
     return FeatureModel(cfg)
 
 def build_patchTST_base(cfg: PatchTSTConfig):
-    from models.PatchTST.supervised.PatchTST import Model
-    return Model(cfg)
+    from models.PatchTST.supervised.PatchTST import BaseModel
+    return BaseModel(cfg)
+
+def build_patchTST_quantile(cfg: PatchTSTConfig):
+    from models.PatchTST.supervised.PatchTST import QuantileModel
+    return QuantileModel(cfg)
 
 
 

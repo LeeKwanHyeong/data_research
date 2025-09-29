@@ -11,7 +11,7 @@ from utils.exogenous_utils import _apply_exo_shift_linear
 # -------------------------
 # Simple PatchMixer -> Horizon regression
 # -------------------------
-class PatchMixerModel(nn.Module):
+class BaseModel(nn.Module):
     """
     PatchMixerBackbone 출력(global patch represntation)
     -> MLP
@@ -68,7 +68,7 @@ class PatchMixerModel(nn.Module):
 # -------------------------
 # Simple PatchMixer + Feature Branch
 # -------------------------
-class PatchMixerFeatureModel(nn.Module):
+class FeatureModel(nn.Module):
     """
     Timeseries + static/exogenous feature combined head.
     ts_input:      (B, L, N)
@@ -142,7 +142,7 @@ class PatchMixerFeatureModel(nn.Module):
 # -------------------------
 # Simple PatchMixer + Decomposition Quantile Head
 # -------------------------
-class PatchMixerQuantileModel(nn.Module):
+class QuantileModel(nn.Module):
     """
     Multi-Scale PatchMixer Backbone + Decomposition Quantile Head
     output: (B, 3, H)  # (q10, q50, q90)
@@ -160,6 +160,7 @@ class PatchMixerQuantileModel(nn.Module):
                  ):
         super().__init__()
         H = horizon if horizon is not None else base_configs.horizon
+
         self.backbone = MultiScalePatchMixerBackbone(
             base_configs=base_configs,
             patch_cfgs=patch_cfgs,
@@ -167,6 +168,7 @@ class PatchMixerQuantileModel(nn.Module):
             fused_dim=fused_dim,
             fusion=fusion,
         )
+
         self.head = DecompQuantileHead(
             in_dim=self.backbone.out_dim,
             horizon=H,

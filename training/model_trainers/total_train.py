@@ -95,19 +95,16 @@ def run_total_train_monthly(train_loader, val_loader, device = 'cuda'):
         train_loader, val_loader,
         lr = 1e-3, loss_mode = 'auto', use_intermittent = True
     )
-
-    # 출력 모양을 모를 수 있으므로 자동 감지: (B,Q,H)이면 is_quantile=True로 평가
-    # val 배치 하나를 훔쳐보고 결정
-    # batch = next(iter(val_loader))
-    # sample_x = batch[0].to(device)
-    # with torch.no_grad():
-    #     out = best_pt(sample_x)
-    # is_q = (out.dim() == 3)
-    # res_pt = evaluate_model(best_pt, val_loader, device=device, is_quantile=is_q,
-    #                         q_index={0.1: 0, 0.5: 1, 0.9: 2} if is_q else None)
-    # results["PatchTST"] = res_pt
-
     results['PatchTST Base'] = best_pt_base
+
+
+    print('PatchTST Quantile')
+    best_pt_quantile = train_patchtst(
+        pt_base,
+        train_loader, val_loader,
+        lr = 1e-3, loss_mode = 'auto', use_intermittent = True
+    )
+    results['PatchTST Quantile'] = best_pt_quantile
 
     return results
 
