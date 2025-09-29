@@ -47,6 +47,8 @@ class BasePatchTSTBackbone(nn.Module):
         x_p = do_patch(x, self.cfg.patch_len, self.cfg.stride, self.cfg.padding_patch)  # [B,nvars,P,N]
         z = self.backbone(x_p)  # [B,nvars,d_model,N]
 
+        self._last_z = z # Cash (Quantile Head에서 가져다 씀)
+
         y = self.head_forward(z)  # 모드별 출력
 
         if self.revin:

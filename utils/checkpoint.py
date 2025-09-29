@@ -60,6 +60,10 @@ def _rebuild_titan(cfgd: dict):
 def _rebuild_patchmixer(cfgd: dict):
     return PatchMixerConfigMonthly(**cfgd)
 
+def _is_quantile_state(state_dict: dict) -> bool:
+    return any(k.startswith("q_head.") for k in state_dict.keys()) \
+        or  any(k.startswith("delta_head.") for k in state_dict.keys())
+
 def _pick_builder_key_safely(name: str, bkey_in_ckpt: str | None, state_dict: dict) -> str:
     # 1) ckpt가 빌더키를 갖고 있으면 그걸 우선
     if bkey_in_ckpt:
@@ -68,18 +72,22 @@ def _pick_builder_key_safely(name: str, bkey_in_ckpt: str | None, state_dict: di
     has_decoder = any(k.startswith("decoder.") for k in state_dict.keys())
     if "Titan" in name:
         if "Seq2" in name or "Seq2seq" in name:
-            return "titan_seq2seq" if has_decoder else "titan_lmm"  # ✅ 내용 기준으로 보정
+            return "titan_seq2seq" if has_decoder else "titan_lmm"
         else:
             return "titan_lmm" if not has_decoder else "titan_seq2seq"
     # 3) 나머지 힌트
-    if "PatchMixer" in name and "Quantile" in name:
-        return "patchmixer_quantile"
-    if "PatchMixer" in name:
-        return "patchmixer_base"
-    if "PatchTST" in name:
-        return "patchtst_base"
-    # 4) 최후의 보루
-    return "patchtst_base"
+    if 'PatchMixer' in name:
+        if 'Quantile' in name:
+            return 'patchmixer_quantile'
+        else:
+            return 'patchmixer_base'
+
+    if 'PatchTST' in name:
+        if 'Quantile' in name:
+            return 'patchtst_quantile'
+        return 'patchtst_quantile' if _is_quantile_state(state_dict) else 'patchtst_base'
+
+    return 'patchtst_base'
 
 def load_model_dict(save_dir, builders: dict, device="cpu", strict=True):
     index = torch.load(os.path.join(save_dir, "_index.pt"), map_location="cpu")
@@ -105,17 +113,33 @@ def load_model_dict(save_dir, builders: dict, device="cpu", strict=True):
 
         model = builders[bkey](cfg_obj)  # 저장 당시 cfg로 재빌드 → horizon/target_dim 일치
         try:
-            model = builders[bkey](cfg_obj)  # ← 복원된 cfg로 반드시 빌드
-            _assert_horizon(model, cfg_obj)  # ← 여기서 검증 (틀리면 즉시 에러로 원인 명확)
             model.load_state_dict(ckpt["state_dict"], strict=strict)
         except RuntimeError as e:
-            if strict:
-                raise
-            # strict=False일 때는 모양 맞는 키만 부분 로드
+            # QuantileModel인데 q_head.*만 없음 → 부분 로드 허용
+            sd_keys = set(ckpt["state_dict"].keys())
             own = model.state_dict()
-            ok = {k: v for k, v in ckpt["state_dict"].items() if (k in own and own[k].shape == v.shape)}
-            model.load_state_dict(ok, strict=False)
-            print(f"[load warning] {name}: partial load, loaded={len(ok)}/{len(own)} keys")
+
+            def _partial_load_with_msg(msg: str):
+                ok = {k: v for k, v in ckpt["state_dict"].items()
+                      if (k in own and own[k].shape == v.shape)}
+                model.load_state_dict(ok, strict=False)
+                print(f"[load warning] {name}: {msg}  partial={len(ok)}/{len(own)} keys; "
+                      f"missing params randomly initialized.")
+
+            # --- Quantile 전용 헤드 결측 허용 ---
+            need_q = any(k.startswith("q_head.") for k in own.keys())
+            miss_q = not any(k.startswith("q_head.") for k in sd_keys)
+            need_d = any(k.startswith("delta_head.") for k in own.keys())
+            miss_d = not any(k.startswith("delta_head.") for k in sd_keys)
+
+            if need_q and miss_q:
+                _partial_load_with_msg("checkpoint lacks q_head.*")
+            elif need_d and miss_d:
+                _partial_load_with_msg("checkpoint lacks delta_head.*")
+            else:
+                if strict:
+                    raise
+                _partial_load_with_msg("shape/key mismatch")
 
         model.to(device).eval()
         loaded[name] = model

@@ -31,7 +31,7 @@ def run_total_train_monthly(train_loader, val_loader, device = 'cuda'):
     best_pm_base = train_patchmixer(
         pm_base_model,
         train_loader, val_loader,
-        lr = 1e-3, loss_mode = 'quantile',
+        lr = 1e-3, loss_mode = 'point',
         quantiles = (0.1, 0.5, 0.9), use_intermittent = True,
     )
     results['PatchMixer Base'] = best_pm_base
@@ -102,7 +102,7 @@ def run_total_train_monthly(train_loader, val_loader, device = 'cuda'):
     best_pt_quantile = train_patchtst(
         pt_base,
         train_loader, val_loader,
-        lr = 1e-3, loss_mode = 'auto', use_intermittent = True
+        lr = 1e-3, loss_mode = 'quantile', use_intermittent = True
     )
     results['PatchTST Quantile'] = best_pt_quantile
 

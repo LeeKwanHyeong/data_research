@@ -15,6 +15,7 @@ def _ensure_config_instance(config):
 class Model(nn.Module):
     def __init__(self, config: TitanConfig):
         super().__init__()
+        self.model_name = 'Titan BaseModel'
 
         # RevIN (Reversible Instance Normalization) 레이어
         # - 입력 시계열 데이터를 인스턴스 단위로 정규화하여 분포 변화를 완화
@@ -83,6 +84,7 @@ class Model(nn.Module):
 class LMMModel(nn.Module):
     def __init__(self, config: TitanConfig):
         super().__init__()
+        self.model_name = 'Titan LMMModel'
 
         # RevIN (Reversible Instance Normalization)
         # - 입력 시계열을 인스턴스 단위로 정규화하여 분포 변화 완화
@@ -217,6 +219,9 @@ class LMMSeq2SeqModel(nn.Module):
     """
     def __init__(self, config: TitanConfig):
         super().__init__()
+        self.model_name = 'Titan LMMSeq2SeqModel'
+
+
         config = _ensure_config_instance(config)
         self.config = config
         self.horizon = getattr(config, 'horizon', getattr(config, 'output_horizon', None))
@@ -305,6 +310,8 @@ class LMMSeq2SeqModel(nn.Module):
 class FeatureModel(nn.Module):
     def __init__(self, config: TitanConfig, feature_dim = 7):
         super().__init__()
+        self.model_name = 'Titan FeatureModel'
+
         # MemoryEncoder (Titan 기반 인코더)
         # - 시계열 데이터를 Transformer 기반 구조로 인코딩
         # - MAC(Memory-as-Context) 구조로 컨텍스트/영구 메모리 활용

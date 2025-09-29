@@ -19,6 +19,8 @@ class BaseModel(nn.Module):
     """
     def __init__(self, configs: PatchMixerConfig, exo_dim: int = 0):
         super().__init__()
+        self.model_name = 'PatchMixer BaseModel'
+
         self.backbone = PatchMixerBackbone(configs = configs)
 
         in_dim = self.backbone.patch_repr_dim # a * d_model
@@ -77,6 +79,8 @@ class FeatureModel(nn.Module):
     """
     def __init__(self, configs: PatchMixerConfig, feature_dim: int = 4, exo_dim: int = 0):
         super().__init__()
+        self.model_name = 'PatchMixer FeatureModel'
+
         self.backbone = PatchMixerBackbone(configs = configs)
 
         # Feature Branch
@@ -159,6 +163,9 @@ class QuantileModel(nn.Module):
                  exo_dim: int = 0
                  ):
         super().__init__()
+        self.is_quantile = True
+        self.model_name = 'PatchMixer QuantileModel'
+
         H = horizon if horizon is not None else base_configs.horizon
 
         self.backbone = MultiScalePatchMixerBackbone(

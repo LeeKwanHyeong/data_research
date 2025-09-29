@@ -106,9 +106,8 @@ def _probe_output(model, x1, device="cpu", future_exo_cb=None):
 def _roll_quantile_ims(model, x_init, horizon, device="cpu", future_exo_cb=None,
                        target_channel=0, fill_mode="copy_last"):
     """
-    Quantile 모델을 IMS(1-step rollout)로 굴려서 길이 horizon의 q10/q50/q90 시퀀스를 만든다.
-    - 각 스텝: model(x, future_exo=...) -> (B,Q,Hm), 첫 토큰만 사용 -> q10_t,q50_t,q90_t
-    - 다음 입력 윈도우 업데이트는 q50_t로 수행(포인트 대용)
+    Quantile 모델(출력 (B,Q,H) 또는 (B,H,Q))을 IMS로 굴려 길이=horizon의
+    q10/q50/q90 시퀀스를 만든다.
     """
     model = model.to(device).eval()
     x = x_init.to(device).float().clone()
@@ -116,55 +115,69 @@ def _roll_quantile_ims(model, x_init, horizon, device="cpu", future_exo_cb=None,
         x = x.unsqueeze(-1)
     B = x.size(0)
 
-    # 한 번 probe해서 Hm 파악
+    # probe: 출력 모양 파악
     out_probe = model(x)
     if isinstance(out_probe, (tuple, list)):
         out_probe = next(t for t in out_probe if torch.is_tensor(t))
-    assert out_probe.dim() == 3, f"expect (B,Q,Hm), got {tuple(out_probe.shape)}"
-    _, Q, Hm = out_probe.shape
-    assert Q >= 3, "need at least 3 quantiles (q10,q50,q90)"
-    # 분위수 index 규약: 0:q10, 1:q50, 2:q90
+    assert out_probe.dim() == 3, f"expect 3D output for quantile model, got {tuple(out_probe.shape)}"
+
+    # ---- 축 자동 감지 ----
+    if out_probe.shape[1] in (3, 5, 9):          # (B,Q,Hm)
+        Q_axis, H_axis = 1, 2
+        Hm = out_probe.shape[H_axis]
+        def extract_first_step_q(out):
+            if isinstance(out, (tuple, list)):
+                out = next(tt for tt in out if torch.is_tensor(tt))
+            # (B,Q,H) 가정
+            return out[:, 0, 0], out[:, 1, 0], out[:, 2, 0]  # q10,q50,q90 @ step0
+    elif out_probe.shape[2] in (3, 5, 9):        # (B,Hm,Q)
+        Q_axis, H_axis = 2, 1
+        Hm = out_probe.shape[H_axis]
+        def extract_first_step_q(out):
+            if isinstance(out, (tuple, list)):
+                out = next(tt for tt in out if torch.is_tensor(tt))
+            # (B,H,Q) 가정
+            return out[:, 0, 0], out[:, 0, 1], out[:, 0, 2]  # q10,q50,q90 @ step0
+    else:
+        raise RuntimeError(f"cannot infer quantile axis from shape {tuple(out_probe.shape)}")
+
     q10_seq, q50_seq, q90_seq = [], [], []
 
     def _prepare_next_input(x, y_step, target_channel=0, fill_mode="copy_last"):
         B, L, C = x.shape
-        y_step = y_step.reshape(B, 1, 1)  # (B,1,1)
+        y_step = y_step.reshape(B, 1, 1)
         if C == 1:
             new_tok = y_step
         else:
             last = x[:, -1:, :].clone()
-            if fill_mode == "zeros":
-                new_tok = torch.zeros_like(last)
-            else:
-                new_tok = last
+            new_tok = torch.zeros_like(last) if fill_mode == "zeros" else last
             new_tok[:, 0, target_channel] = y_step[:, 0, 0]
         return torch.cat([x[:, 1:, :], new_tok], dim=1)
 
     for t in range(int(horizon)):
-        # 미래 exo 만들기 (길이는 Hm로 주는게 무난)
+        # exo 준비 (길이는 Hm로)
         exo = None
         if future_exo_cb is not None:
-            ex = future_exo_cb(t, Hm, device=device)             # (Hm, D)
-            exo = ex.unsqueeze(0).expand(B, -1, -1)              # (B,Hm,D)
+            ex = future_exo_cb(t, Hm, device=device)   # (Hm, D)
+            exo = ex.unsqueeze(0).expand(B, -1, -1)    # (B,Hm,D)
 
-        out = model(x, future_exo=exo)                           # (B,Q,Hm)
-        if isinstance(out, (tuple, list)):
-            out = next(tt for tt in out if torch.is_tensor(tt))
+        out = model(x, future_exo=exo)
+        q10_t, q50_t, q90_t = extract_first_step_q(out)
+        model_name = str(getattr(model, "model_name", "None"))
 
-        q10_t = out[:, 0, 0]                                     # (B,)
-        q50_t = out[:, 1, 0]                                     # (B,)
-        q90_t = out[:, 2, 0]                                     # (B,)
-
+        if t < 5:  # DEBUG
+            print('model', model_name,"[DBG] t", t,
+                  "q10:", float(q10_t[0]), "q50:", float(q50_t[0]), "q90:", float(q90_t[0]))
         q10_seq.append(q10_t.unsqueeze(1))
         q50_seq.append(q50_t.unsqueeze(1))
         q90_seq.append(q90_t.unsqueeze(1))
 
-        # q50으로 다음 입력 윈도우 업데이트
+        # q50으로 다음 입력 윈도우 갱신
         x = _prepare_next_input(x, q50_t, target_channel=target_channel, fill_mode=fill_mode)
 
-    q10 = torch.cat(q10_seq, dim=1)   # (B, H)
-    q50 = torch.cat(q50_seq, dim=1)   # (B, H)
-    q90 = torch.cat(q90_seq, dim=1)   # (B, H)
+    q10 = torch.cat(q10_seq, dim=1)  # (B,H)
+    q50 = torch.cat(q50_seq, dim=1)
+    q90 = torch.cat(q90_seq, dim=1)
     return q10, q50, q90
 
 # -------------------------
@@ -172,28 +185,49 @@ def _roll_quantile_ims(model, x_init, horizon, device="cpu", future_exo_cb=None,
 # -------------------------
 @torch.no_grad()
 def _predict_120_any(model, x1, device="cpu", future_exo_cb=None):
-    """
-    모델에 따라 120개월 예측을 얻는다.
-    - (B,Q,Hm) 형태(분위수: Q∈{3,5,9} 또는 model.is_quantile=True)면 q10/q50/q90를 120 길이로 반환
-    - 그 외(포인트형)면 DMS→IMS로 120개월 point 예측
-    """
     out = _probe_output(model, x1, device=device, future_exo_cb=future_exo_cb)
 
-    # ---- 분위수 모델 ----
+    is_q_flag = bool(getattr(model, "is_quantile", False))
+
     if out.dim() == 3:
-        B, A, Hm = out.shape
-        is_quantile = (A in (3, 5, 9)) or bool(getattr(model, "is_quantile", False))
-        if is_quantile:
-            arr = out.squeeze(0).detach().cpu().numpy()   # (Q,Hm)
-            # 최소 세 분위수만 사용(q10,q50,q90). Q가 5/9여도 앞 3개를 안전 사용.
+        B, D1, D2 = out.shape
+        # 1) 모양으로 1차 판별
+        has_quant_axis = (D1 in (3, 5, 9)) or (D2 in (3, 5, 9))
+        is_quantile = has_quant_axis or is_q_flag
+
+        # 2) 최종 검증: 진짜 Q축이 없으면 분위수 경로 진입 금지
+        if is_quantile and not has_quant_axis:
+            # exo가 필요한 모델일 수 있으니 한번 더 시도
+            try:
+                Hm = _infer_horizon(model, default=120)
+                exo = None
+                if future_exo_cb is not None:
+                    ex = future_exo_cb(0, Hm, device=device)     # (Hm,D)
+                    exo = ex.unsqueeze(0).expand(x1.size(0), -1, -1)
+                out2 = _safe_forward(model, x1.to(device), future_exo=exo)
+                if isinstance(out2, (tuple, list)):
+                    out2 = next(t for t in out2 if torch.is_tensor(t))
+                if out2.dim() == 3:
+                    has_quant_axis = (out2.shape[1] in (3,5,9)) or (out2.shape[2] in (3,5,9))
+                else:
+                    has_quant_axis = False
+            except Exception:
+                has_quant_axis = False
+
+        if is_quantile and has_quant_axis:
+            # IMS 롤아웃으로 120 스텝 분위수 생성
             q10, q50, q90 = _roll_quantile_ims(
                 model, x1, horizon=120, device=device,
                 future_exo_cb=future_exo_cb, target_channel=0, fill_mode="copy_last"
             )
-            q10 = q10.squeeze(0).cpu().numpy()
-            q50 = q50.squeeze(0).cpu().numpy()
-            q90 = q90.squeeze(0).cpu().numpy()
-            return {"point": q50, "q": {"q10": q10, "q50": q50, "q90": q90}}
+            return {
+                "point": q50.squeeze(0).cpu().numpy(),
+                "q": {
+                    "q10": q10.squeeze(0).cpu().numpy(),
+                    "q50": q50.squeeze(0).cpu().numpy(),
+                    "q90": q90.squeeze(0).cpu().numpy(),
+                },
+            }
 
     # ---- 포인트형 모델: DMS→IMS로 120개월 ----
     f = DMSForecaster(
@@ -203,17 +237,11 @@ def _predict_120_any(model, x1, device="cpu", future_exo_cb=None):
         lmm_mode="eval",
         predict_fn=None,
         ttm=None,
-        future_exo_cb=future_exo_cb,  # 콜백 연결
+        future_exo_cb=future_exo_cb,
     )
-
     y120 = f.forecast_DMS_to_IMS(
-        x_init=x1,
-        horizon=120,
-        device=device,
-        extend="ims",
-        context_policy="once",
-    )  # (1,120)
-
+        x_init=x1, horizon=120, device=device, extend="ims", context_policy="once",
+    )
     return {"point": y120.squeeze(0).detach().cpu().numpy()}
 
 
@@ -293,6 +321,7 @@ def plot_120_months_many(models: dict,
 
             # 1) 분위수 밴드 + 중앙선 (있는 모델만) — 이미 120 보장됨
             for nm in list(preds_q50.keys()):
+                print(nm)
                 q10 = preds_q10[nm]; q50 = preds_q50[nm]; q90 = preds_q90[nm]
                 plt.fill_between(t_fut, q10, q90, alpha=0.15, label=f"{nm} P10–P90")
                 plt.plot(t_fut, q50, linewidth=1.8, alpha=0.95, label=f"{nm} P50")
