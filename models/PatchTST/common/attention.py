@@ -46,7 +46,7 @@ class FullAttention(nn.Module):
         A = torch.softmax(scores, dim=-1)
         A = self.dropout(A)
 
-        # ✅ out shape 은 (B, L, H, d_v) 이어야 함
+        # out shape 은 (B, L, H, d_v) 이어야 함
         V = torch.einsum('bhls,bshd->blhd', A, values)
 
         if self.output_attention and self.return_logits:
@@ -306,41 +306,51 @@ class MultiHeadAttention(nn.Module):
             nn.Dropout(proj_dropout)
         )
 
-    def forward(self,
-                Q: torch.Tensor,
-                K: torch.Tensor | None = None,
-                V: torch.Tensor | None = None,
-                attn_mask: torch.Tensor | None = None,
-                prev_logits: torch.Tensor | None = None):
-        # Q,K,V: (B,L,D)
-        B, L, _ = Q.shape
+    # === REPLACE: MultiHeadAttention.forward ===
+    def forward(self, Q, K=None, V=None, attn_mask=None, prev_logits=None):
         if K is None: K = Q
         if V is None: V = Q
+        B, L, _ = Q.shape
         S = K.size(1)
 
-        # (B,L,H,Dh)
-        q = self.W_Q(Q).reshape(B, L, self.n_heads, self.d_k)
-        k = self.W_K(K).reshape(B, S, self.n_heads, self.d_k)
-        v = self.W_V(V).reshape(B, S, self.n_heads, self.d_v)
+        q = self.W_Q(Q).view(B, L, self.n_heads, self.d_k).transpose(1, 2)  # [B,H,L,d_k]
+        k = self.W_K(K).view(B, S, self.n_heads, self.d_k).transpose(1, 2)  # [B,H,S,d_k]
+        v = self.W_V(V).view(B, S, self.n_heads, self.d_v).transpose(1, 2)  # [B,H,S,d_v]
 
-        # 코어 호출 (prev_logits 지원 여부에 따라 분기)
         if self.core_accepts_prev:
             core_out = self.core(q, k, v, attn_mask, prev_logits=prev_logits)
         else:
             core_out = self.core(q, k, v, attn_mask)
 
-        # 코어 출력 정규화: (out, attn) 또는 (out, attn, logits) 모두 허용
         if isinstance(core_out, tuple):
             if len(core_out) == 3:
-                out_b_l_h_d, attn, logits = core_out
+                out_b_h_l_d, attn, logits = core_out
             else:
-                out_b_l_h_d, attn = core_out
+                out_b_h_l_d, attn = core_out
                 logits = None
         else:
-            out_b_l_h_d, attn, logits = core_out, None, None
+            out_b_h_l_d, attn, logits = core_out, None, None
 
-        out = out_b_l_h_d.reshape(B, L, self.n_heads * self.d_v)
-        out = self.to_out(out)
+        # 표준화: core는 [B,H,L,Dv]를 반환한다고 가정
+        assert out_b_h_l_d.dim() == 4, f"attn core must return 4D, got {out_b_h_l_d.shape}"
+        B2, Hh, L_real, Dv = out_b_h_l_d.shape
+
+        # [B,H,L,Dv] → [B,L,H,Dv] → [B,L,H*Dv]
+        out_b_l_h_d = out_b_h_l_d.transpose(1, 2).contiguous()
+        out = out_b_l_h_d.view(B2, L_real, Hh * Dv)
+
+        # (실험 중 H*Dv를 바꿨을 때) to_out in_features 자동 보정
+        lin = self.to_out[0] if isinstance(self.to_out, nn.Sequential) else self.to_out
+        if lin.in_features != out.shape[-1]:
+            new_lin = nn.Linear(out.shape[-1], lin.out_features, bias=(lin.bias is not None)).to(out.device)
+            nn.init.xavier_uniform_(new_lin.weight)
+            if new_lin.bias is not None: nn.init.zeros_(new_lin.bias)
+            if isinstance(self.to_out, nn.Sequential):
+                self.to_out[0] = new_lin
+            else:
+                self.to_out = new_lin
+
+        out = self.to_out(out)  # [B, L_real, d_model]
         return out, attn, logits
 
 

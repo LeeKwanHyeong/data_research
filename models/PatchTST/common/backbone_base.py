@@ -1,61 +1,49 @@
 import torch
-import torch.nn as nn
+from torch import nn
+from models.PatchTST.common.patching import compute_patch_num
+from models.PatchTST.common.pos_encoding import positional_encoding
 
-from models.PatchTST.common.configs import PatchTSTConfig
-from models.PatchTST.common.encoder import TSTiEncoder
-from models.PatchTST.common.patching import compute_patch_num, do_patch
-from models.common_layers.RevIN import RevIN
-
-class BasePatchTSTBackbone(nn.Module):
-    """공통: RevIN, patching, encoder 조립. Head는 서브클래스에서 구현."""
-    def __init__(self, cfg: PatchTSTConfig):
+class PatchBackboneBase(nn.Module):
+    """
+    PatchTST backbone의 공통 기반 클래스.
+    - 입력: (B, C, L)
+    - 출력: (B, L_tok, d_model)
+    - patch_len, stride 변경 시에도 안전하게 patch_num 계산
+    """
+    def __init__(self, cfg):
         super().__init__()
         self.cfg = cfg
+        self.c_in = cfg.c_in
+        self.d_model = cfg.d_model
+        self.patch_len = cfg.patch_len
+        self.stride = cfg.stride
+        self.padding_patch = getattr(cfg, "padding_patch", None)
+        self.use_pos_enc = getattr(cfg, "use_pos_enc", True)
 
-        # RevIN
-        self.revin = cfg.revin
-        if self.revin:
-            self.revin_layer = RevIN(cfg.c_in, affine=cfg.affine, subtract_last=cfg.subtract_last)
-
-        # patching
-        self.patch_num = compute_patch_num(cfg.lookback, cfg.patch_len, cfg.stride, cfg.padding_patch)
-
-        # 백본 (Encoder)
-        self.backbone = TSTiEncoder(
-            c_in=cfg.c_in,
-            patch_num=self.patch_num,
-            patch_len=cfg.patch_len,
-            cfg=cfg
+        # Patch projection: (B, C, L) -> (B, d_model, L_tok)
+        self.patch_proj = nn.Conv1d(
+            in_channels=self.c_in,
+            out_channels=self.d_model,
+            kernel_size=self.patch_len,
+            stride=self.stride,
         )
 
-    # --- 서브클래스가 반드시 구현해야 할 부분 ---
-    def build_head(self) -> nn.Module:
-        raise NotImplementedError
+        # Positional Encoding
+        self.pos_enc = positional_encoding(self.d_model)
 
-    def head_forward(self, z: torch.Tensor) -> torch.Tensor:
-        """z: [B, nvars, d_model, patch_num] -> 모드별 출력으로 변환"""
-        raise NotImplementedError
+    def _patchify(self, x_bcl: torch.Tensor) -> torch.Tensor:
+        """
+        x_bcl: [B, C, L_in]
+        return: [B, L_tok, d_model]
+        """
+        B, C, L_in = x_bcl.shape
 
-    # --- 공통 forward ---
-    def forward(self, x: torch.Tensor):
-        # x: [B, nvars, lookback]
-        if self.revin:
-            x = x.permute(0,2,1)
-            x = self.revin_layer(x, 'norm')
-            x = x.permute(0,2,1)
+        # 안전 patch 수 계산
+        L_tok = compute_patch_num(L_in, self.patch_len, self.stride, self.padding_patch)
+        z = self.patch_proj(x_bcl)              # [B, d_model, L_tok]
+        z = z.transpose(1, 2).contiguous()      # [B, L_tok, d_model]
 
-        x_p = do_patch(x, self.cfg.patch_len, self.cfg.stride, self.cfg.padding_patch)  # [B,nvars,P,N]
-        z = self.backbone(x_p)  # [B,nvars,d_model,N]
+        if self.use_pos_enc:
+            z = z + self.pos_enc[:, :L_tok, :].to(z.device)
 
-        self._last_z = z # Cash (Quantile Head에서 가져다 씀)
-
-        y = self.head_forward(z)  # 모드별 출력
-
-        if self.revin:
-            # supervised면 [B,nvars,horizon], self-supervised면 복원형태에 따라 다름
-            if y.dim()==3 and y.size(1)==self.cfg.c_in:
-                y = y.permute(0,2,1)
-                y = self.revin_layer(y, 'denorm')
-                y = y.permute(0,2,1)
-
-        return y
+        return z

@@ -13,7 +13,7 @@ class RegressionHead(nn.Module):
 
     def forward(self, x):
         """
-        x: [bs x nvars x d_model x num_patch]
+        x: [bs x n_vars x d_model x num_patch]
         output: [bs x output_dim]
         """
         x = x[:, :, :, -1]      # only consider the last item in the sequence, x: bs x nvars x d_model
