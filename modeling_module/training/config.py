@@ -15,8 +15,8 @@ class DecompositionConfig:
 class TrainingConfig:
     # ------------Loader------------
     device: str = 'cuda'
-    lookback: int = 36
-    horizon: int = 48
+    lookback: int = 12
+    horizon: int = 3
 
     # ------------Training------------
     epochs: int = 1

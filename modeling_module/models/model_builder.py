@@ -32,12 +32,12 @@ def build_titan_feature(cfg: TitanConfig):
     return FeatureModel(cfg)
 
 def build_patchTST_base(cfg: PatchTSTConfig):
-    from modeling_module.models.PatchTST.supervised.PatchTST import BaseModel
-    return BaseModel(cfg)
+    from modeling_module.models.PatchTST.supervised.PatchTST import PatchTSTPointModel
+    return PatchTSTPointModel(cfg)
 
 def build_patchTST_quantile(cfg: PatchTSTConfig):
-    from modeling_module.models.PatchTST.supervised.PatchTST import QuantileModel
-    return QuantileModel(cfg)
+    from modeling_module.models.PatchTST.supervised.PatchTST import PatchTSTQuantileModel
+    return PatchTSTQuantileModel(cfg)
 
 
 

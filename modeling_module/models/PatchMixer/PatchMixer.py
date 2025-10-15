@@ -4,6 +4,7 @@ import torch.nn as nn
 from modeling_module.models.PatchMixer.backbone import PatchMixerBackbone, MultiScalePatchMixerBackbone
 from modeling_module.models.PatchMixer.common.configs import PatchMixerConfig
 from modeling_module.models.PatchMixer.common.head import DecompQuantileHead
+from modeling_module.models.common_layers.RevIN import RevIN
 from modeling_module.utils.exogenous_utils import _apply_exo_shift_linear
 
 
@@ -44,6 +45,7 @@ class BaseModel(nn.Module):
                 nn.GELU(),
                 nn.Linear(64, 1)
             )
+        self.revin = RevIN(configs.enc_in)
 
     def forward(self, x: torch.Tensor, future_exo: torch.Tensor | None = None) -> torch.Tensor:
         """
@@ -51,6 +53,7 @@ class BaseModel(nn.Module):
                 future_exo: (B, Hx, exo_dim) | None
                 mode/kwargs: 무시(호출자 호환성)
                 """
+        x = self.revin(x, 'norm')
         patch_repr = self.backbone(x)  # (B, a * d_model)
         patch_repr = self.proj(patch_repr)  # (B, 128)
         out = self.fc(patch_repr)  # (B, H)
@@ -63,6 +66,7 @@ class BaseModel(nn.Module):
                 out_device=out.device
             )  # (B, H)
             out = out + ex
+        out = self.revin(out, 'denorm')
 
         return out  # (B, H)
 
@@ -115,6 +119,7 @@ class FeatureModel(nn.Module):
                 nn.GELU(),
                 nn.Linear(64, 1),  # (B, Hx, 1)
             )
+        self.revin = RevIN(configs.enc_in)
 
     def forward(self,
                 ts_input: torch.Tensor,
@@ -125,6 +130,7 @@ class FeatureModel(nn.Module):
         ts_input: (B, L, N)
         feature_input: (B, F)
         """
+        ts_input = self.revin(ts_input, 'norm')
         patch_repr = self.backbone(ts_input)                              # (B, a * d_model)
         patch_repr = self.proj(patch_repr)                                # (B, 128)
 
@@ -140,7 +146,7 @@ class FeatureModel(nn.Module):
                 out_device=out.device
             )  # (B, H)
             out = out + ex
-
+        out = self.revin(out, 'denorm')
         return out  # (B, H)
 # -------------------------
 # Simple PatchMixer + Decomposition Quantile Head
@@ -190,12 +196,14 @@ class QuantileModel(nn.Module):
                 nn.GELU(),
                 nn.Linear(64, 1)
             )
+        self.revin = RevIN(base_configs.enc_in)
 
     def forward(self, x: torch.Tensor, future_exo: torch.Tensor | None = None) -> torch.Tensor:
         """
         x: (B, L, N)
         return: (B, 3, H)
         """
+        x = self.revin(x, 'norm')
         z = self.backbone(x)    # (B, fused_dim)
         q = self.head(z)        # (B, 3, H)
 
@@ -208,5 +216,6 @@ class QuantileModel(nn.Module):
             )  # (B, H)
             q = q + ex.unsqueeze(1)  # (B, 1, H) → 모든 분위수에 동일 shift
 
+        q = self.revin(q, 'denorm')
         return q  # (B, 3, H)
 

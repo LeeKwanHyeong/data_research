@@ -1,4 +1,5 @@
 # utils/checkpoint.py
+import json
 import os, torch
 
 from modeling_module.models.PatchMixer.common.configs import PatchMixerConfigMonthly
@@ -88,58 +89,177 @@ def _pick_builder_key_safely(name: str, bkey_in_ckpt: str | None, state_dict: di
 
     return 'patchtst_base'
 
-def load_model_dict(save_dir, builders: dict, device="cpu", strict=True):
-    index = torch.load(os.path.join(save_dir, "_index.pt"), map_location="cpu")
-    loaded = {}
-    for name, path in index.items():
-        ckpt = torch.load(path, map_location="cpu")
-        cfgd = ckpt.get("config")
-        clsname = ckpt.get("config_cls", "")
-        # --- config 복원 ---
-        cfg_obj = None
-        if cfgd:
-            if "PatchTST" in clsname:
-                cfg_obj = _rebuild_patchtst(cfgd)
-            elif "Titan" in clsname:
-                cfg_obj = _rebuild_titan(cfgd)
-            elif "PatchMixer" in clsname:
-                cfg_obj = _rebuild_patchmixer(cfgd)
+# def load_model_dict(save_dir, builders: dict, device="cpu", strict=True):
+#     index = torch.load(os.path.join(save_dir, "_index.pt"), map_location="cpu")
+#     loaded = {}
+#     for name, path in index.items():
+#         ckpt = torch.load(path, map_location="cpu")
+#         cfgd = ckpt.get("config")
+#         clsname = ckpt.get("config_cls", "")
+#         # --- config 복원 ---
+#         cfg_obj = None
+#         if cfgd:
+#             if "PatchTST" in clsname:
+#                 cfg_obj = _rebuild_patchtst(cfgd)
+#             elif "Titan" in clsname:
+#                 cfg_obj = _rebuild_titan(cfgd)
+#             elif "PatchMixer" in clsname:
+#                 cfg_obj = _rebuild_patchmixer(cfgd)
+#
+#         # --- 빌더키 안전 선택(이름 vs 내용 불일치 자동 보정) ---
+#         bkey = _pick_builder_key_safely(name, ckpt.get("builder_key"), ckpt["state_dict"])
+#         if bkey not in builders:
+#             raise KeyError(f"builder for '{name}' (key={bkey}) not provided")
+#
+#         model = builders[bkey](cfg_obj)  # 저장 당시 cfg로 재빌드 → horizon/target_dim 일치
+#         try:
+#             model.load_state_dict(ckpt["state_dict"], strict=strict)
+#         except RuntimeError as e:
+#             # --- PointHead 구조 변경 (proj → net.*) 자동 보정 ---
+#             if any(k.startswith("head.proj") for k in sd_keys) and any(k.startswith("head.net") for k in own.keys()):
+#                 fixed = {}
+#                 for k, v in ckpt["state_dict"].items():
+#                     if k.startswith("head.proj"):
+#                         newk = k.replace("head.proj", "head.net.2")  # Dense layer 위치에 매핑
+#                         fixed[newk] = v
+#                     else:
+#                         fixed[k] = v
+#                 ok = {k: v for k, v in fixed.items() if k in own and own[k].shape == v.shape}
+#                 model.load_state_dict(ok, strict=False)
+#                 print(f"[load warning] {name}: converted head.proj.* → head.net.2.* automatically.")
+#                 continue
+#
+#             # QuantileModel인데 q_head.*만 없음 → 부분 로드 허용
+#             sd_keys = set(ckpt["state_dict"].keys())
+#             own = model.state_dict()
+#
+#             def _partial_load_with_msg(msg: str):
+#                 ok = {k: v for k, v in ckpt["state_dict"].items()
+#                       if (k in own and own[k].shape == v.shape)}
+#                 model.load_state_dict(ok, strict=False)
+#                 print(f"[load warning] {name}: {msg}  partial={len(ok)}/{len(own)} keys; "
+#                       f"missing params randomly initialized.")
+#
+#             # --- Quantile 전용 헤드 결측 허용 ---
+#             need_q = any(k.startswith("q_head.") for k in own.keys())
+#             miss_q = not any(k.startswith("q_head.") for k in sd_keys)
+#             need_d = any(k.startswith("delta_head.") for k in own.keys())
+#             miss_d = not any(k.startswith("delta_head.") for k in sd_keys)
+#
+#             if need_q and miss_q:
+#                 _partial_load_with_msg("checkpoint lacks q_head.*")
+#             elif need_d and miss_d:
+#                 _partial_load_with_msg("checkpoint lacks delta_head.*")
+#             else:
+#                 if strict:
+#                     raise
+#                 _partial_load_with_msg("shape/key mismatch")
+#
+#         model.to(device).eval()
+#         loaded[name] = model
+#     return loaded
 
-        # --- 빌더키 안전 선택(이름 vs 내용 불일치 자동 보정) ---
-        bkey = _pick_builder_key_safely(name, ckpt.get("builder_key"), ckpt["state_dict"])
-        if bkey not in builders:
-            raise KeyError(f"builder for '{name}' (key={bkey}) not provided")
+def load_model_dict(save_dir, builders, device="cpu", strict=False):
+    """
+    여러 모델을 한꺼번에 로드하는 통합 함수.
+    - builders: {"patchtst_base": lambda cfg: model_class(cfg), ...}
+    - 자동으로 head 구조 변환 지원 (Point ↔ Quantile)
+    """
+    models = {}
 
-        model = builders[bkey](cfg_obj)  # 저장 당시 cfg로 재빌드 → horizon/target_dim 일치
+    for name, build_fn in builders.items():
+        path = os.path.join(save_dir, f"{name}.pt")
+        if not os.path.exists(path):
+            print(f"[warn] checkpoint not found: {path}")
+            continue
+
+        print(f"[load] {name} ← {path}")
+        ckpt = torch.load(path, map_location=device)
+        cfg_obj = ckpt.get("cfg", None)
+        model = build_fn(cfg_obj)
+        model_name = model.__class__.__name__
+
         try:
             model.load_state_dict(ckpt["state_dict"], strict=strict)
         except RuntimeError as e:
-            # QuantileModel인데 q_head.*만 없음 → 부분 로드 허용
+            print(f"[warn] {model_name}: strict load failed → attempting adaptive remap")
             sd_keys = set(ckpt["state_dict"].keys())
             own = model.state_dict()
 
-            def _partial_load_with_msg(msg: str):
-                ok = {k: v for k, v in ckpt["state_dict"].items()
-                      if (k in own and own[k].shape == v.shape)}
+            # -----------------------------
+            # (1) Quantile ckpt → PointModel 변환
+            # -----------------------------
+            if any(k.startswith("head.net") for k in sd_keys) and any(k.startswith("head.proj") for k in own.keys()):
+                print(f"[load remap] {name}: Quantile checkpoint detected → converting to PointHead.")
+                fixed = {}
+                for k, v in ckpt["state_dict"].items():
+                    if k.startswith("head.net.2.weight"):
+                        fixed["head.proj.weight"] = v.mean(dim=0, keepdim=True)
+                    elif k.startswith("head.net.2.bias"):
+                        fixed["head.proj.bias"] = v.mean().unsqueeze(0)
+                ckpt["state_dict"].update(fixed)
+                ok = {k: v for k, v in ckpt["state_dict"].items() if k in own and own[k].shape == v.shape}
                 model.load_state_dict(ok, strict=False)
-                print(f"[load warning] {name}: {msg}  partial={len(ok)}/{len(own)} keys; "
-                      f"missing params randomly initialized.")
+                print(f"Converted Quantile → PointHead successfully.")
+                models[name] = model.to(device)
+                continue
 
-            # --- Quantile 전용 헤드 결측 허용 ---
-            need_q = any(k.startswith("q_head.") for k in own.keys())
-            miss_q = not any(k.startswith("q_head.") for k in sd_keys)
-            need_d = any(k.startswith("delta_head.") for k in own.keys())
-            miss_d = not any(k.startswith("delta_head.") for k in sd_keys)
+            # -----------------------------
+            # (2) Point ckpt → QuantileModel 변환
+            # -----------------------------
+            if any(k.startswith("head.proj") for k in sd_keys) and any(k.startswith("head.net") for k in own.keys()):
+                print(f"[load remap] {name}: Point checkpoint detected → expanding to QuantileHead layers.")
+                q_list = getattr(cfg_obj, "quantiles", [0.1, 0.5, 0.9])
+                fixed = {}
+                for k, v in ckpt["state_dict"].items():
+                    if k.startswith("head.proj.weight"):
+                        v_expanded = v.unsqueeze(0).expand(len(q_list), -1, -1)
+                        fixed["head.net.2.weight"] = v_expanded.mean(dim=0)
+                    elif k.startswith("head.proj.bias"):
+                        fixed["head.net.2.bias"] = v
+                ckpt["state_dict"].update(fixed)
+                ok = {k: v for k, v in ckpt["state_dict"].items() if k in own and own[k].shape == v.shape}
+                model.load_state_dict(ok, strict=False)
+                print(f"Converted Point → QuantileHead successfully.")
+                models[name] = model.to(device)
+                continue
 
-            if need_q and miss_q:
-                _partial_load_with_msg("checkpoint lacks q_head.*")
-            elif need_d and miss_d:
-                _partial_load_with_msg("checkpoint lacks delta_head.*")
-            else:
-                if strict:
-                    raise
-                _partial_load_with_msg("shape/key mismatch")
+            # -----------------------------
+            # (3) delta_head 누락 시 무시 (Titan / PatchMixer)
+            # -----------------------------
+            missing_delta = [k for k in own.keys() if k.startswith("delta_head")]
+            if missing_delta and not any(k.startswith("delta_head") for k in sd_keys):
+                print(f"[load partial] {name}: skipping delta_head.* (missing in checkpoint)")
+                ok = {k: v for k, v in ckpt["state_dict"].items() if k in own and own[k].shape == v.shape}
+                model.load_state_dict(ok, strict=False)
+                models[name] = model.to(device)
+                continue
 
-        model.to(device).eval()
-        loaded[name] = model
-    return loaded
+            # -----------------------------
+            # (4) 기타 일반적인 mismatch
+            # -----------------------------
+            print(f"[load partial] {name}: non-critical mismatch → partial load.")
+            ok = {k: v for k, v in ckpt["state_dict"].items() if k in own and own[k].shape == v.shape}
+            model.load_state_dict(ok, strict=False)
+
+        models[name] = model.to(device)
+
+    return models
+
+
+# ---------------------------------------
+# Save utility (for completeness)
+# ---------------------------------------
+def save_model(model, cfg, path):
+    ckpt = {
+        "cfg": cfg,
+        "state_dict": model.state_dict()
+    }
+    torch.save(ckpt, path)
+    print(f"[save] model saved to: {path}")
+
+
+def save_json_config(cfg, path):
+    with open(path, "w") as f:
+        json.dump(cfg.__dict__, f, indent=2, ensure_ascii=False)
+    print(f"[save] config saved to: {path}")

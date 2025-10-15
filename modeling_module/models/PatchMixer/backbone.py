@@ -107,9 +107,9 @@ class PatchMixerBackbone(nn.Module):
         self.W_P = nn.Linear(self.patch_size, self.d_model)
 
         # Normalization(RevIN)
-        self.revin = revin
-        if self.revin:
-            self.revin_layer = RevIN(self.n_vals, affine = affine, subtract_last = subtract_last)
+        # self.revin = revin
+        # if self.revin:
+        #     self.revin_layer = RevIN(self.n_vals, affine = affine, subtract_last = subtract_last)
 
         self.flatten = nn.Flatten(start_dim =- 2) # (C, L) -> (C*L)
 
@@ -138,8 +138,8 @@ class PatchMixerBackbone(nn.Module):
         self._assert_input_shape(x)
 
         # RevIN Normalization (B, L, N)
-        if self.revin:
-            x = self.revin_layer(x, 'norm')
+        # if self.revin:
+        #     x = self.revin_layer(x, 'norm')
 
         # (B, N, L)
         x = x.permute(0, 2, 1)
@@ -191,7 +191,7 @@ class MultiScalePatchMixerBackbone(nn.Module):
         self.projs = nn.ModuleList()
 
         # 공유 RevIN: 입력을 한 번만 정규화
-        self.revin = RevIN(base_configs.enc_in, affine = affine, subtract_last = subtract_last)
+        # self.revin = RevIN(base_configs.enc_in, affine = affine, subtract_last = subtract_last)
 
         for (pl, st, ks) in patch_cfgs:
             cfg = copy.deepcopy(base_configs)
@@ -216,7 +216,7 @@ class MultiScalePatchMixerBackbone(nn.Module):
         """
         x: (B, L, N) -> (B, fused_dim)
         """
-        x = self.revin(x, 'norm')
+        # x = self.revin(x, 'norm')
         reps = []
         gates = []
         for branch, proj in zip(self.branches, self.projs):

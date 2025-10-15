@@ -3,26 +3,23 @@ from torch import nn
 
 from modeling_module.models.PatchTST.common.patching import compute_patch_num
 from modeling_module.models.PatchTST.common.pos_encoding import positional_encoding
+from modeling_module.models.common_layers.RevIN import RevIN
 
 
 class PatchBackboneBase(nn.Module):
-    """
-    PatchTST backbone의 공통 기반 클래스.
-    - 입력: (B, C, L)
-    - 출력: (B, L_tok, d_model)
-    - patch_len, stride 변경 시에도 안전하게 patch_num 계산
-    """
     def __init__(self, cfg):
         super().__init__()
         self.cfg = cfg
+
         self.c_in = cfg.c_in
         self.d_model = cfg.d_model
         self.patch_len = cfg.patch_len
         self.stride = cfg.stride
-        self.padding_patch = getattr(cfg, "padding_patch", None)
-        self.use_pos_enc = getattr(cfg, "use_pos_enc", True)
+        # patch 수 계산
+        from modeling_module.models.PatchTST.common.patching import compute_patch_num
+        self.patch_num = compute_patch_num(cfg.lookback, cfg.patch_len, cfg.stride, cfg.padding_patch)
 
-        # Patch projection: (B, C, L) -> (B, d_model, L_tok)
+        # patch projection layer
         self.patch_proj = nn.Conv1d(
             in_channels=self.c_in,
             out_channels=self.d_model,
@@ -30,22 +27,23 @@ class PatchBackboneBase(nn.Module):
             stride=self.stride,
         )
 
-        # Positional Encoding
-        self.pos_enc = positional_encoding(self.d_model)
+        # positional encoding
+        from modeling_module.models.PatchTST.common.pos_encoding import positional_encoding
+        self.pos_enc = positional_encoding(
+                pe=getattr(cfg, "pe", "sincos"),          # sincos 또는 zeros
+                learn_pe=getattr(cfg, "learn_pe", True),  # 학습 여부
+                q_len=self.patch_num,                     # patch 개수
+                d_model=self.d_model,                     # feature 차원
+            )
 
-    def _patchify(self, x_bcl: torch.Tensor) -> torch.Tensor:
+    def _patchify(self, x: torch.Tensor) -> torch.Tensor:
         """
-        x_bcl: [B, C, L_in]
-        return: [B, L_tok, d_model]
+        입력: x [B, C, L]
+        출력: z [B, L_patch, d_model]
         """
-        B, C, L_in = x_bcl.shape
+        z = self.patch_proj(x)  # [B, d_model, L_patch]
+        z = z.transpose(1, 2).contiguous()  # [B, L_patch, d_model]
 
-        # 안전 patch 수 계산
-        L_tok = compute_patch_num(L_in, self.patch_len, self.stride, self.padding_patch)
-        z = self.patch_proj(x_bcl)              # [B, d_model, L_tok]
-        z = z.transpose(1, 2).contiguous()      # [B, L_tok, d_model]
-
-        if self.use_pos_enc:
-            z = z + self.pos_enc[:, :L_tok, :].to(z.device)
-
+        # positional encoding 직접 더하기
+        z = z + self.pos_enc[: z.size(1), :].unsqueeze(0)
         return z

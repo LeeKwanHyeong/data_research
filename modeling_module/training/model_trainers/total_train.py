@@ -14,11 +14,13 @@ from modeling_module.training.model_trainers.titan_train import train_titan
 from modeling_module.utils.metrics import mae, rmse, smape
 
 
-def run_total_train_monthly(train_loader, val_loader, device = 'cuda'):
+def run_total_train_monthly(train_loader, val_loader, device = 'cuda', *, lookback, horizon ):
     results = {}
 
     # ---------------- PatchMixer ----------------
     pm_config = PatchMixerConfigMonthly(
+        lookback = lookback,
+        horizon = horizon,
         device = device,
         loss_mode = 'quantile',
         quantiles = (0.1, 0.5, 0.9)
@@ -48,6 +50,8 @@ def run_total_train_monthly(train_loader, val_loader, device = 'cuda'):
     # ---------------- Titan (point + TTA) ----------------
     ti_config = TitanConfigMonthly(
         device = device,
+        lookback = lookback,
+        horizon = horizon,
         loss_mode = 'point',
         point_loss = 'huber'
     )
@@ -83,6 +87,8 @@ def run_total_train_monthly(train_loader, val_loader, device = 'cuda'):
     # ---------------- PatchTST(Quantile + point) ----------------
     pt_config = PatchTSTConfigMonthly(
         device = device,
+        lookback=lookback,
+        horizon=horizon,
         loss_mode = 'auto',
         quantiles = (0.1, 0.5, 0.9)
     )

@@ -86,8 +86,8 @@ class PatchTSTConfig(TrainingConfig):
     target_dim: int = 1                 # 예측 타깃 채널 수
     patch_len: int = 8                  # 패치 길이(로컬 패턴 단위)
     stride: int = patch_len // 2        # 패치 간 이동 간격 (None 이면 patch_len//2 자동 설정)
-    lookback: int = 36                  # 과거 컨텍스트 길이 (encoder 입력 길이)
-    horizon: int = 48                   # 예측 길이 (decoder/헤드 출력 길이)
+    # lookback: int = 36                  # 과거 컨텍스트 길이 (encoder 입력 길이)
+    # horizon: int = 48                   # 예측 길이 (decoder/헤드 출력 길이)
     padding_patch: Optional[str] = None # 'end' or None (끝 패딩 여부)
 
     # ---------- 인코더(백본) ----------
@@ -126,8 +126,9 @@ class PatchTSTConfigMonthly(PatchTSTConfig):
         - lookback=36(3년), horizon=48(4년) 예시
         - patch_len은 월 주기(12)의 약수/배수를 권장(예: 12), stride는 patch_len//2 권장
     """
-    lookback: int = 36
-    horizon: int = 48
+    # lookback: int = 36
+    # horizon: int = 48
+    pass
 
 @dataclass
 class PatchTSTConfigWeekly(PatchTSTConfig):
@@ -136,5 +137,6 @@ class PatchTSTConfigWeekly(PatchTSTConfig):
         - lookback=54, horizon=27 예시
         - patch_len은 8/12/16 등 주기와 데이터 특성에 맞춰 탐색, stride는 patch_len//2 권장
     """
-    lookback: int = 54
-    horizon: int = 27
+    # lookback: int = 54
+    # horizon: int = 27
+    pass

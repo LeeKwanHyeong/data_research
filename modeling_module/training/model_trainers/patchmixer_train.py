@@ -7,7 +7,7 @@ from modeling_module.utils.exogenous_utils import calendar_cb
 def train_patchmixer(model, train_loader, val_loader, **overrides):
     base = dict(
         loss_mode="auto",
-        point_loss="mse",
+        point_loss="mae",
         quantiles=(0.1, 0.5, 0.9),
         use_intermittent=True,
         val_use_weights=False,

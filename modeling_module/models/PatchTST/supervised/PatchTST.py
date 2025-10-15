@@ -2,6 +2,7 @@ import torch
 from torch import nn
 
 from modeling_module.models.PatchTST.supervised.backbone import SupervisedBackbone
+from modeling_module.models.common_layers.RevIN import RevIN
 
 
 # ------------------------------
@@ -74,15 +75,14 @@ class PatchTSTPointModel(nn.Module):
         self.is_quantile = False
         self.horizon = cfg.horizon
         self.model_name = "PatchTST BaseModel"
+        self.revin = RevIN(num_features = cfg.c_in)
 
-    def forward(self, x_b_l_c: torch.Tensor) -> torch.Tensor:
-        """
-        x_b_l_c: [B, L, C]
-        return: [B, horizon]
-        """
+    def forward(self, x_b_l_c: torch.Tensor, future_exo=None, mode=None) -> torch.Tensor:
+        x_b_l_c = self.revin(x_b_l_c, 'norm')
         x = x_b_l_c.permute(0, 2, 1)  # [B, C, L]
         z = self.backbone(x)          # [B, L_tok, d_model]
         y = self.head(z)              # [B, horizon]
+        y = self.revin(y, 'denorm')
         return y
 
 
@@ -99,13 +99,13 @@ class PatchTSTQuantileModel(nn.Module):
         self.is_quantile = True
         self.horizon = cfg.horizon
         self.model_name = "PatchTST QuantileModel"
+        self.revin = RevIN(num_features = cfg.c_in)
 
-    def forward(self, x_b_l_c: torch.Tensor) -> torch.Tensor:
-        """
-        x_b_l_c: [B, L, C]
-        return: [B, Q, horizon]
-        """
+
+    def forward(self, x_b_l_c: torch.Tensor, future_exo=None, mode=None) -> torch.Tensor:
+        x_b_l_c = self.revin(x_b_l_c, 'norm')
         x = x_b_l_c.permute(0, 2, 1)  # [B, C, L]
         z = self.backbone(x)          # [B, L_tok, d_model]
         q = self.head(z)              # [B, Q, horizon]
+        q = self.revin(q, 'denorm')
         return q

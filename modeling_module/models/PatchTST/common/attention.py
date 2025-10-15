@@ -1,13 +1,17 @@
+# attention.py
 import inspect
-
-import torch
-import torch.nn as nn
-import numpy as np
 from math import sqrt
-
-from modeling_module.utils.masking import TriangularCausalMask, ProbMask
 from typing import Dict, Type
 
+import numpy as np
+import torch
+import torch.nn as nn
+
+from modeling_module.utils.masking import TriangularCausalMask, ProbMask
+
+# ---------------------------------------------------------------------
+# Registry
+# ---------------------------------------------------------------------
 ATTN_REGISTRY: Dict[str, Type[nn.Module]] = {}
 
 def register_attention(name: str):
@@ -17,37 +21,58 @@ def register_attention(name: str):
     return deco
 
 
+# ---------------------------------------------------------------------
+# Full Attention (outputs [B, H, L, Dv])
+# ---------------------------------------------------------------------
 @register_attention('full')
 class FullAttention(nn.Module):
-    def __init__(self, mask_flag = True, factor = 5, scale = None, attention_dropout = 0.1, output_attention = False):
-        super(FullAttention, self).__init__()
+    def __init__(self,
+                 mask_flag: bool = True,
+                 factor: int = 5,                 # kept for interface parity
+                 scale: float | None = None,
+                 attention_dropout: float = 0.1,
+                 output_attention: bool = False):
+        super().__init__()
         self.scale = scale
         self.mask_flag = mask_flag
         self.output_attention = output_attention
         self.dropout = nn.Dropout(attention_dropout)
 
-    def forward(self, queries, keys, values, attn_mask, prev_logits=None):
-        B, L, H, E = queries.shape
-        _, S, _, D = values.shape
+        # 기본값(안전)
+        self.return_logits = False
+        self.use_realformer_residual = False
 
-        scale = self.scale or 1. / sqrt(E)
-        # (B, H, L, S)
-        scores = torch.einsum('blhe,bshe->bhls', queries, keys) * scale
+    def forward(self,
+                queries: torch.Tensor,  # [B,H,L,Dk]
+                keys: torch.Tensor,     # [B,H,S,Dk]
+                values: torch.Tensor,   # [B,H,S,Dv]
+                attn_mask: torch.Tensor | None,
+                prev_logits: torch.Tensor | None = None):
+        B, H, L, Dk = queries.shape
+        _, _, S, _ = keys.shape
 
+        scale = self.scale or 1.0 / sqrt(Dk)
+        # [B,H,L,S]
+        scores = torch.einsum('bhld,bhsd->bhls', queries, keys) * scale
+
+        # RealFormer-style residual on logits
         if self.use_realformer_residual and (prev_logits is not None):
-            scores = scores + prev_logits  # (B,H,L,S)
+            # prev_logits expected: [B,H,L,S]
+            scores = scores + prev_logits
 
+        # causal mask
         if self.mask_flag:
             if attn_mask is None:
                 attn_mask = TriangularCausalMask(B, L, device=queries.device)
             neg_inf = torch.finfo(scores.dtype).min
             scores = scores.masked_fill(attn_mask.mask, neg_inf)
 
-        A = torch.softmax(scores, dim=-1)
+        scores = torch.clamp(scores, min=-50, max=50)
+        A = torch.softmax(scores, dim=-1)    # [B,H,L,S]
         A = self.dropout(A)
 
-        # out shape 은 (B, L, H, d_v) 이어야 함
-        V = torch.einsum('bhls,bshd->blhd', A, values)
+        # === 핵심: out은 반드시 [B,H,L,Dv] ===
+        V = torch.einsum('bhls,bhsd->bhld', A, values)
 
         if self.output_attention and self.return_logits:
             return V.contiguous(), A, scores
@@ -59,193 +84,143 @@ class FullAttention(nn.Module):
             return V.contiguous(), None
 
 
+# ---------------------------------------------------------------------
+# Full Attention (logits 반환/잔차 가능)
+# ---------------------------------------------------------------------
 @register_attention('fullwithlogits')
 class FullAttentionWithLogits(FullAttention):
-    """
-    - return_logits = True: (out, attn, logits) 반환
-    - use_realformer_residual = True: 이전 logits(prev_logits)을 현재 logits에 더함
-    """
     def __init__(self,
-                 mask_flag = True,
-                 factor = 5,
-                 scale = None,
-                 attention_dropout = 0.1,
-                 output_attention = False,
-                 return_logits = False,
-                 use_realformer_residual = False):
+                 mask_flag: bool = True,
+                 factor: int = 5,
+                 scale: float | None = None,
+                 attention_dropout: float = 0.1,
+                 output_attention: bool = False,
+                 return_logits: bool = True,
+                 use_realformer_residual: bool = True):
         super().__init__(
-            mask_flag = mask_flag,
-            factor = factor,
-            scale = scale,
-            attention_dropout = attention_dropout,
-            output_attention = output_attention
+            mask_flag=mask_flag,
+            factor=factor,
+            scale=scale,
+            attention_dropout=attention_dropout,
+            output_attention=output_attention,
         )
         self.return_logits = return_logits
         self.use_realformer_residual = use_realformer_residual
 
-    def forward(self, queries, keys, values, attn_mask, prev_logits = None):
-        B, L, H, E = queries.shape
-        _, S, _, D = values.shape
+    def forward(self, queries, keys, values, attn_mask, prev_logits=None):
+        # 부모 클래스 로직 그대로 사용 (이미 [B,H,L,Dv] 반환)
+        return super().forward(queries, keys, values, attn_mask, prev_logits)
 
-        scale = self.scale or 1. / sqrt(E)
-        # (B, H, L, S)
-        scores = torch.einsum('blhe,bshe->bhls', queries, keys) * scale
 
-        # RealFormer-style residual on logits
-        if self.use_realformer_residual and (prev_logits is not None):
-            # prev_logits expected shape: (B, H, L, S)
-            scores = scores + prev_logits
-
-        # masking
-        if self.mask_flag:
-            if attn_mask is None:
-                attn_mask = TriangularCausalMask(B, L, device = queries.device)
-            neg_inf = torch.finfo(scores.dtype).min
-            scores = scores.masked_fill(attn_mask.mask, neg_inf)
-
-        A = torch.softmax(scores, dim = -1)
-        A = self.dropout(A)
-
-        V = torch.einsum('bhls,bshd->bhls', A, values)
-
-        if self.output_attention and self.return_logits:
-            return V.contiguous(), A, scores
-        elif self.output_attention:
-            return V.contiguous(), A
-        elif self.return_logits:
-            return V.contiguous(), None, scores
-        else:
-            return V.contiguous(), None
-
+# ---------------------------------------------------------------------
+# ProbSparse Attention (outputs [B, H, L, Dv])
+#  - 입력/내부/출력 전부 [B,H,L,*] 축 규약으로 통일
+# ---------------------------------------------------------------------
 @register_attention('probsparse')
 class ProbAttention(nn.Module):
-    def __init__(self, mask_flag = True, factor = 5, scale = None, attention_dropout = 0.1, output_attention = False):
-        super(ProbAttention, self).__init__()
+    def __init__(self,
+                 mask_flag: bool = True,
+                 factor: int = 5,
+                 scale: float | None = None,
+                 attention_dropout: float = 0.1,
+                 output_attention: bool = False):
+        super().__init__()
         self.factor = factor
         self.scale = scale
         self.mask_flag = mask_flag
         self.output_attention = output_attention
         self.dropout = nn.Dropout(attention_dropout)
 
-    def _prob_QK(self, Q, K, sample_k, n_top):
-        # Q [B, H, L, D]
-        B, H, L_K, E = K.shape
-        _, _, L_Q, _ = Q.shape
+    def _prob_QK(self, Q: torch.Tensor, K: torch.Tensor, sample_k: int, n_top: int):
+        # Q,K: [B,H,L,D]
+        B, H, L_Q, D = Q.shape
+        _, _, L_K, _ = K.shape
 
-        # calculate the sampled Q_K
-        K_expand = K.unsqueeze(-3).expand(B, H, L_Q, L_K, E)
-        index_sample = torch.randint(L_K, (L_Q, sample_k)) # real U = U_part(factor * ln(L_k)) * L_q
-        K_sample = K_expand[:, :, torch.arange(L_Q).unsqueeze(1), index_sample, :]
-        Q_K_sample = torch.matmul(Q.unsqueeze(-2), K_sample.transpose(-2, -1)).squeeze()
+        # sample K per query index
+        # K_expand: [B,H,L_Q,L_K,D]
+        K_expand = K.unsqueeze(2).expand(B, H, L_Q, L_K, D)
+        index_sample = torch.randint(L_K, (L_Q, sample_k), device=Q.device)  # U_part
+        K_sample = K_expand[:, :, torch.arange(L_Q, device=Q.device).unsqueeze(1), index_sample, :]  # [B,H,L_Q,sample_k,D]
+        # Q.unsqueeze(3): [B,H,L_Q,1,D]
+        Q_K_sample = torch.matmul(Q.unsqueeze(3), K_sample.transpose(-2, -1)).squeeze(3)  # [B,H,L_Q,sample_k]
 
-        # find the Top_k query with sparsity measurement
-        M = Q_K_sample.max(-1)[0] - torch.div(Q_K_sample.sum(-1), L_K)
-        M_top = M.topk(n_top, sorted=False)[1]
+        # sparsity measurement
+        M = Q_K_sample.max(-1).values - (Q_K_sample.sum(-1) / L_K)  # [B,H,L_Q]
+        M_top = M.topk(n_top, dim=-1, sorted=False).indices         # [B,H,n_top]
 
-        # use the reduce Q to calculate Q_K
-        Q_reduce = Q[torch.arange(B)[:, None, None],
-                     torch.arange(H)[None, :, None],
-                     M_top, :
-        ]
-        Q_K = torch.matmul(Q_reduce, K.transpose(-2, -1))
-        return Q_K, M_top
+        # reduce Q for top queries
+        # gather along L_Q
+        # M_top expansion: [B,H,n_top,D]
+        Q_reduce = Q.gather(dim=2, index=M_top.unsqueeze(-1).expand(-1, -1, -1, D))  # [B,H,n_top,D]
+        Q_K = torch.matmul(Q_reduce, K.transpose(-2, -1))  # [B,H,n_top,L_K]
+        return Q_K, M_top  # scores(top), indices
 
-    def _get_initial_context(self, V, L_Q):
+    def _get_initial_context(self, V: torch.Tensor, L_Q: int):
+        # V: [B,H,L_V,D]
         B, H, L_V, D = V.shape
         if not self.mask_flag:
-            V_sum = V.mean(dim = 2)
-            context = V_sum.unsqueeze(-2).expand(B, H, L_Q, V_sum.shape[-1]).clone()
-        else: # use mask
-            assert (L_Q == L_V) # requires that L_Q == L_V, i.e. for self-attention only
-            context = V.cumsum(dim = 2)
+            V_mean = V.mean(dim=2)  # [B,H,D]
+            context = V_mean.unsqueeze(2).expand(B, H, L_Q, D).clone()  # [B,H,L_Q,D]
+        else:
+            assert L_Q == L_V, "Causal self-attn requires L_Q==L_V"
+            context = V.cumsum(dim=2)  # [B,H,L_Q,D]
         return context
 
-    def _update_context(self, context_in, V, scores, index, L_Q, attn_mask):
+    def _update_context(self, context_in: torch.Tensor, V: torch.Tensor,
+                        scores_top: torch.Tensor, index: torch.Tensor,
+                        L_Q: int, attn_mask):
+        # V: [B,H,L_V,D], scores_top: [B,H,n_top,L_V], index: [B,H,n_top]
         B, H, L_V, D = V.shape
 
         if self.mask_flag:
-            attn_mask = ProbMask(B, H, L_Q, index, scores, device = V.device)
-            scores.masked_fill_(attn_mask.mask, -np.inf)
+            pmask = ProbMask(B, H, L_Q, index, scores_top, device=V.device)
+            scores_top = scores_top.masked_fill(pmask.mask, -np.inf)
 
-        attn = torch.softmax(scores, dim = -1)
+        attn = torch.softmax(scores_top, dim=-1)  # [B,H,n_top,L_V]
+        # matmul: [B,H,n_top,L_V] x [B,H,L_V,D] -> [B,H,n_top,D]
+        ctx_update = torch.matmul(attn, V)  # [B,H,n_top,D]
 
-        context_in[torch.arange(B)[:, None, None],
-                   torch.arange(H)[None, :, None],
-                   index, :
-        ] = torch.matmul(attn, V).type_as(context_in)
+        # scatter update into corresponding top positions
+        context = context_in.clone()  # [B,H,L_Q,D]
+        # index: [B,H,n_top] -> expand to D
+        index_exp = index.unsqueeze(-1).expand(-1, -1, -1, D)  # [B,H,n_top,D]
+        context.scatter_(dim=2, index=index_exp, src=ctx_update)
+
         if self.output_attention:
-            attns = (torch.ones([B, H, L_V, L_V]) / L_V).type_as(attn).to(attn.device)
-            attns[torch.arange(B)[:, None, None], torch.arange(H)[None, :, None], index, :] = attn
-            return (context_in, attns)
+            # Dense attn map for visualization (costly): [B,H,L_Q,L_V]
+            attns = (torch.ones([B, H, L_Q, L_V], device=V.device, dtype=attn.dtype) / L_V)
+            attns.scatter_(dim=2, index=index.unsqueeze(-1).expand(-1, -1, -1, L_V), src=attn)
+            return context, attns
         else:
-            return (context_in, None)
+            return context, None
 
-    def forward(self, queries, keys, values, attn_mask):
-        B, L_Q, H, D = queries.shape
-        _, L_K, _, _ = keys.shape
+    def forward(self,
+                queries: torch.Tensor,  # [B,H,L,Dk]
+                keys: torch.Tensor,     # [B,H,S,Dk]
+                values: torch.Tensor,   # [B,H,S,Dv]
+                attn_mask):
+        B, H, L_Q, Dk = queries.shape
+        _, _, L_K, Dv = values.shape
 
-        queries = queries.transpose(2, 1)
-        keys = keys.transpose(2, 1)
-        values = values.transpose(2, 1)
+        U_part = min(self.factor * int(np.ceil(np.log(L_K))), L_K)  # sample size
+        u = min(self.factor * int(np.ceil(np.log(L_Q))), L_Q)       # top-k queries
 
-        U_part = self.factor * np.ceil(np.log(L_K)).astype('int').item() # c*ln(L_k)
-        u = self.factor * np.ceil(np.log(L_Q)).astype('int').item() # c*ln(L_q)
+        scores_top, index = self._prob_QK(queries, keys, sample_k=U_part, n_top=u)  # [B,H,u,L_K], [B,H,u]
 
-        U_part = U_part if U_part < L_K else L_K
-        u = u if u < L_Q else L_Q
+        scale = self.scale or 1.0 / sqrt(Dk)
+        scores_top = scores_top * scale
 
-        scores_top, index = self._prob_QK(queries, keys, sample_k = U_part, n_top = u)
+        context = self._get_initial_context(values, L_Q)  # [B,H,L_Q,Dv]
+        context, attn = self._update_context(context, values, scores_top, index, L_Q, attn_mask)  # [B,H,L_Q,Dv], opt attn
 
-        # add scale factor
-        scale = self.scale or 1. / sqrt(D)
-        if scale is not None:
-            scores_top = scores_top * scale
-        # get the context
-        context = self._get_initial_context(values, L_Q)
-        # update the context with selected top_k queries
-        context, attn = self._update_context(context, values, scores_top, index, L_Q, attn_mask)
         return context.contiguous(), attn
 
+
+# ---------------------------------------------------------------------
+# Thin wrappers (optional; kept for compatibility)
+# ---------------------------------------------------------------------
 class AttentionLayer(nn.Module):
-    def __init__(self, attention, d_model, n_heads, d_keys = None, d_values = None):
-        super(AttentionLayer, self).__init__()
-
-        d_keys = d_keys or (d_model // n_heads)
-        d_values = d_values or (d_model // n_heads)
-
-        self.inner_attention = attention
-        self.query_projection = nn.Linear(d_model, d_keys * n_heads)
-        self.key_projection = nn.Linear(d_model, d_keys * n_heads)
-        self.value_projection = nn.Linear(d_model, d_values * n_heads)
-        self.out_projection = nn.Linear(d_values * n_heads, d_model)
-        self.n_heads = n_heads
-
-    def forward(self, queries, keys, values, attn_mask):
-        B, L, _ = queries.shape
-        _, S, _ = keys.shape
-        H = self.n_heads
-
-        queries = self.query_projection(queries).view(B, L, H, -1)
-        keys = self.key_projection(keys).view(B, S, H, -1)
-        values = self.value_projection(values).view(B, S, H, -1)
-
-        out, attn = self.inner_attention(
-            queries,
-            keys,
-            values,
-            attn_mask
-        )
-
-        out = out.view(B, L, -1)
-        return self.out_projection(out), attn
-
-class AttentionLayerWithPrev(nn.Module):
-    def __init__(self,
-                 attention,
-                 d_model,
-                 n_heads,
-                 d_keys = None,
-                 d_values = None):
+    def __init__(self, attention: nn.Module, d_model: int, n_heads: int, d_keys=None, d_values=None):
         super().__init__()
         d_keys = d_keys or (d_model // n_heads)
         d_values = d_values or (d_model // n_heads)
@@ -255,31 +230,61 @@ class AttentionLayerWithPrev(nn.Module):
         self.value_projection = nn.Linear(d_model, d_values * n_heads)
         self.out_projection = nn.Linear(d_values * n_heads, d_model)
         self.n_heads = n_heads
+        self.d_keys = d_keys
+        self.d_values = d_values
 
-    def forward(self, queries, keys, values, attn_mask, prev_logits = None):
+    def forward(self, queries, keys, values, attn_mask):
         B, L, _ = queries.shape
         _, S, _ = keys.shape
         H = self.n_heads
 
-        Q = self.query_projection(queries).reshape(B, L, H, -1)
-        K = self.key_projection(keys).reshape(B, S, H, -1)
-        V = self.value_projection(values).reshape(B, S, H, -1)
+        Q = self.query_projection(queries).view(B, L, H, self.d_keys).transpose(1, 2)  # [B,H,L,Dk]
+        K = self.key_projection(keys).view(B, S, H, self.d_keys).transpose(1, 2)       # [B,H,S,Dk]
+        V = self.value_projection(values).view(B, S, H, self.d_values).transpose(1, 2) # [B,H,S,Dv]
 
-        # 내부 커널이 prev_logits를 받도록 설계
-        out, attn, *maybe_scores = self.inner_attention(Q, K, V, attn_mask, prev_logits = prev_logits)
-        out = out.reshape(B, L, -1)
+        out_b_h_l_d, attn = self.inner_attention(Q, K, V, attn_mask)  # [B,H,L,Dv]
+        out = out_b_h_l_d.transpose(1, 2).reshape(B, L, H * self.d_values)            # [B,L,H*Dv]
+        return self.out_projection(out), attn
+
+
+class AttentionLayerWithPrev(nn.Module):
+    def __init__(self, attention: nn.Module, d_model: int, n_heads: int, d_keys=None, d_values=None):
+        super().__init__()
+        d_keys = d_keys or (d_model // n_heads)
+        d_values = d_values or (d_model // n_heads)
+        self.inner_attention = attention
+        self.query_projection = nn.Linear(d_model, d_keys * n_heads)
+        self.key_projection = nn.Linear(d_model, d_keys * n_heads)
+        self.value_projection = nn.Linear(d_model, d_values * n_heads)
+        self.out_projection = nn.Linear(d_values * n_heads, d_model)
+        self.n_heads = n_heads
+        self.d_keys = d_keys
+        self.d_values = d_values
+
+    def forward(self, queries, keys, values, attn_mask, prev_logits=None):
+        B, L, _ = queries.shape
+        _, S, _ = keys.shape
+        H = self.n_heads
+
+        Q = self.query_projection(queries).view(B, L, H, self.d_keys).transpose(1, 2)
+        K = self.key_projection(keys).view(B, S, H, self.d_keys).transpose(1, 2)
+        V = self.value_projection(values).view(B, S, H, self.d_values).transpose(1, 2)
+
+        out_b_h_l_d, attn, *maybe_scores = self.inner_attention(Q, K, V, attn_mask, prev_logits=prev_logits)
+        out = out_b_h_l_d.transpose(1, 2).reshape(B, L, H * self.d_values)
         out = self.out_projection(out)
 
         if len(maybe_scores) == 1:
-            return out, attn, maybe_scores[0] # logits
+            return out, attn, maybe_scores[0]  # logits
         return out, attn
 
+
+# ---------------------------------------------------------------------
+# MHA wrapper: input (B,L,D) -> output (B,L,D)
+#   - assumes core returns [B,H,L,Dv]
+#   - auto-fixes to_out Linear in_features if H*Dv changed
+# ---------------------------------------------------------------------
 class MultiHeadAttention(nn.Module):
-    """
-    MHA 래퍼: 입력 (B,L,D) -> 출력 (B,L,D)
-    - 코어(attn_core)는 (B,L,H,Dh) 입출력 컨벤션
-    - 여분의 키워드 인자(**kwargs)는 받아서 무시 (호출 측 유연성 확보)
-    """
     def __init__(self, *,
                  d_model: int,
                  n_heads: int,
@@ -287,7 +292,7 @@ class MultiHeadAttention(nn.Module):
                  d_v: int | None = None,
                  proj_dropout: float = 0.0,
                  attn_core: nn.Module,
-                 **_):  # ← 여분 키워드는 무시 (attn_dropout/causal/... 등)
+                 **_):
         super().__init__()
         d_k = (d_model // n_heads) if d_k is None else d_k
         d_v = (d_model // n_heads) if d_v is None else d_v
@@ -298,24 +303,22 @@ class MultiHeadAttention(nn.Module):
         self.W_V = nn.Linear(d_model, n_heads * d_v, bias=True)
 
         self.core = attn_core
-        # 코어가 prev_logits를 받는지 자동 감지
         self.core_accepts_prev = 'prev_logits' in inspect.signature(self.core.forward).parameters
 
         self.to_out = nn.Sequential(
             nn.Linear(n_heads * d_v, d_model),
-            nn.Dropout(proj_dropout)
+            nn.Dropout(proj_dropout),
         )
 
-    # === REPLACE: MultiHeadAttention.forward ===
     def forward(self, Q, K=None, V=None, attn_mask=None, prev_logits=None):
         if K is None: K = Q
         if V is None: V = Q
         B, L, _ = Q.shape
         S = K.size(1)
 
-        q = self.W_Q(Q).view(B, L, self.n_heads, self.d_k).transpose(1, 2)  # [B,H,L,d_k]
-        k = self.W_K(K).view(B, S, self.n_heads, self.d_k).transpose(1, 2)  # [B,H,S,d_k]
-        v = self.W_V(V).view(B, S, self.n_heads, self.d_v).transpose(1, 2)  # [B,H,S,d_v]
+        q = self.W_Q(Q).view(B, L, self.n_heads, self.d_k).transpose(1, 2)  # [B,H,L,Dk]
+        k = self.W_K(K).view(B, S, self.n_heads, self.d_k).transpose(1, 2)  # [B,H,S,Dk]
+        v = self.W_V(V).view(B, S, self.n_heads, self.d_v).transpose(1, 2)  # [B,H,S,Dv]
 
         if self.core_accepts_prev:
             core_out = self.core(q, k, v, attn_mask, prev_logits=prev_logits)
@@ -331,54 +334,56 @@ class MultiHeadAttention(nn.Module):
         else:
             out_b_h_l_d, attn, logits = core_out, None, None
 
-        # 표준화: core는 [B,H,L,Dv]를 반환한다고 가정
-        assert out_b_h_l_d.dim() == 4, f"attn core must return 4D, got {out_b_h_l_d.shape}"
+        assert out_b_h_l_d.dim() == 4, f"attn core must return 4D [B,H,L,Dv], got {out_b_h_l_d.shape}"
         B2, Hh, L_real, Dv = out_b_h_l_d.shape
 
-        # [B,H,L,Dv] → [B,L,H,Dv] → [B,L,H*Dv]
-        out_b_l_h_d = out_b_h_l_d.transpose(1, 2).contiguous()
-        out = out_b_l_h_d.view(B2, L_real, Hh * Dv)
+        out = out_b_h_l_d.transpose(1, 2).contiguous().view(B2, L_real, Hh * Dv)  # [B,L,H*Dv]
 
-        # (실험 중 H*Dv를 바꿨을 때) to_out in_features 자동 보정
+        # Linear in_features 자동 보정 (체크포인트/설정 변경 시 안전)
         lin = self.to_out[0] if isinstance(self.to_out, nn.Sequential) else self.to_out
         if lin.in_features != out.shape[-1]:
             new_lin = nn.Linear(out.shape[-1], lin.out_features, bias=(lin.bias is not None)).to(out.device)
             nn.init.xavier_uniform_(new_lin.weight)
-            if new_lin.bias is not None: nn.init.zeros_(new_lin.bias)
+            if new_lin.bias is not None:
+                nn.init.zeros_(new_lin.bias)
             if isinstance(self.to_out, nn.Sequential):
                 self.to_out[0] = new_lin
             else:
                 self.to_out = new_lin
 
-        out = self.to_out(out)  # [B, L_real, d_model]
+        out = self.to_out(out)  # [B, L, d_model]
         return out, attn, logits
 
 
+# ---------------------------------------------------------------------
+# Builder
+# ---------------------------------------------------------------------
 def build_attention(cfg) -> MultiHeadAttention:
-    # 1) core 선택 로직
-    core_name = cfg.type
-    if cfg.type == 'full' and getattr(cfg, 'residual_logits', False):
+    # 1) choose core
+    core_name = cfg.type.lower()
+    if core_name == 'full' and getattr(cfg, 'residual_logits', False):
         core_name = 'fullwithlogits'
 
     core_cls = ATTN_REGISTRY[core_name]
 
-    # 2) core kwargs (허용된 키만)
+    # 2) core kwargs
     core_kwargs = dict(
-        mask_flag = getattr(cfg, 'causal', True),
-        attention_dropout = cfg.attn_dropout,
-        output_attention = getattr(cfg, 'output_attention', False),
+        mask_flag=getattr(cfg, 'causal', True),
+        attention_dropout=cfg.attn_dropout,
+        output_attention=getattr(cfg, 'output_attention', False),
     )
     if core_name == 'probsparse':
         core_kwargs['factor'] = cfg.factor
     if core_name == 'fullwithlogits':
-        # 로짓 잔차 활성화
         core_kwargs['use_realformer_residual'] = True
-        # 필요 시 로짓 반환 (분석/시각화용)
         core_kwargs['return_logits'] = getattr(cfg, 'output_attention', False)
+    if core_name == 'full':
+        # residual logits가 full에서도 켜지도록 허용 (옵션)
+        core_kwargs['use_realformer_residual'] = getattr(cfg, 'residual_logits', False)
 
     core = core_cls(**core_kwargs)
 
-    # 3) d_k/d_v 기본값 계산
+    # 3) d_k/d_v
     d_k = cfg.d_k if cfg.d_k is not None else cfg.d_model // cfg.n_heads
     d_v = cfg.d_v if cfg.d_v is not None else cfg.d_model // cfg.n_heads
 
@@ -387,12 +392,13 @@ def build_attention(cfg) -> MultiHeadAttention:
         n_heads=cfg.n_heads,
         d_k=d_k,
         d_v=d_v,
-        attn_dropout=cfg.attn_dropout,
         proj_dropout=cfg.proj_dropout,
+        attn_core=core,
+        # 아래 키워드는 MHA에서는 사용하지 않지만, 빌더 인터페이스 호환을 위해 받아만 둠
+        attn_dropout=cfg.attn_dropout,
         causal=getattr(cfg, 'causal', True),
-        residual_logits=getattr(cfg, 'residual_logits', False),  # 래퍼 레벨에서 보관만(현재 미사용)
+        residual_logits=getattr(cfg, 'residual_logits', False),
         output_attention=getattr(cfg, 'output_attention', False),
         factor=getattr(cfg, 'factor', 5),
         lsa=getattr(cfg, 'lsa', False),
-        attn_core=core
     )
