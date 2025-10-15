@@ -4,22 +4,20 @@ import torch
 import polars as pl
 import sys
 
-from data_loader.TimeSeriesModule import MultiPartDataModule
-from model_runner.train.titanl_train import TitanTrain
-from models.Titan.Titans import TitanConfigMonthly, LMMModel
+from resources.domain.data_loader_usecase import DataLoaderUseCase
+from resources.service.model_runner_service import ModelRunnerService
+from resources.service.preprocess_service import PreprocessService
 
 # import mlflow
 # mlflow.set_tracking_uri("file:///app/mlruns")
 # mlflow.set_experiment("TitanForecasting")
 # DIR = '/app/data'
 # FILE_PATH = os.path.join(DIR, 'target_dyn_demand.parquet')
-# print("📂 Trying to read:", FILE_PATH)
-# print("✅ File exists:", os.path.exists(FILE_PATH))
 
 
 # 경로 설정
 MAC_DIR = '../data/'
-WINDOW_DIR = 'C:/Users/USER/PycharmProjects/research/data/'
+WINDOW_DIR = '/modeling_module/data/'
 
 if sys.platform == 'win32':
     FILE_PATH = WINDOW_DIR
@@ -34,32 +32,12 @@ else:
 
 target_dyn_demand = pl.read_parquet(FILE_PATH)
 def main():
-    # 1. 데이터 로딩
-    # target_dyn_demand = pl.read_parquet(DIR + 'target_dyn_demand.parquet')
-    target_dyn_demand = pl.read_parquet(FILE_PATH)
-    config = TitanConfigMonthly()
+    PreprocessService().run()
 
-    # 2. 데이터 모듈 구성
-    data_module = MultiPartDataModule(
-        df=target_dyn_demand,
-        config=config,
-        batch_size=128,
-        val_ratio=0.2
-    )
+    train, val, inference = DataLoaderUseCase().run()
 
-    train_loader = data_module.get_train_loader()
-    val_loader = data_module.get_val_loader()
-
-    # 3. 모델 정의
-    model = LMMModel(config)
-
-    # 4. 학습 시작
-    trainer = TitanTrain()
-    trainer.train_model_with_tta(
-        model=model,
-        train_loader=train_loader,
-        val_loader=val_loader
-    )
+    # 2) 서비스 준비(로더 보관)
+    svc = ModelRunnerService(train, val, inference)
 
 if __name__ == "__main__":
     main()
