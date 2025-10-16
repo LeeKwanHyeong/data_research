@@ -15,12 +15,12 @@ class DecompositionConfig:
 class TrainingConfig:
     # ------------Loader------------
     device: str = 'cuda'
-    lookback: int = 12
-    horizon: int = 3
+    lookback: int = 24
+    horizon: int = 6
 
     # ------------Training------------
-    epochs: int = 1
-    lr: float = 1e-3
+    epochs: int = 500
+    lr: float = 1e-4
     weight_decay: float = 1e-4
     t_max: int = 10                 # CosineAnnealingLR
     patience: int = 50

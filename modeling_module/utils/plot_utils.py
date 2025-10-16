@@ -269,6 +269,7 @@ def plot_120_months_many(models: dict,
 
     plotted = 0
     for batch in val_loader:
+        print('batch size: ' + str(batch.size()))
         if len(batch) == 3:
             xb, yb, part_ids = batch
         else:
