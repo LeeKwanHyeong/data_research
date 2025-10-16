@@ -1,6 +1,6 @@
 import polars as pl
 
-from modeling_module.data_loader.TimeSeriesModule import MultiPartDataModule
+from modeling_module.data_loader.MultiPartDataModule import MultiPartDataModule
 from modeling_module.training.config import TrainingConfig
 from resources.engine_config import IS_RUNNING, DIR
 
