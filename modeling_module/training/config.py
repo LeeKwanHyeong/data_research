@@ -14,12 +14,12 @@ class DecompositionConfig:
 @dataclass
 class TrainingConfig:
     # ------------Loader------------
-    device: str = 'cuda'
+    device: str = 'cuda' if torch.cuda.is_available() else 'mps' # For Mac
     lookback: int = 24
     horizon: int = 6
 
     # ------------Training------------
-    epochs: int = 500
+    epochs: int = 1
     lr: float = 1e-4
     weight_decay: float = 1e-4
     t_max: int = 10                 # CosineAnnealingLR
