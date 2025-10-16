@@ -359,3 +359,229 @@ def plot_120_months_many(models: dict,
                 plt.close()
 
             plotted += 1
+
+import os
+import numpy as np
+import torch
+
+@torch.no_grad()
+def plot_val_forecasts_many(models: dict,
+                            val_loader,
+                            *,
+                            device="cpu",
+                            horizon: int = 120,
+                            max_plots: int = 100,
+                            out_dir: str | None = None,
+                            show: bool = True,
+                            future_exo_cb=None):
+    """
+    학습/검증 파이프라인에서 '검증 세트' 기반으로 다수 파트 예측 결과를 플롯.
+    배치 형태: (xb, yb) 또는 (xb, yb, part_ids)
+      - xb: (B, L, 1) 또는 (B, L) 텐서
+      - yb: (B, H) 텐서 (정답)
+      - part_ids: (선택) 길이 B의 식별자 리스트
+    """
+
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+
+    plotted = 0
+    for batch in val_loader:
+        # --- 안전 분기: (xb, yb, part_ids) | (xb, yb) ---
+        if not isinstance(batch, (list, tuple)) or len(batch) < 2:
+            raise ValueError("val_loader batch must be (xb, yb[, part_ids]).")
+
+        xb, yb = batch[0], batch[1]
+        part_ids = None
+        if len(batch) >= 3:
+            part_ids = batch[2]
+
+        if xb.dim() == 2:
+            xb = xb.unsqueeze(-1)  # (B,L)->(B,L,1)
+
+        B = xb.size(0)
+        for i in range(B):
+            if plotted >= max_plots:
+                return
+
+            x1 = xb[i:i+1].to(device)
+            y_true = yb[i:i+1].cpu().numpy().reshape(-1)
+            if y_true.size > horizon:
+                y_true = y_true[:horizon]
+
+            pid = part_ids[i] if (part_ids is not None and i < len(part_ids)) else f"idx{i}"
+
+            # ---- 각 모델 예측 수집 ----
+            preds_point = {}
+            preds_q10, preds_q50, preds_q90 = {}, {}, {}
+
+            for name, mdl in models.items():
+                p = _predict_120_any(mdl, x1, device=device, future_exo_cb=future_exo_cb, horizon=horizon)
+                preds_point[name] = p["point"]
+                if "q" in p:
+                    preds_q10[name] = p["q"].get("q10")
+                    preds_q50[name] = p["q"].get("q50")
+                    preds_q90[name] = p["q"].get("q90")
+
+            # ---- 플롯 ----
+            _plot_single_series(
+                hist=_to_1d_history(x1),
+                y_true=y_true,
+                preds_point=preds_point,
+                preds_q10=preds_q10,
+                preds_q50=preds_q50,
+                preds_q90=preds_q90,
+                horizon=horizon,
+                title=f"[VAL] {horizon}-step Forecast – part: {pid}",
+                out_path=(os.path.join(out_dir, f"val_forecast_{pid}.png") if out_dir else None),
+                show=show
+            )
+            plotted += 1
+
+
+@torch.no_grad()
+def plot_anchored_forecasts_many(models: dict,
+                                 inference_loader,
+                                 *,
+                                 device="cpu",
+                                 plan_dt: int,
+                                 time_granularity: str = "month",  # "month" | "week"
+                                 horizon: int = 120,
+                                 max_plots: int = 100,
+                                 out_dir: str | None = None,
+                                 show: bool = True,
+                                 future_exo_cb=None,
+                                 truth_cb=None):
+    """
+    운영 앵커(plan_dt) 기준으로 inference_loader에서 (xb, part_ids) 배치를 받아
+    실제/가검증 플롯을 생성. 진짜값은 truth_cb(part_id, plan_dt, H, granularity)로 조회.
+
+    배치 형태: (xb, part_ids)
+      - xb: (B, L, 1) 또는 (B, L)
+      - part_ids: 길이 B의 식별자 리스트/시퀀스
+    plan_dt: 앵커 시점 (YYYYMM 또는 YYYYWW)
+    time_granularity: 'month'|'week' (truth_cb 구현과 DateUtil 기준에 맞춰 사용)
+    truth_cb: Callable(part_id: str, plan_dt: int, H: int, granularity: str) -> np.ndarray | None
+              반환 길이는 H로 맞추는 것을 권장(부족하면 NaN 패딩, 넘치면 슬라이스)
+    """
+
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+
+    plotted = 0
+    for batch in inference_loader:
+        # --- 안전 분기: (xb, part_ids) ---
+        if not isinstance(batch, (list, tuple)) or len(batch) != 2:
+            raise ValueError("inference_loader batch must be (xb, part_ids).")
+        xb, part_ids = batch
+
+        if xb.dim() == 2:
+            xb = xb.unsqueeze(-1)
+
+        B = xb.size(0)
+        for i in range(B):
+            if plotted >= max_plots:
+                return
+
+            x1 = xb[i:i+1].to(device)
+            pid = part_ids[i]
+
+            # ---- GT 조회 (선택) ----
+            y_true = None
+            if truth_cb is not None:
+                y_true = truth_cb(pid, plan_dt, horizon, time_granularity)
+                if y_true is not None:
+                    y_true = np.asarray(y_true, dtype=float).reshape(-1)
+                    if y_true.size > horizon:
+                        y_true = y_true[:horizon]
+                    elif y_true.size < horizon:
+                        y_true = np.concatenate([y_true, np.full(horizon - y_true.size, np.nan)])
+
+            # ---- 예측 수집 ----
+            preds_point = {}
+            preds_q10, preds_q50, preds_q90 = {}, {}, {}
+
+            for name, mdl in models.items():
+                p = _predict_120_any(mdl, x1, device=device, future_exo_cb=future_exo_cb)
+                preds_point[name] = p["point"]
+                if "q" in p:
+                    preds_q10[name] = p["q"].get("q10")
+                    preds_q50[name] = p["q"].get("q50")
+                    preds_q90[name] = p["q"].get("q90")
+
+            # ---- 플롯 ----
+            _plot_single_series(
+                hist=_to_1d_history(x1),
+                y_true=y_true,
+                preds_point=preds_point,
+                preds_q10=preds_q10,
+                preds_q50=preds_q50,
+                preds_q90=preds_q90,
+                horizon=horizon,
+                title=f"[INF:{time_granularity}] {horizon}-step Forecast from {plan_dt} – part: {pid}",
+                out_path=(os.path.join(out_dir, f"inf_forecast_{pid}.png") if out_dir else None),
+                show=show
+            )
+            plotted += 1
+
+
+def _plot_single_series(*,
+                        hist: np.ndarray | None,
+                        y_true: np.ndarray | None,
+                        preds_point: dict[str, np.ndarray],
+                        preds_q10: dict[str, np.ndarray],
+                        preds_q50: dict[str, np.ndarray],
+                        preds_q90: dict[str, np.ndarray],
+                        horizon: int,
+                        title: str,
+                        out_path: str | None,
+                        show: bool):
+    import matplotlib.pyplot as plt
+    t_hist = np.arange(-len(hist)+1, 1) if (hist is not None and hist.size > 0) else None
+    t_fut  = np.arange(1, horizon+1)
+
+    plt.figure(figsize=(12, 5))
+    if hist is not None and hist.size > 0:
+        plt.plot(t_hist, hist, label="History", linewidth=2, alpha=0.8)
+
+    if y_true is not None:
+        plt.plot(t_fut, y_true, label="True (target)", linewidth=2)
+
+    # 분위수(있다면)
+    for nm in list(preds_q50.keys()):
+        q10 = preds_q10.get(nm)
+        q50 = preds_q50.get(nm)
+        q90 = preds_q90.get(nm)
+        if q10 is not None and q50 is not None and q90 is not None:
+            plt.fill_between(t_fut, q10, q90, alpha=0.15, label=f"{nm} P10–P90")
+            plt.plot(t_fut, q50, linewidth=1.8, alpha=0.95, label=f"{nm} P50")
+
+    # 포인트(중복은 제외)
+    for nm, yhat in preds_point.items():
+        if nm in preds_q50:  # 중앙선 이미 그림
+            continue
+        plt.plot(t_fut, yhat, label=nm, alpha=0.9)
+
+    # 간단 앙상블(q90 기반)
+    stack = []
+    for nm in preds_point.keys():
+        base = preds_q90.get(nm, preds_point[nm])
+        stack.append(base)
+    if stack:
+        M = np.vstack(stack)
+        ens_q90 = np.nanmean(M, axis=0)
+        plt.plot(t_fut, ens_q90, linewidth=2.8, alpha=0.95, label="Ensemble (q90-based)")
+
+    plt.axvline(0, color="gray", linewidth=1, alpha=0.6)
+    plt.title(title)
+    plt.xlabel("Time (history ≤ 0 < future)")
+    plt.ylabel("Demand")
+    plt.legend(ncol=2)
+    plt.tight_layout()
+
+    if out_path:
+        plt.savefig(out_path, dpi=150)
+    if show:
+        plt.show()
+    else:
+        plt.close()
