@@ -25,6 +25,30 @@ class TitanConfig(TrainingConfig):
         return self.horizon
 
 @dataclass
+class TitanConfigPatchMonthly(TitanConfig):
+    batch_size = 128
+    input_dim = 1
+    d_model = 64
+    n_layers = 2
+    n_heads = 4
+    d_ff = 256
+    contextual_mem_size = 64
+    persistent_mem_size = 16
+
+    # Patch/Mixer
+    patch_len = 12
+    patch_stride = 6
+    n_mixer_blocks = 2
+    mixer_hidden = 64  # None이면 2*d_model로 자동 설정
+    mixer_kernel = 7
+    dropout = 0.1
+
+    # LMM/Head
+    lmm_top_k = 5
+    lmm_memory_source = "encoded"  # 'encoded' | 'context'
+    nonneg_head = True
+
+@dataclass
 class TitanConfigMonthly(TitanConfig):
     # lookback: int = 36
     # horizon: int = 48

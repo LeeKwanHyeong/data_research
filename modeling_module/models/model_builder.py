@@ -27,6 +27,10 @@ def build_titan_seq2seq(cfg: TitanConfig):
     from modeling_module.models.Titan.Titans import LMMSeq2SeqModel
     return LMMSeq2SeqModel(cfg)
 
+def build_titan_patch(cfg: TitanConfig):
+    from modeling_module.models.Titan.Titans import PatchLMMModel
+    return PatchLMMModel(cfg)
+
 def build_titan_feature(cfg: TitanConfig):
     from modeling_module.models.Titan.Titans import FeatureModel
     return FeatureModel(cfg)

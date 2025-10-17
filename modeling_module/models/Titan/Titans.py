@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 
-from modeling_module.models.Titan.backbone import MemoryEncoder
+from modeling_module.models.Titan.backbone import MemoryEncoder, PatchMemoryEncoder
 from modeling_module.models.Titan.common.configs import TitanConfig
 from modeling_module.models.Titan.common.decoder import TitanDecoder
 from modeling_module.models.Titan.common.memory import LMM
@@ -210,7 +210,148 @@ class LMMModel(nn.Module):
         y = self.revin_layer(pred.unsqueeze(1), 'denorm').squeeze(1)
         return y
 
+"""
+x --(RevIN norm)--> PatchMemoryEncoder --> enc:[B, L', D]
+                               │
+                               ├─ LMM(enc, memory) → enhanced:[B, L', D]
+                               └─ TrendCorrector(enc) → Δtrend:[B, H]
+        y_core = Linear(D→H)(enhanced[:, -1, :])
+        y_hat  = RevIN denorm(y_core + Δtrend)
+"""
+class PatchLMMModel(nn.Module):
+    """
+    Patch 기반 Titan + LMM 보강 모델
+    입력:
+        x: [B, L, C]
+        future_exo: Optional[[B, H, exo_dim]]
+    출력:
+        y_hat: [B, H] (H = config.horizon or output_horizon)
+    """
+    def __init__(self, config):
+        super().__init__()
+        config = _ensure_config_instance(config)
+        self.config = config
 
+        self.horizon = getattr(config, 'horizon', getattr(config, 'output_horizon', None))
+        assert self.horizon is not None, 'config.horizon (or output_horizon)가 필요합니다.'
+
+        d_model = config.d_model
+
+        # RevIN: 입력 분포 표준화/역정규화
+        self.revin_layer = RevIN(
+            num_features=config.input_dim,
+            affine=True,
+            subtract_last=True
+        )
+
+        # Patch 기반 인코더 (PatchEmbed1D + Mixer + MemoryAttention Backbone)
+        self.encoder = PatchMemoryEncoder(
+            input_dim=config.input_dim,
+            d_model=config.d_model,
+            n_layers=config.n_layers,
+            n_heads=config.n_heads,
+            d_ff=config.d_ff,
+            contextual_mem_size=config.contextual_mem_size,
+            persistent_mem_size=config.persistent_mem_size,
+            # ---- Patch/Mixer 관련 (config에 없으면 기본값)
+            patch_len=getattr(config, 'patch_len', 12),
+            patch_stride=getattr(config, 'patch_stride', 8),
+            n_mixer_blocks=getattr(config, 'n_mixer_blocks', 2),
+            mixer_hidden=getattr(config, 'mixer_hidden', 2 * config.d_model),
+            mixer_kernel=getattr(config, 'mixer_kernel', 7),
+            dropout=getattr(config, 'dropout', 0.1),
+        )
+
+        # LMM: Local Pattern Matching 보강
+        self.lmm = LMM(
+            d_model=d_model,
+            top_k=getattr(config, 'lmm_top_k', 5)
+        )
+
+        # 출력 헤드: 마지막 토큰으로 H-step 생성 (DMS)
+        nonneg = getattr(config, 'nonneg_head', True)
+        head = [nn.Linear(d_model, self.horizon)]
+        if nonneg:
+            head.append(nn.Softplus())
+        self.output_proj = nn.Sequential(*head)
+
+        # Trend/Seasonality 보정
+        self.trend_corrector = TrendCorrector(
+            d_model=d_model,
+            out_dim=self.horizon
+        )
+
+        # LMM Memory Source 선택: 'encoded' (안정) | 'context'
+        self.lmm_memory_source = getattr(config, 'lmm_memory_source', 'encoded')
+
+        # ===== Exogenous 입력(optional) 지원 추가 =====
+        self.exo_dim = getattr(config, 'exo_dim', 0)
+        if self.exo_dim > 0:
+            # time-distributed linear: [B,H,exo_dim] -> [B,H,1] -> squeeze(-1)
+            self.exo_head = nn.Sequential(
+                nn.Linear(self.exo_dim, d_model),
+                nn.GELU(),
+                nn.Linear(d_model, 1)
+            )
+        else:
+            self.exo_head = None
+
+    def _get_lmm_memory(self, enc: torch.Tensor) -> torch.Tensor:
+        """
+        LMM에 공급할 memory Tensor.
+        - 기본값: enc  (형상 일치/안정)
+        - 옵션: 인코더 레이어의 contextual_memory 사용('context')
+        return: [B, M, D]
+        """
+        B, Lp, D = enc.shape
+        if self.lmm_memory_source == 'context':
+            ctx = None
+            for layer in self.encoder.layers:
+                mem = getattr(layer.attn, 'contextual_memory', None)
+                if mem is not None:
+                    ctx = mem   # [M, D]
+            if ctx is not None and ctx.numel() > 0:
+                return ctx.unsqueeze(0).expand(B, -1, -1)   # [B, M, D]
+            # fallback to encoded
+        return enc  # [B, L', D]
+
+    def forward(self, x, future_exo: torch.Tensor | None = None, mode: str = 'train'):
+        """
+        x: [B, L, C]
+        future_exo: Optional[[B, H, exo_dim]]
+        return: [B, H]
+        """
+        # 입력 정규화
+        x = self.revin_layer(x, 'norm')  # [B, L, C]
+
+        # Patch+Memory Encoding
+        enc = self.encoder(x)            # [B, L', D]
+        if enc.dim() != 3:
+            raise RuntimeError(f"Encoder must return (B,L,D). Got {tuple(enc.shape)}")
+
+        # LMM 보강
+        memory = self._get_lmm_memory(enc)  # [B, M, D]
+        if memory.dim() == 2:  # [M, D] -> [B, M, D]
+            memory = memory.unsqueeze(0).expand(enc.size(0), -1, -1)
+        enhanced = self.lmm(enc, memory)    # [B, L', D]
+
+        # Head (마지막 토큰으로 H-step)
+        y_core = self.output_proj(enhanced[:, -1, :])   # [B, H]
+
+        # Trend/Seasonality 보정
+        y = y_core + self.trend_corrector(enc)          # [B, H]
+
+        # ===== Exogenous term (optional) =====
+        if (self.exo_head is not None) and (future_exo is not None):
+            # future_exo: [B, H, exo_dim]
+            if future_exo.dim() != 3 or future_exo.size(1) != self.horizon:
+                raise ValueError(f"future_exo must be [B, H, exo_dim] with H={self.horizon}, got {tuple(future_exo.shape)}")
+            exo_term = self.exo_head(future_exo).squeeze(-1)  # [B, H]
+            y = y + exo_term
+
+        # 역정규화
+        y = self.revin_layer(y.unsqueeze(1), 'denorm').squeeze(1)   # [B, H]
+        return y
 
 # ---- Seq2Seq 모델 (Encoder + Causal Decoder) ----
 class LMMSeq2SeqModel(nn.Module):

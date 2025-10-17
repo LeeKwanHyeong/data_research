@@ -48,6 +48,12 @@ class PatchMixerLayer(nn.Module):
             nn.BatchNorm1d(a)
         )
 
+        # TODO: Check
+        self.out_proj = (
+            nn.Identity() if a == dim
+            else nn.Conv1d(a, dim, kernel_size=1, bias=False)
+        )
+
         self.dropout = nn.Dropout(dropout) if dropout and dropout > 0 else nn.Identity()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -90,11 +96,10 @@ class PatchMixerBackbone(nn.Module):
         self.d_model: int = configs.d_model
         self.dropout_rate: float = configs.head_dropout
         self.depth: int = configs.e_layers
-
         # output dimension (representation size of backbone output)
         self.patch_repr_dim = self.a * self.d_model
 
-        # unfold after padding (끝단 복제를 통해 마지막 패치 확보)
+        # unfold after padding (끝단 복제를 통해1 마지막 패치 확보)
         self.padding_patch_layer = nn.ReplicationPad1d((0, self.stride))
 
         # PatchMixer blocks
@@ -105,11 +110,6 @@ class PatchMixerBackbone(nn.Module):
 
         # patch length -> model dimension linear projection (각 패치를 d_model로 투영)
         self.W_P = nn.Linear(self.patch_size, self.d_model)
-
-        # Normalization(RevIN)
-        # self.revin = revin
-        # if self.revin:
-        #     self.revin_layer = RevIN(self.n_vals, affine = affine, subtract_last = subtract_last)
 
         self.flatten = nn.Flatten(start_dim =- 2) # (C, L) -> (C*L)
 
