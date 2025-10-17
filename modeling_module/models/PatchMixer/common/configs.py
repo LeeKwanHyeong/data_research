@@ -12,7 +12,7 @@ class PatchMixerConfig(TrainingConfig):
     e_layers: int = 2               # Transformer 또는 PatchMixer 블록의 층(layer) 개수
     patch_len: int = 16             # Patch Length
     stride: int = 8
-    head_dropout: int = 0.1         # Residual Connection을 위한 dropout
+    head_dropout: float = 0.1         # Residual Connection을 위한 dropout
     enc_in: int = 1
     mixer_kernel_size: int = 8
     @property

@@ -4,9 +4,9 @@ from typing import Tuple
 import torch.nn as nn
 import torch
 from modeling_module.models.PatchTST.common.configs import PatchTSTConfig
-from modeling_module.models.PatchTST.common.heads.classification_head import ClassificationHead
-from modeling_module.models.PatchTST.common.heads.prediction_head import PredictionHead
-from modeling_module.models.PatchTST.common.heads.regression_head import RegressionHead
+from modeling_module.models.common_layers.heads.classification_head import ClassificationHead
+from modeling_module.models.common_layers.heads.prediction_head import PredictionHead
+from modeling_module.models.common_layers.heads.regression_head import RegressionHead
 from modeling_module.models.PatchTST.self_supervised.backbone import SelfSupervisedBackbone
 from modeling_module.models.PatchTST.supervised.backbone import SupervisedBackbone
 
@@ -95,7 +95,7 @@ class PatchTSTModel(nn.Module):
 
         # --------- Head 구성 ----------
         if self.head_type == "pretrain":
-            from modeling_module.models.PatchTST.common.heads.pretrain_head import PretrainHead
+            from modeling_module.models.common_layers.heads.pretrain_head import PretrainHead
             self.head = PretrainHead(
                 self.cfg.d_model,
                 self.cfg.patch_len,

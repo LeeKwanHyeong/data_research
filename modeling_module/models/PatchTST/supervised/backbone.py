@@ -3,9 +3,8 @@ from torch import nn
 
 from modeling_module.models.PatchTST.common.backbone_base import PatchBackboneBase
 from modeling_module.models.PatchTST.common.encoder import TSTEncoder, TSTEncoderLayer
-from modeling_module.models.PatchTST.common.attention import MultiHeadAttention, FullAttention, ProbAttention, \
+from modeling_module.models.common_layers.Attention import MultiHeadAttention, FullAttention, ProbAttention, \
     FullAttentionWithLogits
-from modeling_module.models.PatchTST.common.patching import compute_patch_num
 
 
 class SupervisedBackbone(PatchBackboneBase):

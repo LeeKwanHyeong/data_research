@@ -1,4 +1,4 @@
-# attention.py
+# Attention.py
 import inspect
 from math import sqrt
 from typing import Dict, Type

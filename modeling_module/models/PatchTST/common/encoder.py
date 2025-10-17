@@ -3,7 +3,7 @@ from typing import Optional
 import torch
 from torch import nn
 
-from modeling_module.models.PatchTST.common.attention import build_attention
+from modeling_module.models.common_layers.Attention import build_attention
 from modeling_module.models.PatchTST.common.basics import Transpose, get_activation_fn
 from modeling_module.models.PatchTST.common.pos_encoding import positional_encoding
 

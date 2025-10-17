@@ -3,7 +3,7 @@ import torch.nn as nn
 
 from modeling_module.models.PatchTST.common.backbone_base import BasePatchTSTBackbone
 from modeling_module.models.PatchTST.common.configs import PatchTSTConfig
-from modeling_module.models.PatchTST.common.heads.pretrain_head import PretrainHead
+from modeling_module.models.common_layers.heads.pretrain_head import PretrainHead
 
 
 class SelfSupervisedBackbone(BasePatchTSTBackbone):
