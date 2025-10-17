@@ -5,16 +5,36 @@ from torch import nn, Tensor
 import torch.nn.functional as F
 from typing import List, Dict, Tuple
 
-from modeling_module.models.common_layers.heads.quantile_heads.base_quantile_haed import BaseQuantileHead, \
+from modeling_module.models.common_layers.heads.quantile_heads.base_quantile_head import BaseQuantileHead, \
     _split_lower_mid_upper, _ensure_3d
 
 
 class _FourierCache:
-    """H별로 dtype/device 맞춰 캐시"""
+    """
+    Fourier Basis 캐싱 클래스 (Fourier feature 재사용 최적화용)
+
+    목적:
+    - 시점 H에 따라 미리 계산된 sin/cos basis를 dtype/device에 맞춰 캐싱
+    - 반복 학습 중 동일 H일 경우 계산 재사용
+
+    get(H, K, dtype, device):
+    - H: horizon
+    - K: harmonic 개수
+    - 반환: [H, 2K] → [cos(2πkt/H), sin(2πkt/H)] 벡터
+    """
     def __init__(self):
         self.cache: Dict[Tuple[int, torch.dtype, torch.device], Tensor] = {}
 
     def get(self, H: int, K: int, dtype, device) -> Tensor:
+        """
+        Parameters:
+        - H: horizon (시계열 길이)
+        - K: harmonic 수
+        - dtype/device: 현재 입력과 일치하는 타입 및 장치
+
+        Returns:
+        - Fourier basis: [H, 2K]
+        """
         key = (H, dtype, device)
         if key in self.cache:
             return self.cache[key]

@@ -3,7 +3,7 @@ from torch import nn, Tensor
 import torch.nn.functional as F
 from typing import List
 
-from modeling_module.models.common_layers.heads.quantile_heads.base_quantile_haed import _split_lower_mid_upper, \
+from modeling_module.models.common_layers.heads.quantile_heads.base_quantile_head import _split_lower_mid_upper, \
     _ensure_3d, _check_and_sort_quantiles
 
 
