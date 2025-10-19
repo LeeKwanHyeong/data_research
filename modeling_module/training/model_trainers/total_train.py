@@ -14,7 +14,7 @@ from modeling_module.training.model_trainers.patchtst_train import train_patchts
 from modeling_module.training.model_trainers.titan_train import train_titan
 from modeling_module.utils.metrics import mae, rmse, smape
 
-def run_total_train_monthly(train_loader, val_loader, device = 'cuda', *, lookback, horizon ):
+def  run_total_train_monthly(train_loader, val_loader, device = 'cuda', *, lookback, horizon ):
     results = {}
 
     # # ---------------- PatchMixer ----------------
@@ -86,21 +86,21 @@ def run_total_train_monthly(train_loader, val_loader, device = 'cuda', *, lookba
     # )
     # results['Titan Base'] = best_ti_base
 
-    print('Titan LMM')
-    best_ti_lmm = train_titan(
-        ti_lmm,
-        train_loader, val_loader,
-        lr = 1e-3, loss_mode = 'point', tta_steps = 3
-    )
-    results['Titan LMM'] = best_ti_lmm
-
-    print('Titan Seq2Seq')
-    best_ti_seq2seq = train_titan(
-        ti_seq2seq,
-        train_loader, val_loader,
-        lr = 1e-3, loss_mode = 'point', tta_steps = 3
-    )
-    results['Titan Seq2Seq'] = best_ti_seq2seq
+    # print('Titan LMM')
+    # best_ti_lmm = train_titan(
+    #     ti_lmm,
+    #     train_loader, val_loader,
+    #     lr = 1e-3, loss_mode = 'point', tta_steps = 3
+    # )
+    # results['Titan LMM'] = best_ti_lmm
+    #
+    # print('Titan Seq2Seq')
+    # best_ti_seq2seq = train_titan(
+    #     ti_seq2seq,
+    #     train_loader, val_loader,
+    #     lr = 1e-3, loss_mode = 'point', tta_steps = 3
+    # )
+    # results['Titan Seq2Seq'] = best_ti_seq2seq
 
     print('Titan Patch')
     best_ti_patch = train_titan(

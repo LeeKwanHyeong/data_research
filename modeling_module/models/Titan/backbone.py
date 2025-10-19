@@ -200,7 +200,7 @@ class PatchMemoryEncoder(nn.Module):
         # Patch Mixer Block (Residual Conv Mixer 등)
         mixer_hidden = mixer_hidden or (2 * d_model)
         self.mixers = nn.Sequential(*[
-            PatchMixerLayer(d_model, mixer_hidden, kernel_size=mixer_kernel, dropout=dropout)
+            PatchMixerLayer(d_model = d_model, kernel_size = mixer_kernel, dropout=dropout)
             for _ in range(n_mixer_blocks)
         ])
 

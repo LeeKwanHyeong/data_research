@@ -12,59 +12,96 @@ from modeling_module.models.common_layers.RevIN import RevIN
 # -------------------------
 # PatchMixer Layer
 # -------------------------
+# class PatchMixerLayer(nn.Module):
+#     """
+#     논문 기반 Depthwise + Pointwise Patch Mixer Layer
+#     입력: (B, patch_num, d_model)
+#     내부 Conv는 d_model 축 기준 depthwise
+#     """
+#     def __init__(self,
+#                  patch_num: int,
+#                  d_model: int,
+#                  kernel_size: int = 5,
+#                  dropout: float = 0.0):
+#         super().__init__()
+#
+#         self.patch_num = patch_num
+#         self.d_model = d_model
+#
+#         # Token Mixing (feature 축 기준 depthwise)
+#         self.token_mixer = nn.Sequential(
+#             nn.Conv1d(
+#                 in_channels=d_model,
+#                 out_channels=d_model,
+#                 kernel_size=kernel_size,
+#                 groups=d_model,     # depthwise conv
+#                 padding="same"
+#             ),
+#             nn.GELU(),
+#             nn.BatchNorm1d(d_model)
+#         )
+#
+#         # Channel Mixing (1x1 conv)
+#         self.channel_mixer = nn.Sequential(
+#             nn.Conv1d(d_model, d_model, kernel_size=1),
+#             nn.GELU(),
+#             nn.BatchNorm1d(d_model)
+#         )
+#
+#         self.dropout = nn.Dropout(dropout)
+#
+#     def forward(self, x: torch.Tensor) -> torch.Tensor:
+#         """
+#         x: (B, patch_num, d_model)
+#         """
+#         # permute to (B, d_model, patch_num)
+#         x = x.permute(0, 2, 1)
+#         res = x
+#
+#         # depthwise conv over patch axis
+#         x = self.token_mixer(x)
+#         x = self.channel_mixer(x)
+#         x = self.dropout(x)
+#
+#         # residual + back to (B, patch_num, d_model)
+#         x = (x + res).permute(0, 2, 1)
+#         return x
+
 class PatchMixerLayer(nn.Module):
     """
-    Depthwise(패치 축 로컬) + 1x1(Pointwise, Channel Mixing)로 구성된 기본 Mixer 블록.
-    입력/출력 텐서 shape: (N, C = patch_num, L = d_model)
+    입력: (B*, D=d_model, A=patch_num)
+    - depthwise conv는 채널(D) 기준, 길이는 A 방향
+    - 출력 shape 동일: (B*, D, A)
     """
-    def __init__(self,
-                 dim: int,
-                 a: int,
-                 kernel_size: int = 0,
-                 dropout: float = 0.0
-                 ):
+    def __init__(self, d_model: int, kernel_size: int = 5, dropout: float = 0.0):
         super().__init__()
-        self.dim = dim # in/out channels (= patch_num)
-        self.a = a     # out channels for 1x1 (normally match with patch_num)
-        self.kernel_size = kernel_size
+        self.d_model = d_model
 
-        # Depthwise Conv over length(L=d_model)
         self.token_mixer = nn.Sequential(
             nn.Conv1d(
-                in_channels = dim,
-                out_channels = dim,
-                kernel_size = kernel_size,
-                groups = dim,
-                padding = 'same'
+                in_channels=d_model,
+                out_channels=d_model,
+                kernel_size=kernel_size,
+                padding="same",
+                groups=d_model,   # depthwise
             ),
             nn.GELU(),
-            nn.BatchNorm1d(dim)
+            nn.BatchNorm1d(d_model),
         )
-
-        # Pointwise 1x1 Conv for channel mixing
         self.channel_mixer = nn.Sequential(
-            nn.Conv1d(dim, a, kernel_size = 1),
+            nn.Conv1d(d_model, d_model, kernel_size=1),
             nn.GELU(),
-            nn.BatchNorm1d(a)
+            nn.BatchNorm1d(d_model),
         )
-
-        # TODO: Check
-        self.out_proj = (
-            nn.Identity() if a == dim
-            else nn.Conv1d(a, dim, kernel_size=1, bias=False)
-        )
-
-        self.dropout = nn.Dropout(dropout) if dropout and dropout > 0 else nn.Identity()
+        self.dropout = nn.Dropout(dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        x: (N, C=patch_num, L = d_model)
-        """
-        # Residual over depthwise branch (shape 동일)
-        x = x + self.token_mixer(x)
-        x = self.channel_mixer(x)
+        # x: (B*, D, A)
+        res = x
+        x = self.token_mixer(x)     # (B*, D, A)
+        x = self.channel_mixer(x)   # (B*, D, A)
         x = self.dropout(x)
-        return x
+        return x + res              # (B*, D, A)
 
 
 class PatchMixerBackbone(nn.Module):
@@ -104,12 +141,12 @@ class PatchMixerBackbone(nn.Module):
 
         # PatchMixer blocks
         self.PatchMixer_blocks = nn.ModuleList([
-            PatchMixerLayer(dim = self.patch_num, a = self.a, kernel_size = self.kernel_size, dropout = self.dropout_rate)
-            for _ in range(self.depth)
+            PatchMixerLayer(d_model=self.d_model, kernel_size=configs.mixer_kernel_size, dropout=configs.head_dropout)
+            for _ in range(configs.e_layers)
         ])
 
         # patch length -> model dimension linear projection (각 패치를 d_model로 투영)
-        self.W_P = nn.Linear(self.patch_size, self.d_model)
+        self.W_P = nn.Linear(configs.patch_len, self.d_model)
 
         self.flatten = nn.Flatten(start_dim =- 2) # (C, L) -> (C*L)
 
@@ -150,17 +187,39 @@ class PatchMixerBackbone(nn.Module):
 
         # linear projection: 마지막 축 patch_size -> d_model
         x = self.W_P(x) # (B, N, patch_num, d_model)
+        # print("after W_P:", x.shape)
+        actual_patch_num = x.shape[2]  # 실제 patch 개수를 동적으로 가져오기
+        self.patch_num = actual_patch_num  # 내부 변수 업데이트
+        self.a = self.patch_num
+        self.patch_repr_dim = self.a * self.d_model
+        # print("after W_P:", x.shape)
+        # # 변수별 독립 처리 위해 (B*N, patch_num, d_model)로 reshaping
+        # x = x.reshape(bs * n_vars, x.size(2), x.size(3))
+        #
+        # for block in self.PatchMixer_blocks:
+        #     x = block(x) # (B*N, patch_num, d_model)
+        #
+        # # Global representation: (B*N, patch_num * d_model) -> (B, N, -1) -> mean variable
+        # x = self.flatten(x)        # (B*N, patch_num * d_model)
+        # x = x.view(bs, n_vars, -1) # (B, N, patch_num * d_model)
+        # assert x.shape[-1] == self.patch_num * self.d_model, f"Unexpected feature dim: {x.shape[-1]}"
+        # x = x.mean(dim = 1)        # (B, a * d_model) 변수 축 평균 집약
 
-        # 변수별 독립 처리 위해 (B*N, patch_num, d_model)로 reshaping
-        x = x.reshape(bs * n_vars, x.size(2), x.size(3))
+        # (B*N, D, A)로 변환해 레이어 통과
+        BNA = x.reshape(bs * n_vars, self.patch_num, self.d_model)  # (B*N, A, D)
+        BDA = BNA.permute(0, 2, 1)                                   # (B*N, D, A)
+        # print("before blocks:", BDA.shape)
+        for blk in self.PatchMixer_blocks:
+            BDA = blk(BDA)                                           # (B*N, D, A)
 
-        for block in self.PatchMixer_blocks:
-            x = block(x) # (B*N, patch_num, d_model)
+        # (B*N, D*A) → (B, N, D*A)
+        x = self.flatten(BDA)                                        # (B*N, D*A)
+        x = x.view(bs, n_vars, -1)                                   # (B, N, D*A)
+        # print("after flatten+view:", x.shape, " expected last=", self.patch_num * self.d_model)
+        assert x.shape[-1] == self.patch_num * self.d_model, f"Unexpected feature dim: {x.shape[-1]} != {self.patch_num*self.d_model}"
 
-        # Global representation: (B*N, patch_num * d_model) -> (B, N, -1) -> mean variable
-        x = self.flatten(x)        # (B*N, patch_num * d_model)
-        x = x.view(bs, n_vars, -1) # (B, N, patch_num * d_model)
-        x = x.mean(dim = 1)        # (B, a * d_model) 변수 축 평균 집약
+        # 변수 축 pooling
+        x = x.mean(dim=1)
 
         return x # (B, patch_repr_dim)
 
@@ -200,7 +259,8 @@ class MultiScalePatchMixerBackbone(nn.Module):
             cfg.mixer_kernel_size = ks
             branch = PatchMixerBackbone(cfg, revin = False) # 내부 RevIN 비활성화
             self.branches.append(branch)
-            self.projs.append(nn.Linear(branch.patch_repr_dim, per_branch_dim))
+            # self.projs.append(nn.Linear(branch.patch_repr_dim, per_branch_dim))
+            self.projs.append(nn.LazyLinear(per_branch_dim))
 
         if fusion == 'concat':
             self.fuse = nn.Linear(per_branch_dim * len(self.branches), fused_dim)
@@ -265,7 +325,7 @@ class PatchMixerBackboneWithPatcher(nn.Module):
 
         # Mixer blocks (Conv1d는 (N, C=patch_num, L=d_model) 포맷)
         self.blocks = nn.ModuleList([
-            PatchMixerLayer(dim=self.a, a=self.a, kernel_size=configs.mixer_kernel_size, dropout=self.dropout_rate)
+            PatchMixerLayer(patch_num=self.a, d_model=self.d_model, kernel_size=configs.mixer_kernel_size, dropout=self.dropout_rate)
             for _ in range(self.depth)
         ])
 

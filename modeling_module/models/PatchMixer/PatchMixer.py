@@ -241,7 +241,7 @@ class QuantileModel(nn.Module):
         raise ValueError(f"pred shape must be (B,{qlen},{horizon}) or (B,{horizon},{qlen}), got {q.shape}")
 
     def forward(self, x: torch.Tensor, future_exo: torch.Tensor | None = None, *,
-                exo_is_normalized: bool = True) -> torch.Tensor:
+                exo_is_normalized: bool = True, **kwargs) -> torch.Tensor:
         """
         x: (B, L, N)  # RevIN이 이 형태를 받는 구현 가정
         return: (B, 3, H)
