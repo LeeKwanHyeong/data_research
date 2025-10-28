@@ -19,7 +19,7 @@ class TrainingConfig:
     horizon: int = 3
 
     # ------------Training------------
-    epochs: int = 500
+    epochs: int = 1
     lr: float = 1e-4
     weight_decay: float = 1e-4
     t_max: int = 10                 # CosineAnnealingLR

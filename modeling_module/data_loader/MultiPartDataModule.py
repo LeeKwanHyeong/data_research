@@ -15,7 +15,8 @@ class MultiPartInferenceDataset(Dataset):
         주로 모델 추론 시 과거 데이터를 기반으로 예측할 때 사용된다.
     """
     def __init__(self,
-                 df: pl.DataFrame, config,
+                 df: pl.DataFrame,
+                 lookback: int = None,
                  part_col: str = 'oper_part_no',
                  date_col: str = 'demand_dt',  # 주차 컬럼명(정수 YYYYWW)
                  qty_col: str = 'demand_qty',
@@ -27,7 +28,8 @@ class MultiPartInferenceDataset(Dataset):
             - df (pl.DataFrame): 'oper_part_no'와 'demand_dt', 'demand_qty' 컬럼을 포함하는 전체 시계열 데이터.
             - config: lookback 설정 값을 포함하는 설정 객체.
         """
-        self.lookback = config.lookback # 입력 시퀀스 길이
+        assert lookback is not None
+        self.lookback = lookback # 입력 시퀀스 길이
         self.inputs = []                # 최종 모델 입력 시퀀스 리스트 (numpy array)
         self.part_ids = []              # 각 시퀀스에 대응하는 부품 식별자 리스트 (string)
 
@@ -62,13 +64,16 @@ class MultiPartTrainingDataset(Dataset):
         - 모델은 lookback만큼의 과거 데이터를 입력으로 받아 horizon 만큼의 미래를 예측한다.
     """
     def __init__(self,
-                 df: pl.DataFrame, config,
+                 df: pl.DataFrame,
+                 lookback: int = None, horizon: int = None,
                  part_col: str = 'oper_part_no',
                  date_col: str = 'demand_dt',  # 주차 컬럼명(정수 YYYYWW)
                  qty_col: str = 'demand_qty',
                  ):
-        self.lookback = config.lookback # 입력 구간 길이
-        self.horizon = config.horizon   # 예측 구간 길이
+
+        assert lookback, horizon is not None
+        self.lookback = lookback # 입력 구간 길이
+        self.horizon = horizon   # 예측 구간 길이
 
         self.samples = []               # 최종 (x_seq, y_seq) 튜플 목록
         self.part_ids = []              # 각 시퀀스에 대응하는 부품 ID
@@ -391,7 +396,8 @@ class MultiPartDataModule:
     """
     def __init__(self,
                  df: pl.DataFrame,
-                 config,
+                 lookback: int,
+                 horizon: int,
                  is_running,
                  batch_size = 64,
                  val_ratio = 0.2,
@@ -410,7 +416,8 @@ class MultiPartDataModule:
         - seed: 고정 시드를 통한 재현성 보장
         """
         self.df = df
-        self.config = config
+        self.lookback = lookback
+        self.horizon = horizon
         self.is_running = is_running
         self.batch_size = batch_size
         self.val_ratio = val_ratio
@@ -433,7 +440,7 @@ class MultiPartDataModule:
         - 전체 dataset을 생성한 후, train/val로 비율에 따라 분할
         - 동일 시드로 항상 동일하게 분할됨
         """
-        full_dataset = MultiPartTrainingDataset(self.df, self.config)
+        full_dataset = MultiPartTrainingDataset(self.df, self.lookback, self.horizon)
         total_len = len(full_dataset)
         val_len = int(total_len * self.val_ratio)
         train_len = total_len - val_len
@@ -477,7 +484,7 @@ class MultiPartDataModule:
         - 가장 최근 lookback 데이터를 사용하여 추론 입력 구성
         - 학습이 아닌 전용 추론에 사용
         """
-        self.inference_dataset = MultiPartInferenceDataset(self.df, self.config)
+        self.inference_dataset = MultiPartInferenceDataset(self.df, self.lookback)
         self.inference_loader = DataLoader(
             self.inference_dataset,
             batch_size = self.batch_size,
@@ -501,7 +508,7 @@ class MultiPartDataModule:
         if self.is_running:
             ds = MultiPartAnchoredInferenceByYYYYWW(
                 df = self.df,
-                lookback = self.config.lookback,
+                lookback = self.lookback,
                 plan_yyyyww = plan_dt,
                 part_col = 'oper_part_no',
                 date_col = 'demand_dt',
@@ -513,7 +520,7 @@ class MultiPartDataModule:
         else:
             ds = MultiPartAnchoredInferenceByYYYYMM(
                 df = self.df,
-                lookback = self.config.lookback,
+                lookback = self.lookback,
                 plan_yyyymm = plan_dt,
                 part_col = 'oper_part_no',
                 date_col = 'demand_dt',

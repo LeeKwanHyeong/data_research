@@ -2,7 +2,7 @@ import torch
 from torch import nn
 
 from modeling_module.models.PatchTST.common.patching import compute_patch_num
-from modeling_module.models.PatchTST.common.pos_encoding import positional_encoding
+from modeling_module.models.PatchTST.common.pos_encoding import positional_encoding, PositionalEncoding
 from modeling_module.models.common_layers.RevIN import RevIN
 
 
@@ -41,9 +41,21 @@ class PatchBackboneBase(nn.Module):
         입력: x [B, C, L]
         출력: z [B, L_patch, d_model]
         """
-        z = self.patch_proj(x)  # [B, d_model, L_patch]
-        z = z.transpose(1, 2).contiguous()  # [B, L_patch, d_model]
+        # z = self.patch_proj(x)  # [B, d_model, L_patch]
+        # z = z.transpose(1, 2).contiguous()  # [B, L_patch, d_model]
+        #
+        # # positional encoding 직접 더하기
+        # z = z + self.pos_enc[: z.size(1), :].unsqueeze(0)
+        # if self.pos_enc.shape !=
+        # return z
+        z = self.patch_proj(x).transpose(1, 2).contiguous()  # [B, L_patch, d_model]
+        B, L_patch, D = z.shape
 
-        # positional encoding 직접 더하기
-        z = z + self.pos_enc[: z.size(1), :].unsqueeze(0)
+        # 기존 pos_enc 대신, 매 호출마다 L_patch 맞춰 생성
+        pos_enc = self.pos_enc[:L_patch, :].unsqueeze(0).to(z.device)
+        if pos_enc.shape[1] != L_patch:
+            # 새 positional encoding 생성
+            pos_enc = PositionalEncoding(L_patch, D).to(z.device)
+
+        z = z + pos_enc
         return z
