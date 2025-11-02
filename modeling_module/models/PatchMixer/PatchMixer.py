@@ -176,7 +176,7 @@ class QuantileModel(nn.Module):
 
         H = horizon if horizon is not None else base_configs.horizon
         self.horizon = int(H)
-
+        print(self.horizon)
         # 1) Backbone: 전역 벡터 [B, D]
         self.backbone = MultiScalePatchMixerBackbone(
             base_configs=base_configs,

@@ -15,8 +15,8 @@ class DecompositionConfig:
 class TrainingConfig:
     # ------------Loader------------
     device: str = 'cuda' if torch.cuda.is_available() else 'mps' # For Mac
-    lookback: int = 12
-    horizon: int = 3
+    lookback: int = 54
+    horizon: int = 27
 
     # ------------Training------------
     epochs: int = 1
