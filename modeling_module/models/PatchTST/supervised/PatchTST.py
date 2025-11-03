@@ -75,20 +75,31 @@ class PatchTSTPointModel(nn.Module):
         self.is_quantile = False
         self.horizon = cfg.horizon
         self.model_name = "PatchTST BaseModel"
-        self.revin = RevIN(num_features = cfg.c_in)
+
+        # Forecaster 호환: 속성명을 revin_layer로 통일
+        self.revin_layer = RevIN(num_features=cfg.c_in)
 
     def forward(self, x_b_l_c: torch.Tensor, future_exo=None, mode=None) -> torch.Tensor:
-        x_b_l_c = self.revin(x_b_l_c, 'norm')
-        x = x_b_l_c.permute(0, 2, 1)  # [B, C, L]
-        z = self.backbone(x)          # [B, L_tok, d_model]
-        y = self.head(z)              # [B, horizon]
-        y = self.revin(y, 'denorm')
-        return y
+        """
+        x_b_l_c: [B, L, C] (원공간)
+        반환: y_n: [B, H] (정규화 공간; Forecaster에서 model.revin_layer(y, 'denorm') 처리)
+        """
+        # 1) 입력 정규화 (컨텍스트: 배치별/채널별 통계가 revin_layer 내부에 저장)
+        x_n = self.revin_layer(x_b_l_c, 'norm')          # [B, L, C]
 
+        # 2) Backbone forward (PatchTST는 [B, C, L] 입력)
+        x_n_b_c_l = x_n.permute(0, 2, 1)                 # [B, C, L]
+        z = self.backbone(x_n_b_c_l)                     # [B, L_tok, d_model]
+
+        # 3) Head → normalized space 예측
+        y_n = self.head(z)                               # [B, H]
+        return y_n                                       # denorm은 Forecaster가 일원화 수행
 
 class PatchTSTQuantileModel(nn.Module):
     """
-    PatchTST Backbone + Quantile Head
+    PatchTST Backbone + Quantile Head (quantile forecast)
+    - 입력은 RevIN으로 'norm'만 수행
+    - 출력은 normalized space 그대로 반환(dict with 'q')
     """
     def __init__(self, cfg, attn_core=None):
         super().__init__()
@@ -99,13 +110,23 @@ class PatchTSTQuantileModel(nn.Module):
         self.is_quantile = True
         self.horizon = cfg.horizon
         self.model_name = "PatchTST QuantileModel"
-        self.revin = RevIN(num_features = cfg.c_in)
 
+        # Forecaster 호환: 속성명을 revin_layer로 통일
+        self.revin_layer = RevIN(num_features=cfg.c_in)
 
-    def forward(self, x_b_l_c: torch.Tensor, future_exo=None, mode=None) -> torch.Tensor:
-        x_b_l_c = self.revin(x_b_l_c, 'norm')
-        x = x_b_l_c.permute(0, 2, 1)  # [B, C, L]
-        z = self.backbone(x)          # [B, L_tok, d_model]
-        q = self.head(z)              # [B, Q, horizon]
-        q = self.revin(q, 'denorm')
-        return q
+    def forward(self, x_b_l_c: torch.Tensor, future_exo=None, mode=None):
+        """
+        x_b_l_c: [B, L, C] (원공간)
+        반환: {"q": q_n}  with q_n: [B, H, Q] (정규화 공간)
+              (Forecaster가 'q'를 우선 선택해 horizon을 정규화하고, revin_layer로 denorm)
+        """
+        # 1) 입력 정규화
+        x_n = self.revin_layer(x_b_l_c, 'norm')          # [B, L, C]
+
+        # 2) Backbone forward (PatchTST는 [B, C, L] 입력)
+        x_n_b_c_l = x_n.permute(0, 2, 1)                 # [B, C, L]
+        z = self.backbone(x_n_b_c_l)                     # [B, L_tok, d_model]
+
+        # 3) Head → normalized space quantiles
+        q_n = self.head(z)                               # [B, H, Q]
+        return {"q": q_n}

@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from model_runner.model_configs import PatchMixerConfigMonthly
+from modeling_module.models.PatchMixer.common.configs import PatchMixerConfigMonthly
 
 
 class SimpleUnfoldProjector(nn.Module):

@@ -90,6 +90,39 @@ class DefaultAdapter:
         if torch.is_tensor(out): return out
         raise TypeError(f"Model output is not a Tensor/tuple/dict: {type(out)}")
 
+    def _denorm_like_revin(self, model, y):
+        # model.revin_layer가 [B,*,C]를 기대할 수 있으므로 형상 맞춰 denorm
+        def _denorm_tensor(t):
+            # t: [B,H] or [B,H,1] or [B,H,Q]
+            if t.dim() == 2:  # [B,H] -> [B,H,1]
+                t1 = t.unsqueeze(-1)
+                out = model.revin_layer(t1, 'denorm')
+                return out.squeeze(-1)
+            if t.dim() == 3 and t.size(-1) in (1, 3):  # [B,H,1] or [B,H,3] (예: quantiles)
+                outs = []
+                for i in range(t.size(-1)):
+                    ti = t[..., i].unsqueeze(-1)  # [B,H,1]
+                    oi = model.revin_layer(ti, 'denorm').squeeze(-1)
+                    outs.append(oi)
+                return torch.stack(outs, dim=-1)  # [B,H,Q]
+            # 기타 형상은 그대로 시도
+            return model.revin_layer(t, 'denorm')
+
+        if hasattr(model, "revin_layer"):
+            if isinstance(y, dict):
+                y = dict(y)  # shallow copy
+                if "point" in y: y["point"] = _denorm_tensor(y["point"])
+                if "q" in y:     y["q"] = _denorm_tensor(y["q"])
+                return y
+            return _denorm_tensor(y)
+        return y
+
+    def _maybe_denorm(self, model, y):
+        try:
+            return self._denorm_like_revin(model, y)
+        except Exception:
+            return y
+
     def forward(self, model, x_batch, *, future_exo=None, mode=None):
         # x_batch가 dict/tuple일 수도 있으면 여기서 분기
         if isinstance(x_batch, dict):
@@ -116,6 +149,8 @@ class DefaultAdapter:
                 x_batch = x_batch[0]
 
         out = self._call_model(model, x_batch, future_exo = future_exo, mode = mode)
+        if hasattr(model, "revin_layer"):
+            out = self._maybe_denorm(model, out)
         return self._as_tensor(out)
 
 

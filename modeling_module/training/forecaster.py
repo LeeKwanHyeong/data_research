@@ -1,183 +1,181 @@
+# forecaster.py
+
 import torch
 from typing import Optional, Callable
 
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader  # noqa: F401  # (인터페이스 호환용)
 
-def make_calendar_exo(start_idx: int, H: int, period: int = 12, device = 'cpu'):
-    t = torch.arange(start_idx, start_idx + H, device = device, dtype = torch.float32)
-    # 월 주기 sin/cos
-    exo = torch.stack([torch.sin(2*torch.pi*t/period), torch.cos(2*torch.pi*t/period)], dim = -1) # (H, 2)
-    return exo # (H, 2)
+DEBUG_FCAST = True
+
+
+# -------------------- Utilities --------------------
+def _tvar(t: torch.Tensor) -> float:
+    """
+    시간축(=dim=1) 분산의 배치 평균을 간단 확인용으로 계산.
+    기대 shape: [B, H], [B, L], [B, H, *]도 허용(앞의 [B,H]로 맞춤)
+    """
+    if t.dim() >= 2:
+        t2 = t.reshape(t.size(0), t.size(1), -1).mean(-1)  # [B, H]
+        return t2.var(dim=1).mean().item()
+    return float('nan')
+
+
+def _tfirst5(t: torch.Tensor) -> str:
+    """
+    첫 배치의 앞 5개 시점 값을 프린트용 문자열로 반환.
+    기대 shape: [B, H] 또는 [B, H, C]
+    """
+    if t.dim() == 1:
+        x = t[:5].detach().cpu().tolist()
+    elif t.dim() >= 2:
+        x = t[0, :min(5, t.size(1))]
+        if x.dim() > 1:
+            x = x[..., 0]
+        x = x.detach().cpu().tolist()
+    else:
+        x = []
+    return "[" + ", ".join(f"{v:.6g}" for v in x) + "]"
+
+
+def make_calendar_exo(start_idx: int, H: int, period: int = 52, device: str | torch.device = 'cpu') -> torch.Tensor:
+    """
+    단순 주기성(sin/cos) 외생변수 생성: (H, 2)
+    """
+    t = torch.arange(start_idx, start_idx + H, device=device, dtype=torch.float32)
+    exo = torch.stack([torch.sin(2 * torch.pi * t / period),
+                       torch.cos(2 * torch.pi * t / period)], dim=-1)  # (H, 2)
+    return exo
+
 
 def _prepare_next_input(
-        x: torch.Tensor,
-        y_step: torch.Tensor,
-        target_channel: int = 0,
-        fill_mode: str = 'copy_last',
+    x_raw: torch.Tensor,
+    y_step_raw: torch.Tensor,
+    *,
+    target_channel: int = 0,
+    fill_mode: str = 'copy_last',   # 원시 스케일에서 last 복사 or zeros
 ) -> torch.Tensor:
-    '''
-    현재 윈도우 x에 대해 한 스텝 예측값 y_step을 마지막 시점으로 붙여 넣고,
-    가장 오래된 시점을 버려 윈도우를 한 칸 전진.
-    :param x: [B, L, C] 입력 윈도우 (Batch, Lookback, Channel)
-    :param y_step: 이번 스텝에 예측된 target value.
-    :param target_channel: int
-        target 변수가 위치한 채널 인덱스 (기본 0)
-    :param fill_mode: {'copy_last', 'zeros'}
-        다변량 (C>1)일 때, 타깃 외 채널을 새 시점에 채우는 방식
-        - 'copy_last': 직전 시점 값을 복사
-        - 'zeros': 0으로 채움
-    :return:
-    x_next: [B, L, C] 한 칸 전진된 다음 입력 윈도우
-    '''
-    assert x.dim() == 3, f"x must be [B, L, C], got {x.shape}"
-    B, L, C = x.shape
-    y_step = y_step.reshape(B, 1, 1)  # -> [B, 1, 1]
+    """
+    x_raw: [B, L, C]  (원시 스케일)
+    y_step_raw: [B]   (원시 스케일 예측값)
+    """
+    assert x_raw.dim() == 3, f"x must be [B, L, C], got {x_raw.shape}"
+    B, L, C = x_raw.shape
+    y_step_raw = y_step_raw.reshape(B, 1, 1)  # -> [B,1,1]
 
     if C == 1:
-        new_token = y_step  # 단변량이면 예측값만 넣으면 됨
-
+        new_token = y_step_raw
     else:
-        last = x[:, -1:, :].clone()  # 직전 시점 값
+        last = x_raw[:, -1:, :].clone()
         if fill_mode == 'zeros':
             new_token = torch.zeros_like(last)
         else:
             new_token = last  # copy_last
+        new_token[:, 0, target_channel] = y_step_raw[:, 0, 0]
 
-        new_token[:, 0, target_channel] = y_step[:, 0, 0]
-
-    # Window slide + new series
-    x_next = torch.cat([x[:, 1:, :], new_token], dim=1)
+    x_next = torch.cat([x_raw[:, 1:, :], new_token], dim=1)
     return x_next
 
 
 def _winsorize_clamp(
-        hist: torch.Tensor,  # [B, L] (target 채널 히스토리)
-        y_step: torch.Tensor,  # [B]
-        nonneg: bool = True,
-        clip_q: tuple[float, float] = (0.05, 0.95),
-        clip_mul: float = 4.0,  # 상위 분위수 배수 상한
-        max_growth: float = 0.05  # 직전값 대비 최대 성장배율 max_growth=2.0 ~ 2.5
+    hist_n: torch.Tensor,     # [B, L]  (정규화 공간의 타깃 히스토리)
+    y_step_n: torch.Tensor,   # [B]
+    *,
+    nonneg: bool = True,
+    clip_q: tuple[float, float] = (0.05, 0.95),
+    clip_mul: float = 4.0,
+    max_growth: float = 0.05
 ) -> torch.Tensor:
     """
-    히스토리 분위수/직전값 대비 성장률로 y_step을 winsorize + clamp.
-    (nan_to_num 대신 torch.where로 텐서별 대체)
+    히스토리 분위수 기반 + 직전값 대비 성장률 기반으로 y_step_n을 클램프.
+    내부/입출력 모두 정규화 공간 기준.
     """
-    # 안전하게 float로
-    hist = hist.float()
-    y = y_step.float()
+    hist = hist_n.float()
+    y = y_step_n.float()
 
     B, L = hist.shape
-    last = hist[:, -1]  # [B]
+    last = hist[:, -1]
 
-    # 히스토리 내 비유한/비유효값을 직전값으로 대체하여 분위수 계산 안정화
+    # 분위수 계산 안정화
     hist_safe = torch.where(torch.isfinite(hist), hist, last.unsqueeze(1))
-
     q_lo = torch.quantile(hist_safe, clip_q[0], dim=1)  # [B]
     q_hi = torch.quantile(hist_safe, clip_q[1], dim=1)  # [B]
 
     min_cap = torch.zeros_like(q_lo) if nonneg else q_lo
     cap_quant = q_hi * clip_mul
     cap_growth = torch.where(last > 0, last * max_growth, cap_quant)
-    max_cap = torch.minimum(cap_quant, cap_growth)  # [B]
+    max_cap = torch.minimum(cap_quant, cap_growth)
 
-    # 요소별로 nan/±inf를 안전 값으로 치환
     y = torch.where(torch.isnan(y), last, y)
     y = torch.where(torch.isposinf(y), max_cap, y)
     y = torch.where(torch.isneginf(y), min_cap, y)
 
-    # 최종 클램프
     y = torch.clamp(y, min=min_cap, max=max_cap)
     return y
 
 
 def _dampen_to_last(
-        last: torch.Tensor,  # [B]
-        y_step: torch.Tensor,
-        damp: float = 0.1  # 0(무효)~1(그대로), 0.3~0.7 권장
+    last_n: torch.Tensor,     # [B] (정규화 공간)
+    y_step_n: torch.Tensor,
+    *,
+    damp: float = 0.1
 ) -> torch.Tensor:
     """
-    예측값을 직전 관측과 혼합하여 급변을 완화.
+    y_step_n과 직전값 last_n을 혼합해 급변을 완화. (정규화 공간)
     """
     if damp <= 0.0:
-        return y_step
-    return (1.0 - damp) * last + damp * y_step
+        return y_step_n
+    return (1.0 - damp) * last_n + damp * y_step_n
 
 
 def _guard_multiplicative(
-        last: torch.Tensor,  # [B]
-        y_raw: torch.Tensor,  # [B]
-        max_step_up: float = 0.10,  # 스텝당 최대 상승비율 (예: +10%)
-        max_step_down: float = 0.20  # 스텝당 최대 하락비율 (예: -20%)
+    last_n: torch.Tensor,     # [B] (정규화 공간)
+    y_raw_n: torch.Tensor,    # [B] (정규화 공간)
+    *,
+    max_step_up: float = 0.10,
+    max_step_down: float = 0.20
 ) -> torch.Tensor:
     """
-    직전값 대비 예측 비율을 log 도메인에서 클램프.
-    last=0 보호를 위해 eps 사용.
+    로그-비율 도메인에서 상승/하락 비율 제한. (정규화 공간)
+    last==0 케이스 보호를 위해 eps 사용.
     """
     eps = 1e-6
-    last_safe = torch.clamp(last, min=eps)
-    y_safe = torch.clamp(y_raw, min=eps)  # 비율/로그 계산 안정화
+    last_safe = torch.clamp(last_n, min=eps)
+    y_safe = torch.clamp(y_raw_n, min=eps)
 
-    ratio = y_safe / last_safe  # [B]
-    log_ratio = torch.log(ratio)  # [B]
+    ratio = y_safe / last_safe
+    log_ratio = torch.log(ratio)
 
-    min_ratio = 1.0 - max_step_down  # 예: 0.8
-    max_ratio = 1.0 + max_step_up  # 예: 1.1
-    log_min = torch.log(torch.tensor(min_ratio, device=last.device))
-    log_max = torch.log(torch.tensor(max_ratio, device=last.device))
+    log_min = torch.log(torch.tensor(1.0 - max_step_down, device=last_n.device))
+    log_max = torch.log(torch.tensor(1.0 + max_step_up, device=last_n.device))
 
     log_ratio = torch.clamp(log_ratio, min=log_min, max=log_max)
     y_guard = last_safe * torch.exp(log_ratio)
     return y_guard
 
 
+# -------------------- Forecaster --------------------
 class DMSForecaster:
     """
-    Titan/LMM 계열을 위한 DMS(Direct Multi-Step) 예측기 (+미래 exo/TTM/안정화 토글).
-    - model(x) 1회로 [B, Hm] 출력 사용
-    - horizon > Hm 이면 extend='ims'로 초과구간을 IMS로 이어붙임
-    - future_exo_cb(start_idx, Hm) -> (Hm, exo_dim) 콜백 지원
-    - global_t0: 예측 시작의 '절대 인덱스' (필요시 호출 전 세팅)
+    DMS(Direct Multi-Step) + 필요 시 IMS(Iterated Multi-Step) 확장 예측기.
+
+    설계 원칙 (RevIN을 모델 내부에서 'norm'만 수행, denorm은 Forecaster에서 수행)
+    - 모델 입력/슬라이딩 윈도우는 '원시 스케일(raw)'로 유지한다.
+    - 모델 출력은 '정규화 공간'이므로, 가드·윈저·댐핑 등은 정규화 공간에서 수행한다.
+    - 슬라이딩 시에는 다음 입력을 위해 스텝별로 y_step_n → y_step_raw 로 denorm 하여 x_raw에 붙인다.
+    - 최종 반환 y_hat은 원시 스케일(raw).
     """
 
-    def _probe_hm(self, x: torch.Tensor, B: int) -> int:
-        """
-        모델의 실제 출력 길이(Hm)를 안전하게 프로빙.
-        - model(x)
-        - model(x, mode=...)
-        - model(x, future_exo=None)
-        - model(x, future_exo=None, mode=...)
-        순으로 시도해서 첫 성공 출력의 size(1)를 반환.
-        """
-        # 1) model(x)
-        try:
-            y = self.model(x)
-            return self._normalize_out(y, B).size(1)
-        except TypeError:
-            pass
-        # 2) model(x, mode=...)
-        try:
-            y = self.model(x, mode=(self.lmm_mode or "eval"))
-            return self._normalize_out(y, B).size(1)
-        except TypeError:
-            pass
-        # 3) model(x, future_exo=None)
-        try:
-            y = self.model(x, future_exo=None)
-            return self._normalize_out(y, B).size(1)
-        except TypeError:
-            pass
-        # 4) model(x, future_exo=None, mode=...)
-        y = self.model(x, future_exo=None, mode=(self.lmm_mode or "eval"))
-        return self._normalize_out(y, B).size(1)
-
-    def __init__(self,
-                 model: torch.nn.Module,
-                 target_channel: int = 0,
-                 fill_mode: str = "copy_last",
-                 lmm_mode: Optional[str] = None,
-                 predict_fn: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
-                 ttm: Optional[object] = None,
-                 future_exo_cb: Optional[Callable[[int, int], torch.Tensor]] = lambda s, h: make_calendar_exo(s, h, period=12)):
+    def __init__(
+        self,
+        model: torch.nn.Module,
+        *,
+        target_channel: int = 0,
+        fill_mode: str = "copy_last",  # {'copy_last', 'zeros'}  (raw space)
+        lmm_mode: Optional[str] = None,
+        predict_fn: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
+        ttm: Optional[object] = None,
+        future_exo_cb: Optional[Callable[[int, int], torch.Tensor]] = lambda s, h: make_calendar_exo(s, h, period=52),
+    ):
         self.model = model
         self.target_channel = target_channel
         self.fill_mode = fill_mode
@@ -185,593 +183,380 @@ class DMSForecaster:
         self.predict_fn = predict_fn
         self.ttm = ttm
         self.future_exo_cb = future_exo_cb
-        self.global_t0 = 0  # 외생변수 기준 시작 인덱스
+        self.global_t0 = 0  # 절대 인덱스(외생변수 기준 시작점)
 
-    @torch.no_grad()
-    def _context_features(self, x: torch.Tensor) -> torch.Tensor:
-        if hasattr(self.model, "encoder") and hasattr(self.model.encoder, "input_proj"):
-            return self.model.encoder.input_proj(x)
-        return x
+    # ---------- internal helpers ----------
+    def _unwrap_output(self, y_full):
+        if isinstance(y_full, dict):
+            if "point" in y_full:
+                y_full = y_full["point"]
+            elif "q" in y_full:
+                q = y_full["q"]
+                if q.dim() == 3 and q.size(-1) >= 3:
+                    y_full = q[..., 1]  # q50
+                else:
+                    y_full = q[..., 0]  # 첫 채널
+            else:
+                k = next(iter(y_full))
+                y_full = y_full[k]
+        return y_full
 
-    def warmup(self,
-               x_warm: torch.Tensor,
-               y_warm: Optional[torch.Tensor] = None,
-               steps: int = 1,
-               add_context: bool = True,
-               adapt: bool = True) -> None:
-        if self.ttm is None:
-            return
-        if add_context:
-            x_ctx = self._context_features(x_warm)
-            self.ttm.add_context(x_ctx)
-        if adapt and (y_warm is not None):
-            _ = self.ttm.adapt(x_warm, y_warm, steps=steps)
+    def _normalize_by_horizon(self, y_full, B: int, H_hint: Optional[int] = None) -> torch.Tensor:
+        """
+        다양한 출력 텐서를 [B,H](정규화 공간)로 정규화.
+        """
+        y_full = self._unwrap_output(y_full)
 
-    # ---------- 공통 유틸 ----------
-
-    def _normalize_out(self, y_full: torch.Tensor, B: int) -> torch.Tensor:
-        # 최종 형태는 [B, H]
         if y_full.dim() == 1:
             return y_full.view(B, -1)
         if y_full.dim() == 2:
-            return y_full  # [B, H]
+            return y_full  # [B,H]
 
         if y_full.dim() == 3:
-            # 두 축 길이
             d1, d2 = y_full.size(1), y_full.size(2)
 
-            # 1) (B, 1, H)
-            if d1 == 1:
-                return y_full[:, 0, :]  # -> [B, H]
-            # 2) (B, H, 1)
-            if d2 == 1:
-                return y_full[:, :, 0]  # -> [B, H]
+            if H_hint is not None:
+                if d1 == H_hint and d2 != H_hint:
+                    return y_full[:, :, 0]
+                if d2 == H_hint and d1 != H_hint:
+                    ch = min(self.target_channel, d1 - 1)
+                    return y_full[:, ch, :]
+                if d1 == H_hint and d2 == H_hint:
+                    return y_full[:, :, 0]
 
-            # 3) (B, C, H) vs (B, H, C) 추정:
-            #    일반적으로 '시간축'이 더 김. 더 긴 쪽을 H로 간주
-            if d2 >= d1:  # (B, H, C)로 가정
-                ch = min(self.target_channel, d2 - 1)  # 안전 인덱스
-                return y_full[:, :, ch]  # -> [B, H]
-            else:  # (B, C, H)로 가정
-                ch = min(self.target_channel, d1 - 1)
-                return y_full[:, ch, :]  # -> [B, H]
+            # H_hint 불명 → 보수 처리
+            if d2 in (1, 3):
+                return y_full[:, :, 1] if d2 == 3 else y_full[:, :, 0]
+            ch = min(self.target_channel, d1 - 1)
+            return y_full[:, ch, :]
 
-        # fallback
         return y_full.reshape(B, -1)
 
-    def _call_model(self, x: torch.Tensor, B: int) -> torch.Tensor:
-        if self.predict_fn is not None:
-            y_full = self.predict_fn(x)
-        else:
-            try:
-                y_full = self.model(x)
-            except TypeError:
-                # 먼저 mode, 안되면 None exo, 마지막으로 None+mode
-                try:
-                    y_full = self.model(x, mode=(self.lmm_mode or "eval"))
-                except TypeError:
-                    try:
-                        y_full = self.model(x, future_exo=None)
-                    except TypeError:
-                        y_full = self.model(x, future_exo=None, mode=(self.lmm_mode or "eval"))
-        return self._normalize_out(y_full, B)
-
-    def _try_model_call(self, x, future_exo, B):
-        """(x, future_exo, mode) → (x, future_exo) → (x, mode) → (x) 순서로 안전 호출."""
-        try:
-            return self.model(x, future_exo=future_exo, mode=(self.lmm_mode or "eval"))
-        except TypeError:
-            pass
-        try:
-            return self.model(x, future_exo=future_exo)
-        except TypeError:
-            pass
-        try:
-            return self.model(x, mode=(self.lmm_mode or "eval"))
-        except TypeError:
-            pass
-        return self.model(x)
-
-    def _call_with_exo(self, x: torch.Tensor, B: int, Hm: int, step_offset: int) -> torch.Tensor:
-        """미래 exo 콜백이 있으면 (B,Hm,exo_dim)로 만들어 모델에 주입 후 [B,Hm]로 정규화."""
-        if self.future_exo_cb is None:
-            return self._call_model(x, B)
-        t0 = self.global_t0 + step_offset
-        exo = self.future_exo_cb(t0, Hm)              # (Hm, exo_dim)
-        exo = exo.to(x.device).unsqueeze(0).expand(B, -1, -1)  # (B,Hm,exo_dim)
-        y_full = self._try_model_call(x, exo, B)
-        return self._normalize_out(y_full, B)
-
-    # ---------- Overlap-DMS ----------
     @torch.no_grad()
-    def forecast_overlap_avg(self,
-                             x_init: torch.Tensor,
-                             horizon: int,
-                             block_stride: int = 1,
-                             device: Optional[torch.device] = None,
-                             context_policy: str = 'once',
-                             # 안정화 토글 & 파라미터
-                             use_winsor: bool = True,
-                             use_multi_guard: bool = True,
-                             use_dampen: bool = True,
-                             winsor_q: tuple = (0.05, 0.95),
-                             winsor_mul: float = 2.0,
-                             winsor_growth: float = 1.10,
-                             max_step_up: float = 0.10,
-                             max_step_down: float = 0.30,
-                             damp_min: float = 0.2,
-                             damp_max: float = 0.6) -> torch.Tensor:
+    def _context_features(self, x_raw: torch.Tensor) -> torch.Tensor:
+        # 필요 시 encoder.input_proj로 컨텍스트 임베딩
+        if hasattr(self.model, "encoder") and hasattr(self.model.encoder, "input_proj"):
+            return self.model.encoder.input_proj(x_raw)
+        return x_raw
+
+    def _get_h_hint(self) -> int:
+        return int(getattr(self.model, "horizon", getattr(self.model, "output_horizon", 0)) or 0)
+
+    def _call_model(self, x_raw: torch.Tensor, B: int) -> torch.Tensor:
         """
-        Overlapped DMS averaging:
-        - horizon 길이 만큼을 목표로, DMS 블록을 겹치게 예측하여 동일 시점 평균.
-        - 각 블록 시작 → Hm 길이의 예측(y_block) 생성 → 해당 구간 누적/카운트
-        - 다음 블록으로 전진할 때는 y_block의 앞쪽 'advance'개(= stride) 1-step 값을
-          순차적으로 사용해 입력 윈도우를 업데이트(옵션 가드/댐핑 적용).
+        모델은 내부에서 RevIN.norm을 수행한다고 가정. 입력은 'raw'를 그대로 넣는다.
+        반환은 정규화 공간 [B,H].
         """
+        H_hint = self._get_h_hint()
+        if self.predict_fn is not None:
+            y = self.predict_fn(x_raw)
+            return self._normalize_by_horizon(y, B, H_hint)
+
+        try:
+            y = self.model(x_raw)
+            return self._normalize_by_horizon(y, B, H_hint)
+        except TypeError:
+            try:
+                y = self.model(x_raw, mode=(self.lmm_mode or "eval"))
+                return self._normalize_by_horizon(y, B, H_hint)
+            except TypeError:
+                try:
+                    y = self.model(x_raw, future_exo=None)
+                    return self._normalize_by_horizon(y, B, H_hint)
+                except TypeError:
+                    y = self.model(x_raw, future_exo=None, mode=(self.lmm_mode or "eval"))
+                    return self._normalize_by_horizon(y, B, H_hint)
+
+    def _try_model_call(self, x_raw: torch.Tensor, future_exo: torch.Tensor, B: int) -> torch.Tensor:
+        try:
+            return self.model(x_raw, future_exo=future_exo, mode=(self.lmm_mode or "eval"))
+        except TypeError:
+            pass
+        try:
+            return self.model(x_raw, future_exo=future_exo)
+        except TypeError:
+            pass
+        try:
+            return self.model(x_raw, mode=(self.lmm_mode or "eval"))
+        except TypeError:
+            pass
+        return self.model(x_raw)
+
+    def _call_with_exo(self, x_raw: torch.Tensor, B: int, H_need: int, step_offset: int) -> torch.Tensor:
+        """
+        future_exo_cb가 있으면 (B,H,exo)로 주입하여 모델 호출.
+        반환은 '정규화 공간' [B,H].
+        """
+        H_hint = H_need or self._get_h_hint()
+        if self.future_exo_cb is None:
+            return self._call_model(x_raw, B)
+        t0 = self.global_t0 + step_offset
+        exo = self.future_exo_cb(t0, H_hint).to(x_raw.device)  # (H, exo_dim)
+        exo = exo.unsqueeze(0).expand(B, -1, -1)
+        y_full = self._try_model_call(x_raw, exo, B)
+        return self._normalize_by_horizon(y_full, B, H_hint)
+
+    def _denorm_like_revin(self, y_any: torch.Tensor | dict) -> torch.Tensor | dict:
+        """
+        model.revin_layer(…, 'denorm')을 사용해 정규화 공간→raw로 변환.
+        정규화 통계는 '바로 직전 norm 호출(=마지막 model(...), 혹은 이 함수 내 임시 norm)'의 것을 사용.
+
+        - 1D([B]) / 2D([B,H]) / 3D([B,H,k]) 안전 지원
+        - dict({"point":[B,H], "q":[B,H,3]}) 형태도 지원
+        """
+        def _denorm_tensor(t: torch.Tensor) -> torch.Tensor:
+            if not hasattr(self.model, "revin_layer"):
+                return t  # RevIN 미보유 모델: 원본 반환
+
+            # 표준화: RevIN은 [B,*,C] 형식을 기대하므로 1D/2D도 [B,H,1]로 승격
+            if t.dim() == 1:          # [B]
+                t1 = t.view(t.size(0), 1, 1)
+                out = self.model.revin_layer(t1, 'denorm')  # [B,1,1]
+                return out.view(t.size(0))
+            if t.dim() == 2:          # [B,H]
+                t1 = t.unsqueeze(-1)  # [B,H,1]
+                out = self.model.revin_layer(t1, 'denorm')  # [B,H,1]
+                return out.squeeze(-1)
+            if t.dim() == 3 and t.size(-1) in (1, 3):  # [B,H,1] or [B,H,3]
+                if t.size(-1) == 1:
+                    out = self.model.revin_layer(t, 'denorm')  # [B,H,1]
+                    return out.squeeze(-1)
+                outs = []
+                for i in range(t.size(-1)):
+                    ti = t[..., i].unsqueeze(-1)              # [B,H,1]
+                    oi = self.model.revin_layer(ti, 'denorm') # [B,H,1]
+                    outs.append(oi.squeeze(-1))
+                return torch.stack(outs, dim=-1)              # [B,H,3]
+            # 기타 형상은 그대로 시도
+            return self.model.revin_layer(t, 'denorm')
+
+        if isinstance(y_any, dict):
+            y_any = dict(y_any)  # shallow copy
+            if "point" in y_any:
+                y_any["point"] = _denorm_tensor(y_any["point"])
+            if "q" in y_any:
+                y_any["q"] = _denorm_tensor(y_any["q"])
+            return y_any
+        return _denorm_tensor(y_any)
+
+    # ---------- public: forecasting ----------
+    @torch.no_grad()
+    def forecast_DMS_to_IMS(
+        self,
+        x_init: Optional[torch.Tensor] = None,   # 호환용(기존 유틸이 x_init=로 호출)
+        *,
+        x: Optional[torch.Tensor] = None,        # 호환용(다른 호출부에서 x=로 넘길 수 있음)
+        horizon: Optional[int] = None,
+        device: Optional[torch.device] = None,
+        extend: str = "ims",                    # {'ims','error'}
+        context_policy: str = "once",           # {'once','per_step','off'}
+        y_true: Optional[torch.Tensor] = None,  # (정규화 공간 기준) Teacher Forcing 타깃
+        teacher_forcing_ratio: float = 0.0,
+
+        # 안정화 토글 & 파라미터 (정규화 공간에서 적용)
+        use_winsor: bool = False,
+        use_multi_guard: bool = False,
+        use_dampen: bool = False,
+        winsor_q: tuple = (0.05, 0.95),
+        winsor_mul: float = 4.0,
+        winsor_growth: float = 3.0,
+        max_step_up: float = 0.10,
+        max_step_down: float = 0.40,
+        damp: float = 0.5,
+    ) -> torch.Tensor:
+        """
+        DMS 한 번으로 Hm 구간을 만들고, H>Hm이면 IMS로 초과 구간을 생성한다.
+
+        입력:
+          - x_init 또는 x 중 하나를 필수로 전달 (둘 다 주면 x_init 우선)
+          - 입력 텐서는 '원시 스케일(raw)'
+
+        핵심:
+          - 모델은 내부 RevIN.norm을 수행 → 입력은 항상 raw.
+          - 예측 y는 정규화 공간 → 가드/윈저/댐핑은 정규화 공간에서 수행.
+          - 슬라이딩을 위해 스텝별로 y_step_n을 denorm하여 x_raw에 붙인다.
+          - 최종 반환 y_hat은 raw.
+        """
+        # ---- 입력 통합 ----
+        x_in = x_init if x_init is not None else x
+        if x_in is None:
+            raise TypeError("forecast_DMS_to_IMS requires 'x_init' (preferred) or 'x'.")
+
         was_training = self.model.training
         self.model.eval()
 
         device = device or next(self.model.parameters()).device
-        x = x_init.to(device).float().clone()
-        if x.dim() == 2:
-            x = x.unsqueeze(-1)  # [B,L] -> [B,L,1]
-        B = x.size(0)
+        x_raw = x_in.to(device).float().clone()
+        if x_raw.dim() == 2:
+            x_raw = x_raw.unsqueeze(-1)  # [B,L] -> [B,L,1]
+        B, L, C = x_raw.shape
 
         # TTM context
-        if (self.ttm is not None) and (context_policy in ('once', 'per_step')):
-            if context_policy == 'once':
-                self.ttm.add_context(self._context_features(x))
-
-        # --- Hm probe (exo 필수 모델도 안전하게) ---
-        try:
-            Hm = self._call_model(x, B).size(1)
-        except Exception:
-            # exo가 필요한 모델일 수 있으므로 exo 포함 호출로 추정
-            H_guess = int(getattr(self.model, 'horizon',
-                                  getattr(self.model, 'output_horizon', 120)))
-            Hm = self._call_with_exo(x, B, H_guess, step_offset=0).size(1)
-
-        H = int(horizon)
-        stride = max(1, int(block_stride))
-
-        # 첫 블록(미래 exo 포함)
-        y_block0 = self._call_with_exo(x, B, Hm, step_offset=0)  # [B,Hm]
-
-        pred_sum = torch.zeros(B, H, device=device)
-        pred_cnt = torch.zeros(B, H, device=device)
-
-        # 블록 시작 인덱스들(0..H-Hm, stride 간격) — H<Hm이면 starts=[0]
-        if H >= Hm:
-            starts = list(range(0, H - Hm + 1, stride))
-        else:
-            starts = [0]
-
-        # Block loop
-        for bi, b_start in enumerate(starts):
-            if (self.ttm is not None) and (context_policy == 'per_step'):
-                self.ttm.add_context(self._context_features(x))
-
-            # 첫 블록 재활용, 이후는 step_offset=b_start로 DMS 호출
-            y_block = y_block0 if bi == 0 else self._call_with_exo(x, B, Hm, step_offset=b_start)
-
-            # 누적/카운트
-            max_t = min(Hm, H - b_start)
-            pred_sum[:, b_start:b_start + max_t] += y_block[:, :max_t]
-            pred_cnt[:, b_start:b_start + max_t] += 1.0
-
-            # 다음 블록을 위해 입력 윈도우 전진
-            if bi < len(starts) - 1:
-                advance = starts[bi + 1] - starts[bi]  # 보폭(= stride)
-                advance = max(1, advance)
-
-                # y_block의 앞쪽 advance개를 순서대로 사용해 한 스텝씩 전진
-                for s in range(advance):
-                    hist = x[:, :, self.target_channel]  # [B,L]
-                    last = hist[:, -1]
-                    y_step = y_block[:, s]  # 해당 시점의 1-step 예측
-
-                    if use_winsor:
-                        y_step = _winsorize_clamp(hist, y_step,
-                                                  nonneg=True, clip_q=winsor_q,
-                                                  clip_mul=winsor_mul, max_growth=winsor_growth)
-                    if use_multi_guard:
-                        y_step = _guard_multiplicative(last, y_step,
-                                                       max_step_up=max_step_up,
-                                                       max_step_down=max_step_down)
-                    if use_dampen:
-                        # 블록 진행도에 따른 가중(선형): bi 기준으로 완만히 증가
-                        w = float(damp_min + (damp_max - damp_min) *
-                                  (bi / max(1, len(starts) - 1)))
-                        y_step = _dampen_to_last(last, y_step, damp=w)
-
-                    x = _prepare_next_input(x, y_step,
-                                            target_channel=self.target_channel,
-                                            fill_mode=self.fill_mode)
-
-        y_hat = pred_sum / torch.clamp(pred_cnt, min=1.0)
-
-        if was_training:
-            self.model.train()
-        return y_hat
-
-    # ---------- DMS + (필요시) IMS 확장 ----------
-    @torch.no_grad()
-    def forecast_DMS_to_IMS(self,
-                            x_init: torch.Tensor,
-                            horizon: Optional[int] = None,
-                            device: Optional[torch.device] = None,
-                            extend: str = "ims",  # "ims" | "error"
-                            context_policy: str = "once",
-                            y_true: Optional[torch.Tensor] = None,
-                            teacher_forcing_ratio: float = 0.0,
-                            # 안정화 토글 & 파라미터
-                            use_winsor: bool = True,
-                            use_multi_guard: bool = False,  # DMS 본구간은 보통 끔(원하면 켜기)
-                            use_dampen: bool = True,
-                            winsor_q: tuple = (0.05, 0.95),
-                            winsor_mul: float = 4.0,
-                            winsor_growth: float = 3.0,
-                            max_step_up: float = 0.10,
-                            max_step_down: float = 0.40,
-                            damp: float = 0.5) -> torch.Tensor:
-        """
-        DMS 한 번으로 Hm까지 생성하고, horizon>Hm 이면 IMS로 이어붙임.
-        future_exo_cb가 필요한 모델도 안전하게 Hm을 추정해 동작.
-        """
-        was_training = self.model.training
-        self.model.eval()
-
-        device = device or next(self.model.parameters()).device
-        x = x_init.to(device).float().clone()
-        if x.dim() == 2:
-            x = x.unsqueeze(-1)  # [B,L] -> [B,L,1]
-        B = x.size(0)
-
-        # 0) TTM context
         if (self.ttm is not None) and (context_policy in ("once", "per_step")):
             if context_policy == "once":
-                self.ttm.add_context(self._context_features(x))
+                self.ttm.add_context(self._context_features(x_raw))
 
-        # 1) Hm probe (exo 없이 먼저 시도, 실패 시 exo 포함 시도로 백업)
+        # 모델 출력 길이 Hm 추정 (exo 없이 → 실패 시 exo 포함)
         def _probe_hm_safe() -> int:
             try:
-                return self._call_model(x, B).size(1)
+                return self._call_model(x_raw, B).size(1)
             except Exception:
-                H_guess = int(getattr(self.model, "horizon",
-                                      getattr(self.model, "output_horizon", 120)))
-                return self._call_with_exo(x, B, H_guess, step_offset=0).size(1)
+                H_guess = self._get_h_hint() or 120
+                return self._call_with_exo(x_raw, B, H_guess, step_offset=0).size(1)
 
         Hm = _probe_hm_safe()
-        H = Hm if horizon is None else int(horizon)
+        H = int(horizon) if horizon is not None else Hm
 
-        # 2) DMS 1회 (미래 exo 포함) → y_block:[B,Hm]
-        y_block = self._call_with_exo(x, B, Hm, step_offset=0)
+        # DMS 본블록(정규화 공간)
+        y_block_n = self._call_with_exo(x_raw, B, Hm, step_offset=0)  # [B,Hm] (normalized)
 
-        outputs = []
+        if DEBUG_FCAST:
+            print(f"[FCAST-DBG] DMS block: Hm={y_block_n.size(1)}, "
+                  f"var(Hm)={_tvar(y_block_n):.6g}, first5={_tfirst5(y_block_n)}")
+
+        outputs_raw = []
         use_tf = (y_true is not None) and (teacher_forcing_ratio > 0.0)
         if use_tf:
-            y_true = y_true.to(device).float()
+            y_true = y_true.to(device).float()  # 정규화 공간 기준이라고 가정
 
-        # 3) 본구간: min(Hm, H) 만큼 스텝별 취득(안정화/TF 적용)
+        # 본구간: min(Hm, H) 스텝 공동 루프
         use_len = min(Hm, H)
         for t in range(use_len):
-            if (self.ttm is not None) and (context_policy == "per_step"):
-                self.ttm.add_context(self._context_features(x))
-
-            if use_tf and (t < (y_true.shape[1] if y_true.dim() > 1 else 0)) and \
-                    (torch.rand(1).item() < teacher_forcing_ratio):
-                y_step = y_true[:, t]
-            else:
-                hist = x[:, :, self.target_channel]
-                last = hist[:, -1]
-                y_step = y_block[:, t]
-
-                if use_winsor:
-                    y_step = _winsorize_clamp(hist, y_step,
-                                              nonneg=True, clip_q=winsor_q,
-                                              clip_mul=winsor_mul, max_growth=winsor_growth)
-                if use_multi_guard:
-                    y_step = _guard_multiplicative(last, y_step,
-                                                   max_step_up=max_step_up,
-                                                   max_step_down=max_step_down)
-                if use_dampen:
-                    y_step = _dampen_to_last(last, y_step, damp=damp)
-
-            outputs.append(y_step.unsqueeze(1))
-            x = _prepare_next_input(x, y_step,
-                                    target_channel=self.target_channel,
-                                    fill_mode=self.fill_mode)
-
-        # 4) H <= Hm 이면 바로 반환
-        if H <= Hm:
-            y_hat = torch.cat(outputs, dim=1)  # [B,H]
-            if was_training:
-                self.model.train()
-            return y_hat
-
-        # 5) H > Hm: IMS로 초과 구간 생성
-        if extend not in ("ims", "error"):
-            raise ValueError("extend must be 'ims' or 'error'")
-        if extend == "error":
-            raise ValueError(f"horizon ({H}) > model_output ({Hm}). "
-                             f"Set extend='ims' to extend autoregressively.")
-
-        remaining = H - use_len
-        for t in range(remaining):
-            if (self.ttm is not None) and (context_policy == "per_step"):
-                self.ttm.add_context(self._context_features(x))
-
-            # step_offset = 이미 생성한 길이(use_len) + IMS의 상대 step t
-            y_full = self._call_with_exo(x, B, Hm, step_offset=(use_len + t))
-            y_raw = y_full[:, 0]
-
-            hist = x[:, :, self.target_channel]
-            last = hist[:, -1]
-            y_step = y_raw
-
-            if use_winsor:
-                y_step = _winsorize_clamp(hist, y_step,
-                                          nonneg=True, clip_q=winsor_q,
-                                          clip_mul=winsor_mul, max_growth=winsor_growth)
-            if use_multi_guard:
-                y_step = _guard_multiplicative(last, y_step,
-                                               max_step_up=max_step_up,
-                                               max_step_down=max_step_down)
-            if use_dampen:
-                y_step = _dampen_to_last(last, y_step, damp=damp)
-
-            outputs.append(y_step.unsqueeze(1))
-            x = _prepare_next_input(x, y_step,
-                                    target_channel=self.target_channel,
-                                    fill_mode=self.fill_mode)
-
-        y_hat = torch.cat(outputs, dim=1)  # [B,H]
-
-        if was_training:
-            self.model.train()
-        return y_hat
-
-
-class IMSForecaster:
-    """
-    Titan/LMM 계열을 위한 IMS(autoregressive) 예측기 (+미래 exo 주입/TTM/안정화 토글).
-    - future_exo_cb(start_idx:int, H:int) -> Tensor(H, exo_dim)
-    - global_t0: 예측 시작의 '절대 인덱스' (파트/시계열마다 다르게 세팅 권장)
-    """
-
-    def __init__(self,
-                 model: torch.nn.Module,
-                 target_channel: int = 0,
-                 fill_mode: str = "copy_last",
-                 lmm_mode: Optional[str] = None,
-                 predict_fn: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
-                 ttm: Optional[object] = None,
-                 future_exo_cb: Optional[Callable[[int, int], torch.Tensor]] = lambda s, h: make_calendar_exo(s, h, period=12)):
-        self.model = model
-        self.target_channel = target_channel
-        self.fill_mode = fill_mode
-        self.lmm_mode = lmm_mode
-        self.predict_fn = predict_fn
-        self.ttm = ttm
-
-        # 달력/외생 피처 콜백 (예: make_calendar_exo)
-        self.future_exo_cb = future_exo_cb
-        self.global_t0 = 0  # 호출 전에 "예측 시작 절대 인덱스"로 세팅하세요.
-
-    @torch.no_grad()
-    def _context_features(self, x: torch.Tensor) -> torch.Tensor:
-        if hasattr(self.model, "encoder") and hasattr(self.model.encoder, "input_proj"):
-            return self.model.encoder.input_proj(x)
-        return x
-
-    def warmup(self,
-               x_warm: torch.Tensor,
-               y_warm: Optional[torch.Tensor] = None,
-               steps: int = 1,
-               add_context: bool = True,
-               adapt: bool = True) -> None:
-        if self.ttm is None:
-            return
-        if add_context:
-            x_ctx = self._context_features(x_warm)
-            self.ttm.add_context(x_ctx)
-            if adapt and (y_warm is not None):
-                _ = self.ttm.adapt(x_warm, y_warm, steps=steps)
-
-    def _normalize_out(self, y_full: torch.Tensor, B: int) -> torch.Tensor:
-        # 출력 형상 정규화 → [B, H]
-        if y_full.dim() == 1:
-            y_full = y_full.view(B, -1)
-        elif y_full.dim() == 2:
-            pass
-        elif y_full.dim() == 3:
-            if y_full.size(1) == 1:
-                y_full = y_full[:, 0, :]
-            elif y_full.size(-1) == 1:
-                y_full = y_full[:, :, 0]
-            else:
-                y_full = y_full.reshape(B, -1)
-        else:
-            y_full = y_full.reshape(B, -1)
-        return y_full
-
-    def _call_model(self, x: torch.Tensor, B: int) -> torch.Tensor:
-        if self.predict_fn is not None:
-            y_full = self.predict_fn(x)
-        else:
-            try:
-                y_full = self.model(x)
-            except TypeError:
-                y_full = self.model(x, mode=(self.lmm_mode or 'eval'))
-        return self._normalize_out(y_full, B)
-
-    def _try_model_call(self, x, future_exo, B):
-        """
-        모델이 future_exo / mode를 어떤 시그니처로 받는지 몰라도 안전하게 시도.
-        (x, future_exo, mode) → (x, future_exo) → (x, mode) → (x)
-        """
-        try:
-            return self.model(x, future_exo=future_exo, mode=(self.lmm_mode or "eval"))
-        except TypeError:
-            pass
-        try:
-            return self.model(x, future_exo=future_exo)
-        except TypeError:
-            pass
-        try:
-            return self.model(x, mode=(self.lmm_mode or "eval"))
-        except TypeError:
-            pass
-        return self.model(x)
-
-    def _call_with_exo(self, x: torch.Tensor, B: int, Hm: int, step_offset: int) -> torch.Tensor:
-        """
-        Hm 길이의 예측을 하되, future_exo_cb가 있으면 step_offset부터의 exo를 주입.
-        """
-        if self.future_exo_cb is None:
-            return self._call_model(x, B)
-
-        # 미래 외생 피처 만들기
-        t0 = self.global_t0 + step_offset
-        exo = self.future_exo_cb(t0, Hm)  # (Hm, exo_dim)
-        exo = exo.to(x.device).unsqueeze(0).expand(B, -1, -1)  # (B,Hm,exo_dim)
-
-        y_full = self._try_model_call(x, exo, B)
-        return self._normalize_out(y_full, B)
-
-    @torch.no_grad()
-    def forecast(self,
-                 x_init: torch.Tensor,
-                 horizon: int,
-                 device: Optional[torch.device] = None,
-                 y_true: Optional[torch.Tensor] = None,
-                 teacher_forcing_ratio: float = 0.0,
-                 context_policy: str = 'once',  # 'none' | 'once' | 'per_step'
-                 # 안정화 토글
-                 use_winsor: bool = True,
-                 use_multi_guard: bool = True,
-                 use_dampen: bool = True,
-                 winsor_q: tuple = (0.05, 0.95),
-                 winsor_mul: float = 4.0,
-                 winsor_growth: float = 3.0,
-                 max_step_up: float = 0.10,
-                 max_step_down: float = 0.30,
-                 damp: float = 0.5
-                 ) -> torch.Tensor:
-        """
-        Returns
-        - y_hat: [B, horizon]
-        """
-        was_training = self.model.training
-        self.model.eval()
-
-        device = device or next(self.model.parameters()).device
-        x = x_init.to(device).float().clone()
-        if x.dim() == 2:
-            x = x.unsqueeze(-1)  # [B, L] -> [B, L, 1]
-        B = x.size(0)
-
-        # TTM: 시작 시점 메모리 주입
-        if (self.ttm is not None) and (context_policy in ('once', 'per_step')):
-            if context_policy == 'once':
-                x_ctx = self._context_features(x)
-                self.ttm.add_context(x_ctx)
-
-        # 모델의 출력 길이(Hm) probe (exo 없이 한 번)
-        y_probe = self._call_model(x, B)      # [B, Hm]
-        Hm = y_probe.size(1)
-
-        outputs = []
-        use_tf = (y_true is not None) and (teacher_forcing_ratio > 0.0)
-        if use_tf:
-            y_true = y_true.to(device).float()
-
-        for t in range(horizon):
-
             # per-step TTM
-            if (self.ttm is not None) and (context_policy == 'per_step'):
-                x_ctx = self._context_features(x)
-                self.ttm.add_context(x_ctx)
+            if (self.ttm is not None) and (context_policy == "per_step"):
+                self.ttm.add_context(self._context_features(x_raw))
 
-            # 1) 모델 호출 (미래 exo 포함)
-            y_full = self._call_with_exo(x, B, Hm, step_offset=t)  # [B, Hm]
-            y_raw = y_full[:, 0]                                   # 첫 스텝만 사용
+            # 정규화 공간에서의 원시 예측
+            y_raw_n = y_block_n[:, t]  # [B] normalized
+            if DEBUG_FCAST and t < 5:
+                print(f"[FCAST-DBG] DMS step={t}: raw_n={float(y_raw_n[0]):.6g}")
 
-            # 2) 한 스텝 결정: TF or 안정화 예측
-            if use_tf and (t < y_true.shape[1]) and (torch.rand(1).item() < teacher_forcing_ratio):
-                y_step = y_true[:, t]
+            # 정규화 공간에서의 안정화/TF
+            if use_tf and (t < (y_true.shape[1] if y_true.dim() > 1 else 0)) \
+               and (torch.rand(1).item() < teacher_forcing_ratio):
+                y_step_n = y_true[:, t]  # teacher forcing (normalized)
             else:
-                hist = x[:, :, self.target_channel]   # [B, L]
-                last = hist[:, -1]
+                # 정규화 히스토리를 만들기 위해 현재 raw x를 한시적으로 norm
+                # (모델 내부에서도 norm하지만, 여기서는 히스토리 통계용)
+                if hasattr(self.model, "revin_layer"):
+                    x_n_tmp = self.model.revin_layer(x_raw, "norm")  # 통계 업데이트(현 시점)
+                    hist_n = x_n_tmp[:, :, self.target_channel]
+                else:
+                    # RevIN이 없으면 raw에서 직접 사용(덜 안정적일 수 있음)
+                    hist_n = x_raw[:, :, self.target_channel]
+                last_n = hist_n[:, -1]
 
-                y_step = y_raw
+                y_step_n = y_raw_n
                 if use_winsor:
-                    y_step = _winsorize_clamp(hist, y_step,
-                                              nonneg=True, clip_q=winsor_q,
-                                              clip_mul=winsor_mul, max_growth=winsor_growth)
+                    y_step_n = _winsorize_clamp(
+                        hist_n, y_step_n,
+                        nonneg=True, clip_q=winsor_q,
+                        clip_mul=winsor_mul, max_growth=winsor_growth
+                    )
                 if use_multi_guard:
-                    y_step = _guard_multiplicative(last, y_step,
-                                                  max_step_up=max_step_up,
-                                                  max_step_down=max_step_down)
+                    y_step_n = _guard_multiplicative(
+                        last_n, y_step_n,
+                        max_step_up=max_step_up, max_step_down=max_step_down
+                    )
                 if use_dampen:
-                    y_step = _dampen_to_last(last, y_step, damp=damp)
+                    y_step_n = _dampen_to_last(last_n, y_step_n, damp=damp)
 
-            outputs.append(y_step.unsqueeze(1))  # [B,1]
+            # 다음 입력을 위해 raw로 변환하여 슬라이딩
+            y_step_raw = self._denorm_like_revin(y_step_n)  # [B] raw
+            if isinstance(y_step_raw, dict):
+                # 이 경로는 사실상 발생하지 않음(여기선 텐서만 옴). 안전장치.
+                y_step_raw = y_step_raw.get("point", None)
+                if y_step_raw is None:
+                    raise RuntimeError("denorm result is not a tensor.")
+            outputs_raw.append(y_step_raw.unsqueeze(1))
+            x_raw = _prepare_next_input(
+                x_raw, y_step_raw,
+                target_channel=self.target_channel,
+                fill_mode=self.fill_mode
+            )
 
-            # 3) 입력 윈도우 업데이트
-            x = _prepare_next_input(x, y_step,
-                                    target_channel=self.target_channel,
-                                    fill_mode=self.fill_mode)
+        # H > Hm: IMS 구간
+        if H > Hm:
+            if extend not in ("ims", "error"):
+                raise ValueError("extend must be 'ims' or 'error'")
+            if extend == "error":
+                raise ValueError(f"horizon ({H}) > model_output ({Hm}). "
+                                 f"Set extend='ims' to extend autoregressively.")
 
-        y_hat = torch.cat(outputs, dim=1)  # [B, horizon]
+            remaining = H - use_len
+            for t in range(remaining):
+                if (self.ttm is not None) and (context_policy == "per_step"):
+                    self.ttm.add_context(self._context_features(x_raw))
+
+                # 이미 생성한 길이(use_len) + IMS 상대 step(t)만큼 step_offset 적용
+                y_full_n = self._call_with_exo(x_raw, B, Hm, step_offset=(use_len + t))  # [B,Hm] normalized
+                y_raw_n = y_full_n[:, 0]  # 다음 한 스텝만 사용
+
+                if DEBUG_FCAST and t < 5:
+                    print(f"[FCAST-DBG] IMS step={t}: raw_n={float(y_raw_n[0]):.6g}")
+
+                # 안정화용 정규화 히스토리
+                if hasattr(self.model, "revin_layer"):
+                    x_n_tmp = self.model.revin_layer(x_raw, "norm")  # 통계 업데이트(현 시점)
+                    hist_n = x_n_tmp[:, :, self.target_channel]
+                else:
+                    hist_n = x_raw[:, :, self.target_channel]
+                last_n = hist_n[:, -1]
+
+                y_step_n = y_raw_n
+                if use_winsor:
+                    y_step_n = _winsorize_clamp(
+                        hist_n, y_step_n,
+                        nonneg=True, clip_q=winsor_q,
+                        clip_mul=winsor_mul, max_growth=winsor_growth
+                    )
+                if use_multi_guard:
+                    y_step_n = _guard_multiplicative(
+                        last_n, y_step_n,
+                        max_step_up=max_step_up, max_step_down=max_step_down
+                    )
+                if use_dampen:
+                    y_step_n = _dampen_to_last(last_n, y_step_n, damp=damp)
+
+                # raw로 변환하여 슬라이딩
+                y_step_raw = self._denorm_like_revin(y_step_n)
+                if isinstance(y_step_raw, dict):
+                    y_step_raw = y_step_raw.get("point", None)
+                    if y_step_raw is None:
+                        raise RuntimeError("denorm result is not a tensor.")
+                outputs_raw.append(y_step_raw.unsqueeze(1))
+                x_raw = _prepare_next_input(
+                    x_raw, y_step_raw,
+                    target_channel=self.target_channel,
+                    fill_mode=self.fill_mode
+                )
+
+        # [B,H] raw 예측을 반환
+        y_hat = torch.cat(outputs_raw, dim=1)  # [B, H] (raw)
+
+        if DEBUG_FCAST:
+            print(f"[FCAST-DBG] DONE: H={y_hat.size(1)}, var={_tvar(y_hat):.6g}, first5={_tfirst5(y_hat)}")
 
         if was_training:
             self.model.train()
         return y_hat
 
 
-def evaluate(model, loader, device='cpu'):
-    model.to(device)
-    model.eval()
-
-    preds = []
-    part_ids = []
-
-    with torch.no_grad():
-        for batch in loader:
-            x, part = batch  # inference에서는 y가 없을 수 있음
-            x = x.to(device)
-
-            pred = model(x)
-            # pred = model.revin_layer(pred, 'denorm')
-            preds.append(pred.cpu())
-            # trues는 없음 → 추론 모드에서는 실제 y를 모를 수 있으니 skip
-            part_ids.extend(part)
-
-    all_preds = torch.cat(preds, dim=0)
-    return all_preds, part_ids
-
-
-def evaluate_with_truth(model, loader, device='cpu'):
-    model.to(device)
-    model.eval()
-
-    preds, trues, part_ids = [], [], []
-
-    with torch.no_grad():
-        for batch in loader:
-            x, y, part = batch
-            x, y = x.to(device), y.to(device)
-
-            pred = model(x)
-            pred = pred.clone()  # ✅ 복사
-            # pred = model.revin_layer(pred, 'denorm')
-            pred = pred.reshape(pred.shape[0], -1, 1).cpu()
-
-            y = y.reshape(y.shape[0], -1, 1).cpu()
-
-            preds.append(pred)
-            trues.append(y)
-            part_ids.extend(part)
-
-    return torch.cat(preds, dim=0), torch.cat(trues, dim=0), part_ids
+# -------------------- 사용 예시 (주석) --------------------
+# model = YourModel(...)  # 내부에서 RevIN.norm 수행, denorm은 하지 않음
+# forecaster = DMSForecaster(model, target_channel=0, fill_mode='zeros')
+# x_init_raw = ...  # [B,L,C] (원시 스케일)
+# y_hat = forecaster.forecast_DMS_to_IMS(
+#     x_init=x_init_raw,       # 또는 x=x_init_raw
+#     horizon=120,
+#     extend='ims',
+#     use_winsor=True,
+#     use_multi_guard=True,
+#     use_dampen=True,
+#     winsor_q=(0.05, 0.95),
+#     winsor_mul=4.0,
+#     winsor_growth=2.0,
+#     max_step_up=0.10,
+#     max_step_down=0.60,
+#     damp=0.4
+# )

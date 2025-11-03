@@ -68,7 +68,7 @@ class BaseModel(nn.Module):
                 out_device=out.device
             )  # (B, H)
             out = out + ex
-        out = self.revin(out, 'denorm')
+        # out = self.revin(out, 'denorm')
 
         return out  # (B, H)
 
@@ -148,7 +148,7 @@ class FeatureModel(nn.Module):
                 out_device=out.device
             )  # (B, H)
             out = out + ex
-        out = self.revin(out, 'denorm')
+        # out = self.revin(out, 'denorm')
         return out  # (B, H)
 # -------------------------
 # Simple PatchMixer + Decomposition Quantile Head
@@ -176,7 +176,7 @@ class QuantileModel(nn.Module):
 
         H = horizon if horizon is not None else base_configs.horizon
         self.horizon = int(H)
-        print(self.horizon)
+
         # 1) Backbone: 전역 벡터 [B, D]
         self.backbone = MultiScalePatchMixerBackbone(
             base_configs=base_configs,
@@ -283,8 +283,8 @@ class QuantileModel(nn.Module):
             )  # (B, H)
             q = q + ex.unsqueeze(1)          # (B, 3, H)
 
-        # 5) RevIN 역정규화 (분위수별 슬라이스)
-        q = self._denorm_quantiles_with_revin(q)  # (B, 3, H)
+        # # 5) RevIN 역정규화 (분위수별 슬라이스)
+        # q = self._denorm_quantiles_with_revin(q)  # (B, 3, H)
 
         return q
 

@@ -6,67 +6,6 @@ import copy
 import torch
 import torch.nn as nn
 
-from modeling_module.models.common_layers.RevIN import RevIN
-
-
-# -------------------------
-# PatchMixer Layer
-# -------------------------
-# class PatchMixerLayer(nn.Module):
-#     """
-#     논문 기반 Depthwise + Pointwise Patch Mixer Layer
-#     입력: (B, patch_num, d_model)
-#     내부 Conv는 d_model 축 기준 depthwise
-#     """
-#     def __init__(self,
-#                  patch_num: int,
-#                  d_model: int,
-#                  kernel_size: int = 5,
-#                  dropout: float = 0.0):
-#         super().__init__()
-#
-#         self.patch_num = patch_num
-#         self.d_model = d_model
-#
-#         # Token Mixing (feature 축 기준 depthwise)
-#         self.token_mixer = nn.Sequential(
-#             nn.Conv1d(
-#                 in_channels=d_model,
-#                 out_channels=d_model,
-#                 kernel_size=kernel_size,
-#                 groups=d_model,     # depthwise conv
-#                 padding="same"
-#             ),
-#             nn.GELU(),
-#             nn.BatchNorm1d(d_model)
-#         )
-#
-#         # Channel Mixing (1x1 conv)
-#         self.channel_mixer = nn.Sequential(
-#             nn.Conv1d(d_model, d_model, kernel_size=1),
-#             nn.GELU(),
-#             nn.BatchNorm1d(d_model)
-#         )
-#
-#         self.dropout = nn.Dropout(dropout)
-#
-#     def forward(self, x: torch.Tensor) -> torch.Tensor:
-#         """
-#         x: (B, patch_num, d_model)
-#         """
-#         # permute to (B, d_model, patch_num)
-#         x = x.permute(0, 2, 1)
-#         res = x
-#
-#         # depthwise conv over patch axis
-#         x = self.token_mixer(x)
-#         x = self.channel_mixer(x)
-#         x = self.dropout(x)
-#
-#         # residual + back to (B, patch_num, d_model)
-#         x = (x + res).permute(0, 2, 1)
-#         return x
-
 class PatchMixerLayer(nn.Module):
     """
     입력: (B*, D=d_model, A=patch_num)
@@ -223,11 +162,6 @@ class PatchMixerBackbone(nn.Module):
 
         return x # (B, patch_repr_dim)
 
-    def inverse_norm(self, y: torch.Tensor) -> torch.Tensor:
-        """필요 시 예측치(또는 재구성치)에 대한 RevIN 역변환 지원용 헬퍼"""
-        if not self.revin:
-            return y
-        return self.revin_layer(y, 'denorm')
 
 class MultiScalePatchMixerBackbone(nn.Module):
     """
@@ -249,9 +183,6 @@ class MultiScalePatchMixerBackbone(nn.Module):
         self.branches = nn.ModuleList()
         self.projs = nn.ModuleList()
 
-        # 공유 RevIN: 입력을 한 번만 정규화
-        # self.revin = RevIN(base_configs.enc_in, affine = affine, subtract_last = subtract_last)
-
         for (pl, st, ks) in patch_cfgs:
             cfg = copy.deepcopy(base_configs)
             cfg.patch_len = pl
@@ -259,7 +190,6 @@ class MultiScalePatchMixerBackbone(nn.Module):
             cfg.mixer_kernel_size = ks
             branch = PatchMixerBackbone(cfg, revin = False) # 내부 RevIN 비활성화
             self.branches.append(branch)
-            # self.projs.append(nn.Linear(branch.patch_repr_dim, per_branch_dim))
             self.projs.append(nn.LazyLinear(per_branch_dim))
 
         if fusion == 'concat':
@@ -276,7 +206,6 @@ class MultiScalePatchMixerBackbone(nn.Module):
         """
         x: (B, L, N) -> (B, fused_dim)
         """
-        # x = self.revin(x, 'norm')
         reps = []
         gates = []
         for branch, proj in zip(self.branches, self.projs):

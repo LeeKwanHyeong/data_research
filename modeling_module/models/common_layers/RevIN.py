@@ -1,94 +1,138 @@
+# RevIN.py
 import torch
 import torch.nn as nn
 
 class RevIN(nn.Module):
-    def __init__(self, num_features: int, eps = 1e-5, affine = True, subtract_last = False):
-        """
-        Reversible Instance Normalization (RevIN)
-
-        Args:
-            num_features (int): 특성(feature)의 수 (마지막 차원 크기)
-            eps (float): 분산 안정화를 위한 작은 값
-            affine (bool): affine transform 적용 여부 (scale + bias)
-            subtract_last (bool): 평균 대신 마지막 시점 값을 기준으로 정규화할지 여부
-        """
-        super(RevIN, self).__init__()
-        self.num_features = num_features
-        self.eps = eps
-        self.affine = affine
-        self.subtract_last = subtract_last
+    """
+    Reversible Instance Normalization for time series
+    - x: [B, L, C] 가정 (배치, 길이, 채널)
+    - forward(mode='norm'): x를 정규화하고 μ,σ(또는 last)를 버퍼에 저장
+    - forward(mode='denorm'): 같은 forward 컨텍스트에서 복원
+    메모:
+      * 본 모듈은 "한 번의 forward 호출 내"에서 norm→denorm이 이어지는 사용을 권장합니다.
+      * μ,σ는 배치별·채널별 통계입니다.
+    """
+    def __init__(self, num_features: int, eps: float = 1e-5, affine: bool = True, subtract_last: bool = False):
+        super().__init__()
+        self.num_features = int(num_features)
+        self.eps = float(eps)
+        self.affine = bool(affine)
+        self.subtract_last = bool(subtract_last)
 
         if self.affine:
-            self._init_params() # learnable scale/bias 파라미터 초기화
+            self._init_params()
 
-    def forward(self, x, mode: str):
-        """
-        Args:
-            x (Tensor): 입력 tensor, shape = [B, L, C] 또는 [B, ..., C]
-            mode (str): 'norm' 또는 'denorm' (정규화 / 역정규화)
-
-        Returns:
-            Tensor: 변환된 tensor
-        """
-        if mode == 'norm':
-            self._get_statistics(x)
-            x = self._normalize(x)
-        elif mode == 'denorm':
-            x = self._denormalize(x)
-        else: raise NotImplementedError
-        return x
+        # forward('norm')에서 채워지고 forward('denorm')에서 사용
+        self._cached_mean = None  # [B,1,C]
+        self._cached_std  = None  # [B,1,C]
+        self._cached_last = None  # [B,1,C]
 
     def _init_params(self):
-        # 학습 가능한 스케일(가중치)과 바이어스 초기화
-        self.affine_weight = nn.Parameter(torch.ones(self.num_features))    # shape = [C]
-        self.affine_bias = nn.Parameter(torch.zeros(self.num_features))     # shape = [C]
+        self.affine_weight = nn.Parameter(torch.ones(self.num_features))  # [C]
+        self.affine_bias   = nn.Parameter(torch.zeros(self.num_features)) # [C]
 
-    def _get_statistics(self, x):
+    def _reduce_dims(self, x: torch.Tensor):
         """
-        평균과 표준편차 계산 (detach하여 역전파에는 영향 X)
-        - 평균: [B, 1, C]
-        - 표준편차: [B, 1, C]
+        x: [B, L, C] 혹은 [B, *, C] 라면, 시간/공간 축 전체에 대해 평균/표준편차를 구하도록
+        채널 직전 모든 축을 reduce 대상으로 잡습니다.
         """
-        dim2reduce = tuple(range(1, x.ndim-1))  # 시간축 등 모든 축을 평균
+        assert x.dim() >= 3 and x.size(-1) == self.num_features, \
+            f"Expected [..., C={self.num_features}] got {tuple(x.shape)}"
+        # 배치/채널을 제외한 모든 축을 reduce
+        dim2reduce = tuple(range(1, x.ndim - 1))
+        return dim2reduce
+
+    def _compute_stats(self, x: torch.Tensor):
         if self.subtract_last:
-            # 마지막 시점 값 사용 (예: forecasting에서 마지막 입력값 유지 시)
-            self.last = x[:, -1, :].unsqueeze(1)    # shape = [B, 1, C]
+            # 마지막 시점(축=-2)의 값을 빼는 설정
+            last = x.select(dim=-2, index=x.size(-2) - 1).unsqueeze(-2)  # [B,1,C]
+            mean = None
+            std  = None
+        else:
+            dim2reduce = self._reduce_dims(x)
+            mean = x.mean(dim=dim2reduce, keepdim=True)  # [B,1,C]
+            var  = x.var(dim=dim2reduce, keepdim=True, unbiased=False)
+            std  = torch.sqrt(var + self.eps)            # [B,1,C]
+            last = None
+        return mean, std, last
+
+    def _apply_affine(self, x: torch.Tensor):
+        if not self.affine:
+            return x
+        w = self.affine_weight.view(1, *([1] * (x.ndim - 2)), -1)  # [..., C]
+        b = self.affine_bias.view( 1, *([1] * (x.ndim - 2)), -1)
+        return x * w + b
+
+    def _inverse_affine(self, x: torch.Tensor):
+        if not self.affine:
+            return x
+        w = self.affine_weight.view(1, *([1] * (x.ndim - 2)), -1)
+        b = self.affine_bias.view( 1, *([1] * (x.ndim - 2)), -1)
+        return (x - b) / (w + 1e-12)
+
+    def forward(self, x: torch.Tensor, mode: str):
+        """
+        mode in {'norm', 'denorm'}
+        - 'norm': x[... , C] 기준으로 μ,σ(혹은 last)를 구해 정규화. 캐시에 저장.
+        - 'denorm': 직전 'norm'에서 계산된 캐시로 복원.
+        """
+        if mode == 'norm':
+            assert x.size(-1) == self.num_features, \
+                f"RevIN expected last dim C={self.num_features}, got {x.size(-1)}"
+            mean, std, last = self._compute_stats(x)
+            self._cached_mean = mean
+            self._cached_std  = std
+            self._cached_last = last
+
+            if self.subtract_last:
+                x_n = x - last  # [B,*,C]
+                x_n = self._apply_affine(x_n)
+            else:
+                x_n = (x - mean) / std
+                x_n = self._apply_affine(x_n)
+
+            return x_n
+
+        elif mode == 'denorm':
+            # 입력 y는 정규화 공간 값. 캐시가 존재해야 함.
+            if self.subtract_last:
+                assert self._cached_last is not None, "RevIN denorm: last cache missing. Call norm first in same forward."
+                y = self._inverse_affine(x)
+                y = y + self._cached_last
+            else:
+                assert (self._cached_mean is not None) and (self._cached_std is not None), \
+                    "RevIN denorm: mean/std cache missing. Call norm first in same forward."
+                y = self._inverse_affine(x)
+                y = y * self._cached_std + self._cached_mean
+            return y
 
         else:
-            self.mean = torch.mean(x, dim = dim2reduce, keepdim = True).detach()
+            raise ValueError("mode must be 'norm' or 'denorm'")
 
-        self.stdev = torch.sqrt(torch.var(x, dim = dim2reduce, keepdim = True, unbiased = False) + self.eps).detach()
-
-    def _normalize(self, x):
+    # ----- Utilities for model outputs (H may differ from L) -----
+    @torch.no_grad()
+    def denorm_like_channel(self, out: torch.Tensor, target_channel: int = 0) -> torch.Tensor:
         """
-        평균 또는 마지막 값을 기준으로 정규화 (instance-wise)
+        모델 출력(out)이 마지막 차원이 C가 아닐 수 있는 경우(예: [B,H] 또는 [B,H,Q])에
+        '타깃 채널'의 μ,σ (혹은 last)만 사용해 스칼라/벡터에 동일 스케일을 곱해 복원.
+        - out: [B,H] or [B,H,1] or [B,H,Q] ... (C와 무관한 텐서)
+        - 반환: 동일 shape, raw 공간
         """
-        x = x.clone()
+        B = out.size(0)
         if self.subtract_last:
-            x -= self.last
+            assert self._cached_last is not None
+            last = self._cached_last[:, :, target_channel:target_channel+1]  # [B,1,1]
+            # out의 shape에 맞게 broadcast
+            while last.dim() < out.dim():
+                last = last.expand(-1, -1, *([-1] * (last.dim() - 2)))
+            # [B,1,1] -> [B,H,1] 혹은 [B,H,Q]로 broadcast
+            last = last.expand(B, *( [out.size(d) for d in range(1, out.dim())] ))
+            y = out + last
         else:
-            x -= self.mean
-
-        x /= self.stdev # 정규화
-        if self.affine:
-            # affine transform 적용: x * γ + β
-            x *= self.affine_weight
-            x += self.affine_bias
-        return x
-
-    def _denormalize(self, x):
-        """
-        정규화된 입력에 대해 원래 스케일로 복원
-        """
-        x = x.clone()
-        if self.affine:
-            # affine 역변환
-            x -= self.affine_bias
-            x /= (self.affine_weight + self.eps * self.eps) # 안정성 확보
-        x = x * self.stdev  # 원래 스케일 복원
-        if self.subtract_last:
-            x += self.last
-        else:
-            x += self.mean
-
-        return x
+            assert (self._cached_mean is not None) and (self._cached_std is not None)
+            mean = self._cached_mean[:, :, target_channel:target_channel+1]  # [B,1,1]
+            std  = self._cached_std[:,  :, target_channel:target_channel+1]  # [B,1,1]
+            mean = mean.expand(B, *( [out.size(d) for d in range(1, out.dim())] ))
+            std  = std.expand( B, *( [out.size(d) for d in range(1, out.dim())] ))
+            y = out * std + mean
+        return y
