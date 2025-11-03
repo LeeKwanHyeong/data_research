@@ -305,38 +305,41 @@ class DMSForecaster:
         - dict({"point":[B,H], "q":[B,H,3]}) 형태도 지원
         """
         def _denorm_tensor(t: torch.Tensor) -> torch.Tensor:
-            if not hasattr(self.model, "revin_layer"):
+            if not hasattr(self.model, "revin"):
+                print('hasattr is not revin')
                 return t  # RevIN 미보유 모델: 원본 반환
 
             # 표준화: RevIN은 [B,*,C] 형식을 기대하므로 1D/2D도 [B,H,1]로 승격
             if t.dim() == 1:          # [B]
                 t1 = t.view(t.size(0), 1, 1)
-                out = self.model.revin_layer(t1, 'denorm')  # [B,1,1]
+                out = self.model.revin(t1, 'denorm')  # [B,1,1]
                 return out.view(t.size(0))
             if t.dim() == 2:          # [B,H]
                 t1 = t.unsqueeze(-1)  # [B,H,1]
-                out = self.model.revin_layer(t1, 'denorm')  # [B,H,1]
+                out = self.model.revin(t1, 'denorm')  # [B,H,1]
                 return out.squeeze(-1)
             if t.dim() == 3 and t.size(-1) in (1, 3):  # [B,H,1] or [B,H,3]
                 if t.size(-1) == 1:
-                    out = self.model.revin_layer(t, 'denorm')  # [B,H,1]
+                    out = self.model.revin(t, 'denorm')  # [B,H,1]
                     return out.squeeze(-1)
                 outs = []
                 for i in range(t.size(-1)):
                     ti = t[..., i].unsqueeze(-1)              # [B,H,1]
-                    oi = self.model.revin_layer(ti, 'denorm') # [B,H,1]
+                    oi = self.model.revin(ti, 'denorm') # [B,H,1]
                     outs.append(oi.squeeze(-1))
                 return torch.stack(outs, dim=-1)              # [B,H,3]
             # 기타 형상은 그대로 시도
-            return self.model.revin_layer(t, 'denorm')
+            return self.model.revin(t, 'denorm')
 
         if isinstance(y_any, dict):
+            print('y_any:: ', y_any)
             y_any = dict(y_any)  # shallow copy
             if "point" in y_any:
                 y_any["point"] = _denorm_tensor(y_any["point"])
             if "q" in y_any:
                 y_any["q"] = _denorm_tensor(y_any["q"])
             return y_any
+        print('final')
         return _denorm_tensor(y_any)
 
     # ---------- public: forecasting ----------
@@ -438,8 +441,8 @@ class DMSForecaster:
             else:
                 # 정규화 히스토리를 만들기 위해 현재 raw x를 한시적으로 norm
                 # (모델 내부에서도 norm하지만, 여기서는 히스토리 통계용)
-                if hasattr(self.model, "revin_layer"):
-                    x_n_tmp = self.model.revin_layer(x_raw, "norm")  # 통계 업데이트(현 시점)
+                if hasattr(self.model, "revin"):
+                    x_n_tmp = self.model.revin(x_raw, "norm")  # 통계 업데이트(현 시점)
                     hist_n = x_n_tmp[:, :, self.target_channel]
                 else:
                     # RevIN이 없으면 raw에서 직접 사용(덜 안정적일 수 있음)
@@ -496,8 +499,8 @@ class DMSForecaster:
                     print(f"[FCAST-DBG] IMS step={t}: raw_n={float(y_raw_n[0]):.6g}")
 
                 # 안정화용 정규화 히스토리
-                if hasattr(self.model, "revin_layer"):
-                    x_n_tmp = self.model.revin_layer(x_raw, "norm")  # 통계 업데이트(현 시점)
+                if hasattr(self.model, "revin"):
+                    x_n_tmp = self.model.revin(x_raw, "norm")  # 통계 업데이트(현 시점)
                     hist_n = x_n_tmp[:, :, self.target_channel]
                 else:
                     hist_n = x_raw[:, :, self.target_channel]

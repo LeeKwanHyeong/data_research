@@ -56,87 +56,87 @@ def  run_total_train_monthly(train_loader, val_loader, device = 'cuda', *, lookb
     )
     results['PatchMixer Quantile'] = best_pm_quantile
 
-    # ---------------- Titan (point + TTA) ----------------
-    ti_config = TitanConfigMonthly(
-        device = device,
-        lookback = lookback,
-        horizon = horizon,
-        loss_mode = 'point',
-        point_loss = 'huber'
-    )
-
-    ti_patch_config = TitanConfigPatchMonthly(
-        device = device,
-        lookback = lookback,
-        horizon = horizon,
-        loss_mode = 'point',
-        point_loss = 'huber'
-    )
-
-    ti_base = build_titan_base(ti_config)
-    ti_lmm = build_titan_lmm(ti_config)
-    ti_seq2seq = build_titan_seq2seq(ti_config)
-    ti_patch = build_titan_patch(ti_patch_config)
-
-    print('Titan Base')
-    best_ti_base = train_titan(
-        ti_base,
-        train_loader, val_loader,
-        lr = 1e-3, loss_mode = 'point', tta_steps = 3
-    )
-    results['Titan Base'] = best_ti_base
-
-    print('Titan LMM')
-    best_ti_lmm = train_titan(
-        ti_lmm,
-        train_loader, val_loader,
-        lr = 1e-3, loss_mode = 'point', tta_steps = 3
-    )
-    results['Titan LMM'] = best_ti_lmm
-
-    print('Titan Seq2Seq')
-    best_ti_seq2seq = train_titan(
-        ti_seq2seq,
-        train_loader, val_loader,
-        lr = 1e-3, loss_mode = 'point', tta_steps = 3
-    )
-    results['Titan Seq2Seq'] = best_ti_seq2seq
-
-    print('Titan Patch')
-    best_ti_patch = train_titan(
-        ti_patch,
-        train_loader, val_loader,
-        lr = 1e-3, loss_mode = 'point', tta_steps = 3
-    )
-    results['Titan Patch'] = best_ti_patch
-
-    # ---------------- PatchTST(Quantile + point) ----------------
-    pt_config = PatchTSTConfigMonthly(
-        device = device,
-        lookback=lookback,
-        horizon=horizon,
-        loss_mode = 'auto',
-        quantiles = (0.1, 0.5, 0.9)
-    )
-
-    pt_base = build_patchTST_base(pt_config)
-
-    print('PatchTST Base')
-    best_pt_base = train_patchtst(
-        pt_base,
-        train_loader, val_loader,
-        lr = 1e-3, loss_mode = 'auto', use_intermittent = True
-    )
-    results['PatchTST Base'] = best_pt_base
-
-
-    print('PatchTST Quantile')
-    best_pt_quantile = train_patchtst(
-        pt_base,
-        train_loader, val_loader,
-        lr = 1e-3, loss_mode = 'quantile', use_intermittent = True
-    )
-    results['PatchTST Quantile'] = best_pt_quantile
+    # # ---------------- Titan (point + TTA) ----------------
+    # ti_config = TitanConfigMonthly(
+    #     device = device,
+    #     lookback = lookback,
+    #     horizon = horizon,
+    #     loss_mode = 'point',
+    #     point_loss = 'huber'
+    # )
+    #
+    # ti_patch_config = TitanConfigPatchMonthly(
+    #     device = device,
+    #     lookback = lookback,
+    #     horizon = horizon,
+    #     loss_mode = 'point',
+    #     point_loss = 'huber'
+    # )
+    #
+    # ti_base = build_titan_base(ti_config)
+    # ti_lmm = build_titan_lmm(ti_config)
+    # ti_seq2seq = build_titan_seq2seq(ti_config)
+    # ti_patch = build_titan_patch(ti_patch_config)
+    #
+    # print('Titan Base')
+    # best_ti_base = train_titan(
+    #     ti_base,
+    #     train_loader, val_loader,
+    #     lr = 1e-3, loss_mode = 'point', tta_steps = 3
+    # )
+    # results['Titan Base'] = best_ti_base
+    #
+    # print('Titan LMM')
+    # best_ti_lmm = train_titan(
+    #     ti_lmm,
+    #     train_loader, val_loader,
+    #     lr = 1e-3, loss_mode = 'point', tta_steps = 3
+    # )
+    # results['Titan LMM'] = best_ti_lmm
+    #
+    # print('Titan Seq2Seq')
+    # best_ti_seq2seq = train_titan(
+    #     ti_seq2seq,
+    #     train_loader, val_loader,
+    #     lr = 1e-3, loss_mode = 'point', tta_steps = 3
+    # )
+    # results['Titan Seq2Seq'] = best_ti_seq2seq
+    #
+    # print('Titan Patch')
+    # best_ti_patch = train_titan(
+    #     ti_patch,
+    #     train_loader, val_loader,
+    #     lr = 1e-3, loss_mode = 'point', tta_steps = 3
+    # )
+    # results['Titan Patch'] = best_ti_patch
+    #
+    # # ---------------- PatchTST(Quantile + point) ----------------
+    # pt_config = PatchTSTConfigMonthly(
+    #     device = device,
+    #     lookback=lookback,
+    #     horizon=horizon,
+    #     loss_mode = 'auto',
+    #     quantiles = (0.1, 0.5, 0.9)
+    # )
+    #
+    # pt_base = build_patchTST_base(pt_config)
+    #
+    # print('PatchTST Base')
+    # best_pt_base = train_patchtst(
+    #     pt_base,
+    #     train_loader, val_loader,
+    #     lr = 1e-3, loss_mode = 'auto', use_intermittent = True
+    # )
+    # results['PatchTST Base'] = best_pt_base
+    #
+    #
+    # print('PatchTST Quantile')
+    # best_pt_quantile = train_patchtst(
+    #     pt_base,
+    #     train_loader, val_loader,
+    #     lr = 1e-3, loss_mode = 'quantile', use_intermittent = True
+    # )
+    # results['PatchTST Quantile'] = best_pt_quantile
 
     return results
 

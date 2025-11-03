@@ -463,7 +463,7 @@ def _run_and_plot_many(
     *,
     models: Dict[str, torch.nn.Module],
     loader,
-    device: str = "cpu",
+    device: str = "cuda" if torch.cuda.is_available() else 'cpu',
     horizon: int,
     mode: str,                      # 'val' | 'infer'
     plan_dt: Optional[int] = None,  # anchor label (YYYYMM or YYYYWW)
@@ -574,7 +574,7 @@ def plot_27w(
     models: Dict[str, torch.nn.Module],
     loader,
     *,
-    device: str = "cpu",
+    device: str = 'cuda' if torch.cuda.is_available() else 'cpu',
     mode: str = "val",                # 'val' | 'infer'
     plan_yyyyww: Optional[int] = None,
     max_plots: int = 100,

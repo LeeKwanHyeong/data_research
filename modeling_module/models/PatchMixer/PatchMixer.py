@@ -19,58 +19,101 @@ class BaseModel(nn.Module):
     -> MLP
     -> horizon regression
     """
+
     def __init__(self, configs: PatchMixerConfig, exo_dim: int = 0):
         super().__init__()
         self.model_name = 'PatchMixer BaseModel'
 
-        self.backbone = PatchMixerBackbone(configs = configs)
+        self.backbone = PatchMixerBackbone(configs=configs)
+        in_dim = self.backbone.patch_repr_dim
 
-        in_dim = self.backbone.patch_repr_dim # a * d_model
-        self.proj = nn.Sequential(
-            nn.Linear(in_dim, 128),
-            nn.Softplus(),
-            nn.Dropout(0.10)
+        self.expander = TemporalExpander(
+            d_in=in_dim, horizon=configs.horizon, f_out=128,
+            dropout=0.1, use_sinus=True, season_period=52,  # 월간이면 12로
+            max_harmonics=16, use_conv=True
         )
 
-        self.fc = nn.Sequential(
-            nn.Linear(128, 64),
-            nn.ReLU(),
-            nn.Linear(64, configs.horizon)
+        self.head = nn.Sequential(
+            nn.Linear(128, 128), nn.GELU(), nn.Linear(128, 1)
         )
 
+        self.final_nonneg = True
         self.horizon = configs.horizon
+
         self.exo_dim = exo_dim
-        self.exo_head = None
-        if self.exo_dim > 0:
+        if self.exo_dim and exo_dim > 0:
             self.exo_head = nn.Sequential(
-                nn.Linear(self.exo_dim, 64),
-                nn.GELU(),
-                nn.Linear(64, 1)
+                nn.Linear(self.exo_dim, 64), nn.GELU(), nn.Linear(64, 1)
             )
+        else:
+            self.exo_head = None
+
         self.revin = RevIN(configs.enc_in)
 
-    def forward(self, x: torch.Tensor, future_exo: torch.Tensor | None = None) -> torch.Tensor:
-        """
-                x: (B, L, N)
-                future_exo: (B, Hx, exo_dim) | None
-                mode/kwargs: 무시(호출자 호환성)
-                """
-        x = self.revin(x, 'norm')
-        patch_repr = self.backbone(x)  # (B, a * d_model)
-        patch_repr = self.proj(patch_repr)  # (B, 128)
-        out = self.fc(patch_repr)  # (B, H)
+        # ---- 출력 스케일/바이어스 (초기는 1.0/0.0 권장) ----
+        self.out_scale = nn.Parameter(torch.tensor(1.0))
+        self.out_bias = nn.Parameter(torch.tensor(0.0))
 
+        # ---- H축 잔차 (국소 곡률 통로) ----
+        self.dw_head = nn.Conv1d(1, 1, kernel_size=3, padding=1, groups=1)
+
+        # ---- 베이스: 절편 + 기울기(직선 성분은 여기서 흡수) ----
+        self.base_head_b = nn.Linear(in_dim, 1)  # intercept
+        self.base_head_m = nn.Linear(in_dim, 1)  # slope
+
+        # ---- 스텝별 게이트: 포화 방지용 LayerNorm + Temperature ----
+        self.step_gate_fc = nn.Linear(128, 1)
+        self.gate_ln = nn.LayerNorm(128)
+        self.gate_temp = nn.Parameter(torch.tensor(5.0))  # ↑ 클수록 포화 덜 함
+
+        # 게이트 초깃값: 작게/음수 바이어스로 시작 → 평균 ~0.3~0.5
+        torch.nn.init.normal_(self.step_gate_fc.weight, std=0.01)
+        torch.nn.init.constant_(self.step_gate_fc.bias, -0.5)  # sigmoid(-0.5)≈0.38
+
+    def forward(self, x, future_exo: torch.Tensor | None = None) -> torch.Tensor:
+        x = self.revin(x, 'norm')
+        z = self.backbone(x)  # [B, D]
+        x_bhf = self.expander(z)  # [B, H, 128]
+
+        # 1) 베이스(절편+기울기): [B,1] → [B,H]
+        B, H = z.size(0), self.horizon
+        t = torch.linspace(0, 1, H, device=z.device).unsqueeze(0)  # [1,H]
+        b = self.base_head_b(z)  # [B,1]
+        m = self.base_head_m(z)  # [B,1]
+        base = b + m * t  # [B,H]
+
+        # 2) 스텝별 잔차
+        resid = self.head(x_bhf).squeeze(-1)  # [B,H]
+
+        # 3) 스텝별 게이트(정규화 + 온도)
+        g_pre = self.step_gate_fc(self.gate_ln(x_bhf)) / self.gate_temp  # [B,H,1]
+        gate = torch.sigmoid(g_pre).squeeze(-1)  # [B,H]
+        # (선택) 극단값 방지:
+        # gate = gate.clamp_(0.05, 0.95)
+
+        # 4) 결합
+        y = base + gate * resid  # [B,H]
+
+        # 5) 외생변수(정규화 기준값이면 여기에서 더함)
         if (self.exo_head is not None) and (future_exo is not None):
             ex = _apply_exo_shift_linear(
-                self.exo_head, future_exo,
-                horizon=self.horizon,
-                out_dtype=out.dtype,
-                out_device=out.device
-            )  # (B, H)
-            out = out + ex
-        # out = self.revin(out, 'denorm')
+                self.exo_head, future_exo, horizon=self.horizon,
+                out_dtype=y.dtype, out_device=y.device
+            )
+            y = y + ex
 
-        return out  # (B, H)
+        # 6) 출력 스케일/바이어스
+        y = y * self.out_scale + self.out_bias
+
+        # 7) H축 잔차(국소 곡률 강화)
+        yc = self.dw_head(y.unsqueeze(1)).squeeze(1)  # [B,H]
+        y = y + 0.5 * yc
+
+        # 8) 비음수 도메인: 학습 중엔 끄고, 평가에서만 클램프 권장
+        if getattr(self, 'final_nonneg', False) and (not self.training):
+            y = torch.clamp_min(y, 0.0)
+
+        return y
 
 # -------------------------
 # Simple PatchMixer + Feature Branch
