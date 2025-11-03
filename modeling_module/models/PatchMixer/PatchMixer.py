@@ -15,103 +15,140 @@ from modeling_module.utils.temporal_expander import TemporalExpander
 # -------------------------
 class BaseModel(nn.Module):
     """
-    PatchMixerBackbone 출력(global patch represntation)
-    -> MLP
-    -> horizon regression
+    PatchMixer Backbone → TemporalExpander → per-step head
+    + base(절편+기울기, α-게이트) + step-gate(Conv1d+τ) + DW residual
     """
-
-    def __init__(self, configs: PatchMixerConfig, exo_dim: int = 0):
+    def __init__(self, configs, exo_dim: int = 0):
         super().__init__()
         self.model_name = 'PatchMixer BaseModel'
 
         self.backbone = PatchMixerBackbone(configs=configs)
         in_dim = self.backbone.patch_repr_dim
+        H = int(configs.horizon)
 
         self.expander = TemporalExpander(
-            d_in=in_dim, horizon=configs.horizon, f_out=128,
-            dropout=0.1, use_sinus=True, season_period=52,  # 월간이면 12로
-            max_harmonics=16, use_conv=True
+            d_in=in_dim, horizon=H, f_out=128, dropout=0.1,
+            use_sinus=True, season_period=52, max_harmonics=16, use_conv=True
         )
 
+        # RevIN(norm 전용; denorm은 forecaster)
+        self.revin = RevIN(configs.enc_in)
+
+        # base(절편 + 기울기) + base gate α
+        self.base_head_b = nn.Linear(in_dim, 1)
+        self.base_head_m = nn.Linear(in_dim, 1)
+        self.base_gate   = nn.Linear(in_dim, 1)
+        nn.init.constant_(self.base_gate.bias, -2.5)  # 초기엔 resid 쪽이 크게
+
+        # head 경로
+        self.pre_ln = nn.LayerNorm(128)
         self.head = nn.Sequential(
-            nn.Linear(128, 128), nn.GELU(), nn.Linear(128, 1)
+            nn.Linear(128, 128),
+            nn.GELU(),
+            nn.Linear(128, 1)
         )
+        self.resid_scale = nn.Parameter(torch.tensor(1.2))
 
-        self.final_nonneg = True
-        self.horizon = configs.horizon
+        # ---- Step gate: H-방향 Conv + τ 가법 ----
+        self.gate_ln = nn.LayerNorm(128)
 
-        self.exo_dim = exo_dim
-        if self.exo_dim and exo_dim > 0:
+        # 멀티스케일 컨볼루션: 3x, 5x, dilated-3 병렬 후 1x1로 축소
+        self.gate_conv_3 = nn.Conv1d(128, 32, kernel_size=3, padding=1, dilation=1)
+        self.gate_conv_5 = nn.Conv1d(128, 32, kernel_size=5, padding=2, dilation=1)
+        self.gate_conv_d3 = nn.Conv1d(128, 32, kernel_size=3, padding=2, dilation=2)
+        self.gate_reduce = nn.Conv1d(96, 1, kernel_size=1)  # 32*3 -> 1
+        self.gate_act = nn.GELU()
+        self.gate_do = nn.Dropout(0.1)
+
+        # τ 영향도/게인/바이어스/온도/클램프
+        self.tau_weight = nn.Parameter(torch.tensor(1.0))  # 0.5 -> 1.0
+        self.g_gain = nn.Parameter(torch.tensor(5.0))  # 로짓 스케일↑
+        self.g_bias = nn.Parameter(torch.tensor(1.8))  # 로짓 바이어스
+        self.gate_temp = nn.Parameter(torch.tensor(1.0))  # 1.5 -> 1.0 (감도↑)
+        self.g_logit_clip = 8.0
+
+        # 출력 스케일/바이어스
+        self.out_scale = nn.Parameter(torch.tensor(1.0))
+        self.out_bias  = nn.Parameter(torch.tensor(0.0))
+
+        # H축 depthwise residual(국소 곡률)
+        self.dw_head = nn.Conv1d(1, 1, kernel_size=3, padding=1, groups=1)
+        self.dw_gain = nn.Parameter(torch.tensor(1.0))
+
+        # 외생
+        self.horizon = H
+        self.exo_dim = int(exo_dim)
+        if self.exo_dim > 0:
             self.exo_head = nn.Sequential(
-                nn.Linear(self.exo_dim, 64), nn.GELU(), nn.Linear(64, 1)
+                nn.Linear(self.exo_dim, 64),
+                nn.GELU(),
+                nn.Linear(64, 1)
             )
         else:
             self.exo_head = None
 
-        self.revin = RevIN(configs.enc_in)
+        self.final_nonneg = True  # 추론시에만 clamp
 
-        # ---- 출력 스케일/바이어스 (초기는 1.0/0.0 권장) ----
-        self.out_scale = nn.Parameter(torch.tensor(1.0))
-        self.out_bias = nn.Parameter(torch.tensor(0.0))
+    def forward(self, x: torch.Tensor, future_exo: torch.Tensor | None = None) -> torch.Tensor:
+        # 1) 정규화(denorm은 forecaster)
+        x = self.revin(x, 'norm')                 # [B,L,C]
+        z = self.backbone(x)                      # [B,D]
+        x_bhf = self.expander(z)                  # [B,H,128]
+        x_bhf_n = self.pre_ln(x_bhf)              # [B,H,128]
 
-        # ---- H축 잔차 (국소 곡률 통로) ----
-        self.dw_head = nn.Conv1d(1, 1, kernel_size=3, padding=1, groups=1)
-
-        # ---- 베이스: 절편 + 기울기(직선 성분은 여기서 흡수) ----
-        self.base_head_b = nn.Linear(in_dim, 1)  # intercept
-        self.base_head_m = nn.Linear(in_dim, 1)  # slope
-
-        # ---- 스텝별 게이트: 포화 방지용 LayerNorm + Temperature ----
-        self.step_gate_fc = nn.Linear(128, 1)
-        self.gate_ln = nn.LayerNorm(128)
-        self.gate_temp = nn.Parameter(torch.tensor(5.0))  # ↑ 클수록 포화 덜 함
-
-        # 게이트 초깃값: 작게/음수 바이어스로 시작 → 평균 ~0.3~0.5
-        torch.nn.init.normal_(self.step_gate_fc.weight, std=0.01)
-        torch.nn.init.constant_(self.step_gate_fc.bias, -0.5)  # sigmoid(-0.5)≈0.38
-
-    def forward(self, x, future_exo: torch.Tensor | None = None) -> torch.Tensor:
-        x = self.revin(x, 'norm')
-        z = self.backbone(x)  # [B, D]
-        x_bhf = self.expander(z)  # [B, H, 128]
-
-        # 1) 베이스(절편+기울기): [B,1] → [B,H]
         B, H = z.size(0), self.horizon
-        t = torch.linspace(0, 1, H, device=z.device).unsqueeze(0)  # [1,H]
-        b = self.base_head_b(z)  # [B,1]
-        m = self.base_head_m(z)  # [B,1]
-        base = b + m * t  # [B,H]
+        # t01 = torch.linspace(0, 1, H, device=z.device).unsqueeze(0)
+        # t = t01 * 0.7  # 기울기 과대 억제
+        t = torch.linspace(-1, 1, H, device=z.device).unsqueeze(0)
 
-        # 2) 스텝별 잔차
-        resid = self.head(x_bhf).squeeze(-1)  # [B,H]
+        # 2) base + α
+        b = self.base_head_b(z)                   # [B,1]
+        m = self.base_head_m(z)                   # [B,1]
+        base = b + m * t                          # [B,H]
+        alpha = torch.sigmoid(self.base_gate(z)).expand(-1, H)  # [B,H]
 
-        # 3) 스텝별 게이트(정규화 + 온도)
-        g_pre = self.step_gate_fc(self.gate_ln(x_bhf)) / self.gate_temp  # [B,H,1]
-        gate = torch.sigmoid(g_pre).squeeze(-1)  # [B,H]
-        # (선택) 극단값 방지:
-        # gate = gate.clamp_(0.05, 0.95)
+        # 3) residual
+        resid = self.head(x_bhf_n).squeeze(-1)    # [B,H]
+        resid = self.resid_scale * resid
+        resid = resid - resid.mean(dim=1, keepdim=True)  # 잔차 평균 0
 
-        # 4) 결합
-        y = base + gate * resid  # [B,H]
 
-        # 5) 외생변수(정규화 기준값이면 여기에서 더함)
+        # 4) step gate (Conv1d on H + τ)
+        xg = self.gate_ln(x_bhf_n).transpose(1, 2)  # [B,128,H]
+        g1 = self.gate_act(self.gate_conv_3(xg))  # [B,32,H]
+        g2 = self.gate_act(self.gate_conv_5(xg))  # [B,32,H]
+        g3 = self.gate_act(self.gate_conv_d3(xg))  # [B,32,H]
+        gcat = torch.cat([g1, g2, g3], dim=1)  # [B,96,H]
+        gcat = self.gate_do(gcat)
+        g_logit = self.gate_reduce(gcat).transpose(1, 2).squeeze(-1)  # [B,H]
+
+        tau = torch.linspace(-1.0, 1.0, H, device=x_bhf.device).view(1, H).expand(B, H)
+        g_logit = (g_logit + self.tau_weight * tau + self.g_bias)
+        g_logit = torch.clamp(self.g_gain * (g_logit / self.gate_temp), -self.g_logit_clip, self.g_logit_clip)
+        gate = torch.sigmoid(g_logit)  # [B,H]
+        gate = gate - gate.mean(dim=1, keepdim=True) + 0.5
+        gate = torch.clamp(gate, 0.05, 0.95)  # 과포화 방지
+
+
+        # 5) 혼합
+        y = alpha * base + (1.0 - alpha) * (gate * resid)          # [B,H]
+
+        # 6) exogenous(정규화 공간 기준이면 여기서 더함)
         if (self.exo_head is not None) and (future_exo is not None):
-            ex = _apply_exo_shift_linear(
-                self.exo_head, future_exo, horizon=self.horizon,
-                out_dtype=y.dtype, out_device=y.device
-            )
+            ex = self.exo_head(future_exo).squeeze(-1)             # [B,H]
             y = y + ex
 
-        # 6) 출력 스케일/바이어스
+        # 7) scale/bias + H축 DW 곡률
         y = y * self.out_scale + self.out_bias
+        yc = self.dw_head(y.unsqueeze(1)).squeeze(1)
+        y  = y + self.dw_gain * yc
 
-        # 7) H축 잔차(국소 곡률 강화)
-        yc = self.dw_head(y.unsqueeze(1)).squeeze(1)  # [B,H]
-        y = y + 0.5 * yc
+        y = self.revin(y.unsqueeze(-1), 'denorm').squeeze(-1)
 
-        # 8) 비음수 도메인: 학습 중엔 끄고, 평가에서만 클램프 권장
+        # 8) 추론시에만 비음수 클램프
         if getattr(self, 'final_nonneg', False) and (not self.training):
             y = torch.clamp_min(y, 0.0)
+
 
         return y
 
@@ -284,7 +321,7 @@ class QuantileModel(nn.Module):
         raise ValueError(f"pred shape must be (B,{qlen},{horizon}) or (B,{horizon},{qlen}), got {q.shape}")
 
     def forward(self, x: torch.Tensor, future_exo: torch.Tensor | None = None, *,
-                exo_is_normalized: bool = True, **kwargs) -> torch.Tensor:
+                exo_is_normalized: bool = True, **kwargs):
         """
         x: (B, L, N)  # RevIN이 이 형태를 받는 구현 가정
         return: (B, 3, H)
@@ -326,8 +363,17 @@ class QuantileModel(nn.Module):
             )  # (B, H)
             q = q + ex.unsqueeze(1)          # (B, 3, H)
 
+        qs = []
+        for i in range(q.size(-1)):
+            qi_raw = self.revin(q[..., i: i+1], 'denorm')
+            qs.append(qi_raw)
+        q_raw = torch.cat(qs, dim = -1)
+
+        if getattr(self, 'final_nonneg', False) and (not self.training):
+            q_raw = torch.clamp_min(q_raw, 0.0)
+
         # # 5) RevIN 역정규화 (분위수별 슬라이스)
         # q = self._denorm_quantiles_with_revin(q)  # (B, 3, H)
 
-        return q
+        return {"q": q_raw}
 

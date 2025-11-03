@@ -78,3 +78,5 @@ Patch(국소 구간)로 분해해 길이를 줄이고, 어텐션으로 전역 �
 ### 비교 요약
 PatchMixer vs PatchTST: Mixer(MLP 기반)는 가볍고 빠름, PatchTST는 전역 패턴 표현력이 더 강함.
 DLinear/TCN 대비: 전역 패턴·비선형 상호작용 표현에서 우위, 다만 비용은 큼
+
+

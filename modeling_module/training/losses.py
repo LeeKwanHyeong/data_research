@@ -54,6 +54,27 @@ class LossComputer:
             return newsvendor_q_star(self.cfg.Cu, self.cfg.Co)
         return self.cfg.q_star
 
+    def _make_spike_weight(self, y_hist: torch.Tensor, k: float = 3.5,
+                           w_spike: float = 6.0, w_norm: float = 1.0) -> torch.Tensor:
+        med = torch.median(y_hist, dim=1, keepdim=True).values
+        mad = torch.median(torch.abs(y_hist - med), dim=1, keepdim=True).values + 1e-6
+        z = (y_hist - med) / mad
+        spike = (z > k).float()
+        return torch.where(spike > 0, torch.full_like(y_hist, w_spike), torch.full_like(y_hist, w_norm))
+
+    def _weighted_huber(self, y_hat: torch.Tensor, y_true: torch.Tensor,
+                        weight: torch.Tensor, delta: float = 5.0) -> torch.Tensor:
+        err = y_hat - y_true
+        abs_e = err.abs()
+        huber = torch.where(abs_e <= delta, 0.5 * err * err, delta * (abs_e - 0.5 * delta))
+        return (weight * huber).mean()
+
+    def _asymmetric_mse(self, y_hat: torch.Tensor, y_true: torch.Tensor,
+                        up_w: float = 2.0) -> torch.Tensor:
+        e = y_hat - y_true
+        w = torch.where(e < 0, torch.ones_like(e), torch.full_like(e, up_w))
+        return (w * e.pow(2)).mean()
+
     def compute(self, pred: torch.Tensor, y: torch.Tensor, * , is_val: bool) -> torch.Tensor:
         """
         주어진 예측과 정답에 대해 손실 계산

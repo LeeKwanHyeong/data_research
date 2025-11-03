@@ -1,6 +1,6 @@
 from modeling_module.training.adapters import PatchMixerAdapter
 from modeling_module.training.config import TrainingConfig
-from modeling_module.training.engine import CommonTrainer
+from modeling_module.training.engine import CommonTrainer, TrainerCallbacks
 from modeling_module.utils.exogenous_utils import calendar_cb
 
 
@@ -15,6 +15,13 @@ def train_patchmixer(model, train_loader, val_loader, **overrides):
     base.update(overrides)  # 호출부 인자로 덮어쓰기
     cfg = TrainingConfig(**base)
 
-    trainer = CommonTrainer(cfg, PatchMixerAdapter(), future_exo_cb = calendar_cb)
+    trainer = CommonTrainer(cfg, PatchMixerAdapter(),
+                            logger=print,
+                            # metrics_fn=my_metrics_fn,        # 선택
+                            future_exo_cb=calendar_cb,         # 선택
+                            callbacks=TrainerCallbacks(      # 선택
+                                    on_epoch_end=lambda ep, info: print("ep end:", ep, info)
+                                ),
+                            )
     best_model = trainer.fit(model, train_loader, val_loader, tta_steps=0)
     return best_model
