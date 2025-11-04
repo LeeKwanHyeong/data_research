@@ -1,13 +1,15 @@
 import torch
 import torch.nn as nn
 
+
+
 class RevIN(nn.Module):
     """
     Reversible Instance Normalization
     - forward('norm'): 입력을 정규화하고, denorm에 필요한 통계를 캐시
     - forward('denorm'): 마지막 'norm' 호출 시의 통계로 복원
     """
-    def __init__(self, num_features: int, eps: float = 1e-5, affine: bool = True, subtract_last: bool = False):
+    def __init__(self, num_features: int, eps: float = 1e-4, affine: bool = True, subtract_last: bool = False):
         super().__init__()
         self.num_features = int(num_features)
         self.eps = float(eps)
@@ -25,6 +27,8 @@ class RevIN(nn.Module):
         self._cached_mean = None   # [B,1,C]
         self._cached_std  = None   # [B,1,C]
         self._cached_last = None   # [B,1,C] (subtract_last=True일 때)
+
+
 
     def _get_stats(self, x: torch.Tensor):
         # x: [B, L, C] or [B, H, C]

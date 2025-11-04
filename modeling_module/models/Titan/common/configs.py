@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from typing import Literal
 
 from modeling_module.training.config import TrainingConfig
 
@@ -19,6 +20,20 @@ class TitanConfig(TrainingConfig):
     # --------------- Decoder -----------------
     n_dec_layers = 1                    # 1~2 권장
     dec_dropout = 0.1
+
+    # --------------- Temporal Expander Option -----------------
+    date_type: Literal['M', 'W'] = 'M'
+    use_temporal_expander: bool = True
+    expander_use_sinus: bool = True
+    expander_use_conv: bool = True
+    expander_season_period: int = 12
+    expander_max_harmonics: int = 8
+    expander_n_harmonics: int = 4
+    expander_f_out: int = 128
+
+    # Exogenous
+    use_calendar_exo: bool = True
+    exo_dim: int = 2
 
     @property
     def output_horizon(self) -> int:
@@ -48,14 +63,58 @@ class TitanConfigPatchMonthly(TitanConfig):
     lmm_memory_source = "encoded"  # 'encoded' | 'context'
     nonneg_head = True
 
+    date_type = 'M'
+    lookback: int = 36
+    horizon: int = 48
+    expander_season_period: int = 12
+    expander_max_harmonics = 8
+    expander_n_harmonics: int = 6
+
+@dataclass
+class TitanConfigPatchWeekly(TitanConfig):
+    batch_size = 128
+    input_dim = 1
+    d_model = 64
+    n_layers = 2
+    n_heads = 4
+    d_ff = 256
+    contextual_mem_size = 64
+    persistent_mem_size = 16
+
+    # Patch/Mixer
+    patch_len = 12
+    patch_stride = 6
+    n_mixer_blocks = 2
+    mixer_hidden = 64  # None이면 2*d_model로 자동 설정
+    mixer_kernel = 7
+    dropout = 0.1
+
+    # LMM/Head
+    lmm_top_k = 5
+    lmm_memory_source = "encoded"  # 'encoded' | 'context'
+    nonneg_head = True
+
+    date_type: str = 'W'
+    lookback: int = 54
+    horizon: int = 27
+    expander_season_period: int = 52
+    expander_max_harmonics: int = 16
+    expander_n_harmonics: int = 8
+
 @dataclass
 class TitanConfigMonthly(TitanConfig):
-    # lookback: int = 36
-    # horizon: int = 48
-    pass
+    date_type: str = 'M'
+    lookback: int = 36
+    horizon: int = 48
+    expander_season_period: int = 12
+    expander_max_harmonics: int = 8
+    expander_n_harmonics: int = 6
 
 @dataclass
 class TitanConfigWeekly(TitanConfig):
-    # lookback: int = 54
-    # horizon: int = 27
-    pass
+    date_type: str = 'W'
+    lookback: int = 54
+    horizon: int = 27
+    expander_season_period: int = 52
+    expander_max_harmonics: int = 16
+    expander_n_harmonics: int = 8

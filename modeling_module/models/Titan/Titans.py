@@ -10,11 +10,38 @@ from modeling_module.models.Titan.common.decoder import TitanDecoder
 from modeling_module.models.Titan.common.memory import LMM
 from modeling_module.models.common_layers.RevIN import RevIN
 from modeling_module.models.common_layers.TrendCorrector import TrendCorrector
+from modeling_module.models.common_layers.heads.expander_head import ExpanderHead
 
 
 def _ensure_config_instance(config):
     return config() if isinstance(config, type) else config
 
+def _denorm_forecast_from_revin(revin, y_h: torch.Tensor) -> torch.Tensor:
+    """
+    y_h: [B, H]  (모델 출력, RevIN normalized space)
+    RevIN에서 저장된 mean/stdev/last를 이용해 [B,H]에 맞춰 역정규화.
+    subtract_last=True이면 last를 기준으로 복원.
+    """
+    # RevIN이 아직 통계가 없다면 그대로 반환
+    mean  = getattr(revin, "mean",  None)
+    stdev = getattr(revin, "stdev", None)
+    last  = getattr(revin, "last",  None)
+    if (stdev is None) or ((last is None) and (mean is None)):
+        return y_h
+
+    # RevIN 통계는 보통 [B,1,C] 형태. (univariate면 C=1)
+    # C>1 멀티변량인 경우, 예측 대상 채널 index를 써서 골라주면 됩니다(여기선 0번 가정).
+    ch = 0
+    device = y_h.device
+    dtype  = y_h.dtype
+
+    st = stdev[..., ch].squeeze(1).to(device=device, dtype=dtype)      # [B]
+    if getattr(revin, "subtract_last", False) and (last is not None):
+        base = last[..., ch].squeeze(1).to(device=device, dtype=dtype)  # [B]
+    else:
+        base = mean[..., ch].squeeze(1).to(device=device, dtype=dtype)  # [B]
+
+    return y_h * st.unsqueeze(1) + base.unsqueeze(1)                    # [B,H]
 
 # =========================
 # Titan Base (point model)
@@ -37,7 +64,7 @@ class Model(nn.Module):
         self.horizon = cfg.horizon
 
         # RevIN (norm only)
-        self.revin_layer = RevIN(num_features=cfg.input_dim, affine=True, subtract_last=True)
+        self.revin = RevIN(num_features=cfg.input_dim, affine=True, subtract_last=True)
 
         # Backbone
         self.encoder = MemoryEncoder(
@@ -45,12 +72,25 @@ class Model(nn.Module):
             cfg.contextual_mem_size, cfg.persistent_mem_size
         )
 
-        # Head (nonneg option)
-        nonneg = getattr(cfg, "nonneg_head", True)
-        head = [nn.Linear(cfg.d_model, cfg.horizon)]
-        if nonneg:
-            head.append(nn.Softplus())
-        self.output_proj = nn.Sequential(*head)
+        self.use_temporal_expander = getattr(cfg, "use_temporal_expander", True)
+        if self.use_temporal_expander:
+            self.output_head = ExpanderHead(
+                d_model = cfg.d_model,
+                horizon = cfg.horizon,
+                f_out = getattr(cfg, 'expander_f_out', 128),
+                nonneg = getattr(cfg, 'nonneg_head', True),
+                use_sinus = getattr(cfg, 'expander_use_sinus', True),
+                season_period = getattr(cfg, 'expander_season_period', 52),
+                max_harmonics = getattr(cfg, 'expander_max_harmonics', 16),
+                use_conv = getattr(cfg, 'expander_use_conv', True),
+                dropout = getattr(cfg, 'expander_dropout', 0.1)
+            )
+        else:
+            nonneg = getattr(cfg, 'nonneg_head', True)
+            head = [nn.Linear(cfg.d_model, cfg.horizon)]
+            if nonneg:
+                head.append(nn.Softplus())
+            self.output_proj = nn.Sequential(*head)
 
         # Optional exogenous term
         self.exo_dim = getattr(cfg, "exo_dim", 0)
@@ -73,7 +113,7 @@ class Model(nn.Module):
         mode: Optional[str] = None,
     ) -> torch.Tensor:                            # returns [B,H] in NORMALIZED space
         # 1) RevIN normalize
-        x_n = self.revin_layer(x, "norm")         # [B,L,C]
+        x_n = self.revin(x, "norm")         # [B,L,C]
 
         # 2) Encode
         enc = self.encoder(x_n)                   # [B,L,D]
@@ -81,7 +121,14 @@ class Model(nn.Module):
             raise RuntimeError(f"Encoder must return [B,L,D], got {tuple(enc.shape)}")
 
         # 3) Head (last token)
-        y_n = self.output_proj(enc[:, -1, :])     # [B,H]
+        z_last = enc[:, -1, :]
+        if self.use_temporal_expander:
+            y_n = self.output_head(z_last)        # [B, H]
+        else:
+            y_n = self.output_proj(z_last)        # [B, H]
+
+        # y_n = self.revin(y_n, 'denorm')
+        y_n = _denorm_forecast_from_revin(self.revin, y_n)
 
         # 4) Optional exogenous addend
         if (self.exo_head is not None) and (future_exo is not None):
@@ -95,6 +142,7 @@ class Model(nn.Module):
         # 5) Optional final clamp in normalized space (keeps ≥0 after Softplus + addends)
         if self.final_clamp_nonneg:
             y_n = torch.clamp_min(y_n, 0.0)
+
 
         # NOTE: NO denorm here — forecaster handles it consistently.
         return y_n
@@ -122,7 +170,7 @@ class LMMModel(nn.Module):
         self.model_name = "Titan LMMModel"
         self.horizon = cfg.horizon
 
-        self.revin_layer = RevIN(num_features=cfg.input_dim, affine=True, subtract_last=True)
+        self.revin = RevIN(num_features=cfg.input_dim, affine=True, subtract_last=True)
 
         self.encoder = MemoryEncoder(
             cfg.input_dim, cfg.d_model, cfg.n_layers, cfg.n_heads, cfg.d_ff,
@@ -131,13 +179,27 @@ class LMMModel(nn.Module):
 
         self.lmm = LMM(d_model=cfg.d_model, top_k=getattr(cfg, "lmm_top_k", 5))
 
-        nonneg = getattr(cfg, "nonneg_head", True)
-        head = [nn.Linear(cfg.d_model, cfg.horizon)]
-        if nonneg:
-            head.append(nn.Softplus())
-        self.output_proj = nn.Sequential(*head)
+        self.use_temporal_expander = getattr(cfg, "use_temporal_expander", True)
+        if self.use_temporal_expander:
+            self.output_head = ExpanderHead(
+                d_model=cfg.d_model,
+                horizon=cfg.horizon,
+                f_out=getattr(cfg, 'expander_f_out', 128),
+                nonneg=getattr(cfg, 'nonneg_head', True),
+                use_sinus=getattr(cfg, 'expander_use_sinus', True),
+                season_period=getattr(cfg, 'expander_season_period', 52),
+                max_harmonics=getattr(cfg, 'expander_max_harmonics', 16),
+                use_conv=getattr(cfg, 'expander_use_conv', True),
+                dropout=getattr(cfg, 'expander_dropout', 0.1)
+            )
+        else:
+            nonneg = getattr(cfg, 'nonneg_head', True)
+            head = [nn.Linear(cfg.d_model, cfg.horizon)]
+            if nonneg:
+                head.append(nn.Softplus())
+            self.output_proj = nn.Sequential(*head)
 
-        self.trend_corrector = TrendCorrector(d_model=cfg.d_model, out_dim=cfg.horizon)
+        # self.trend_corrector = TrendCorrector(d_model=cfg.d_model, out_dim=cfg.horizon)
 
         self.exo_dim = getattr(cfg, "exo_dim", 0)
         if self.exo_dim > 0:
@@ -190,7 +252,7 @@ class LMMModel(nn.Module):
         mode: str = "train",
     ) -> torch.Tensor:                            # returns [B,H] in NORMALIZED space
         # 1) RevIN normalize
-        x_n = self.revin_layer(x, "norm")
+        x_n = self.revin(x, "norm")
 
         # 2) Encode
         enc = self.encoder(x_n)                   # [B,L,D]
@@ -202,10 +264,19 @@ class LMMModel(nn.Module):
         enhanced = self.lmm(enc, memory)          # [B,L,D]
 
         # 4) Head (last token)
-        y_core_n = self.output_proj(enhanced[:, -1, :])  # [B,H]
+        z_last = enhanced[:, -1, :]
+        if self.use_temporal_expander:
+            y_core_n = self.output_head(z_last)     # [B, H]
+        else:
+            y_core_n = self.output_proj(z_last)     # [B, H]
+
 
         # 5) Trend correction (vector input)
-        y_n = y_core_n + self.trend_corrector(enhanced[:, -1, :])  # [B,H]
+        # y_n = y_core_n + self.trend_corrector(enhanced[:, -1, :])  # [B,H]
+
+        y_n = y_core_n
+        # y_n = self.revin(y_n, 'denorm')
+        y_n = _denorm_forecast_from_revin(self.revin, y_n)
 
         # 6) Optional exogenous term
         if (self.exo_head is not None) and (future_exo is not None):
@@ -218,6 +289,7 @@ class LMMModel(nn.Module):
 
         if self.final_clamp_nonneg:
             y_n = torch.clamp_min(y_n, 0.0)
+
 
         return y_n
 
@@ -245,7 +317,7 @@ class PatchLMMModel(nn.Module):
         self.horizon = getattr(cfg, "horizon", getattr(cfg, "output_horizon", None))
         assert self.horizon is not None, "config.horizon (or output_horizon) is required"
 
-        self.revin_layer = RevIN(num_features=cfg.input_dim, affine=True, subtract_last=True)
+        self.revin = RevIN(num_features=cfg.input_dim, affine=True, subtract_last=True)
 
         # Patch-based encoder
         self.encoder = PatchMemoryEncoder(
@@ -266,13 +338,27 @@ class PatchLMMModel(nn.Module):
 
         self.lmm = LMM(d_model=cfg.d_model, top_k=getattr(cfg, "lmm_top_k", 5))
 
-        nonneg = getattr(cfg, "nonneg_head", True)
-        head = [nn.Linear(cfg.d_model, self.horizon)]
-        if nonneg:
-            head.append(nn.Softplus())
-        self.output_proj = nn.Sequential(*head)
+        self.use_temporal_expander = getattr(cfg, "use_temporal_expander", True)
+        if self.use_temporal_expander:
+            self.output_head = ExpanderHead(
+                d_model=cfg.d_model,
+                horizon=cfg.horizon,
+                f_out=getattr(cfg, 'expander_f_out', 128),
+                nonneg=getattr(cfg, 'nonneg_head', True),
+                use_sinus=getattr(cfg, 'expander_use_sinus', True),
+                season_period=getattr(cfg, 'expander_season_period', 52),
+                max_harmonics=getattr(cfg, 'expander_max_harmonics', 16),
+                use_conv=getattr(cfg, 'expander_use_conv', True),
+                dropout=getattr(cfg, 'expander_dropout', 0.1)
+            )
+        else:
+            nonneg = getattr(cfg, 'nonneg_head', True)
+            head = [nn.Linear(cfg.d_model, cfg.horizon)]
+            if nonneg:
+                head.append(nn.Softplus())
+            self.output_proj = nn.Sequential(*head)
 
-        self.trend_corrector = TrendCorrector(d_model=cfg.d_model, out_dim=self.horizon)
+        # self.trend_corrector = TrendCorrector(d_model=cfg.d_model, out_dim=self.horizon)
 
         # Which memory to use for LMM: 'encoded' | 'context'
         self.lmm_memory_source = getattr(cfg, "lmm_memory_source", "encoded")
@@ -309,7 +395,7 @@ class PatchLMMModel(nn.Module):
         mode: str = "train",
     ) -> torch.Tensor:                             # returns [B,H] in NORMALIZED space
         # 1) RevIN normalize
-        x_n = self.revin_layer(x, "norm")
+        x_n = self.revin(x, "norm")
 
         # 2) Encode
         enc = self.encoder(x_n)                    # [B,L',D]
@@ -323,10 +409,20 @@ class PatchLMMModel(nn.Module):
         enhanced = self.lmm(enc, memory)           # [B,L',D]
 
         # 4) Head
-        y_core_n = self.output_proj(enhanced[:, -1, :])   # [B,H]
+        # y_core_n = self.output_proj(enhanced[:, -1, :])   # [B,H]
+        z_last = enhanced[:, -1, :]
+        if self.use_temporal_expander:
+            y_core_n = self.output_head(z_last)     # [B,H]
+        else:
+            y_core_n = self.output_proj(z_last)     # [B,H]
 
         # 5) Trend (vector input)
-        y_n = y_core_n + self.trend_corrector(enhanced[:, -1, :])  # [B,H]
+        # y_n = y_core_n + self.trend_corrector(enhanced[:, -1, :])  # [B,H]
+        y_n = y_core_n
+
+
+        # y_n = self.revin(y_n, 'denorm')
+        y_n = _denorm_forecast_from_revin(self.revin, y_n)
 
         # 6) Optional exogenous addend
         if (self.exo_head is not None) and (future_exo is not None):
@@ -339,6 +435,7 @@ class PatchLMMModel(nn.Module):
 
         if self.final_clamp_nonneg:
             y_n = torch.clamp_min(y_n, 0.0)
+
 
         return y_n
 
@@ -366,7 +463,7 @@ class LMMSeq2SeqModel(nn.Module):
         self.horizon = getattr(cfg, "horizon", getattr(cfg, "output_horizon", None))
         assert self.horizon is not None, "config.horizon is required"
 
-        self.revin_layer = RevIN(num_features=cfg.input_dim, affine=True, subtract_last=True)
+        self.revin = RevIN(num_features=cfg.input_dim, affine=True, subtract_last=True)
 
         self.encoder = MemoryEncoder(
             cfg.input_dim, cfg.d_model, cfg.n_layers, cfg.n_heads, cfg.d_ff,
@@ -415,7 +512,7 @@ class LMMSeq2SeqModel(nn.Module):
         mode: str = "train",
     ) -> torch.Tensor:                                # returns [B,H] in NORMALIZED space
         # 1) RevIN normalize
-        x_n = self.revin_layer(x, "norm")
+        x_n = self.revin(x, "norm")
 
         # 2) Encode
         enc = self.encoder(x_n)                       # [B,L,D]
@@ -442,6 +539,9 @@ class LMMSeq2SeqModel(nn.Module):
 
         if self.final_clamp_nonneg:
             y_n = torch.clamp_min(y_n, 0.0)
+
+        # y_n = self.revin(y_n, 'denorm')
+        y_n = _denorm_forecast_from_revin(self.revin, y_n)
 
         return y_n
 

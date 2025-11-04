@@ -23,7 +23,7 @@ class BaseModel(nn.Module):
         self.model_name = 'PatchMixer BaseModel'
 
         self.horizon = configs.horizon
-        self.f_out = configs.f_out
+        self.f_out = configs.expander_f_out
 
 
 
@@ -33,8 +33,8 @@ class BaseModel(nn.Module):
         self.expander = TemporalExpander(
             d_in = in_dim, horizon = self.horizon, f_out = self.f_out, dropout = 0.1,
             use_sinus = True,
-            season_period = int(getattr(configs, 'season_period', 52)),
-            max_harmonics = int(getattr(configs, 'max_harmonics', 16)),
+            season_period = int(getattr(configs, 'expander_season_period', 52)),
+            max_harmonics = int(getattr(configs, 'expander_max_harmonics', 16)),
             use_conv = True
         )
 
@@ -197,9 +197,9 @@ class QuantileModel(nn.Module):
         self.horizon = configs.horizon
         self.per_branch_dim = configs.per_branch_dim
         self.fusion = configs.fusion
-        self.n_harmonics = configs.n_harmonics
+        self.n_harmonics = configs.expander_n_harmonics
         self.exo_dim = configs.exo_dim
-        self.f_out = configs.f_out
+        self.f_out = configs.expander_f_out
 
 
         # 1) Backbone: 전역 벡터 [B, D]

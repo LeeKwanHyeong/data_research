@@ -20,6 +20,7 @@ class CommonTrainer:
         metrics_fn=None,
         logger=print,
         future_exo_cb=None,
+        autocast_input = None,
     ):
         self.cfg = cfg
         self.adapter: DefaultAdapter = adapter
@@ -28,6 +29,15 @@ class CommonTrainer:
         self.metrics_fn = metrics_fn
         self.future_exo_cb = future_exo_cb
         self.amp_enabled = (self.cfg.amp_device == "cuda" and torch.cuda.is_available())
+        self.autocast_input = autocast_input
+
+        if autocast_input is not None:
+            self.amp_device = autocast_input['device_type']
+            self.enabled = autocast_input['enabled']
+            self.dtype = autocast_input['dtype']
+
+
+        # self.amp_enabled = False
 
     # ----------------- 내부 유틸 -----------------
     @staticmethod
@@ -97,6 +107,26 @@ class CommonTrainer:
     def _compute_loss(self, pred, y, *, is_val: bool):
         return self.loss_comp.compute(pred, y, is_val=is_val)
 
+    def _nan_stat(self, name, t):
+        if not torch.is_tensor(t):
+            return
+        has_nan = torch.isnan(t).any().item()
+        has_inf = torch.isinf(t).any().item()
+
+        # 버전 호환: torch.nanmax 사용하지 않고 finite 마스크로 최대 절댓값을 계산
+        finite_mask = torch.isfinite(t)
+        if finite_mask.any():
+            try:
+                mx = t[finite_mask].abs().max().item()
+            except Exception:
+                # 일부 dtype(정수, bool) 대비 방어
+                mx = t[finite_mask].to(torch.float32).abs().max().item()
+        else:
+            mx = float('inf')  # 전부 NaN/Inf인 경우
+
+        if has_nan or has_inf:
+            print(f"[NaN-{name}] has_nan={has_nan} has_inf={has_inf} max|x|={mx}")
+
     # ----------------- 에폭 루프 -----------------
     def _run_epoch(self, model, loader, *, train: bool):
         device = self.cfg.device
@@ -111,21 +141,36 @@ class CommonTrainer:
                     x, y = batch
                 x, y = x.to(device), y.to(device)
 
+                self._nan_stat("x(in)", x)
+                self._nan_stat("y(in)", y)
+
+
                 if train:
                     self.opt.zero_grad(set_to_none=True)
 
                 future_exo = self._make_future_exo(x, y, device=device)
+                if future_exo is not None:
+                    # 외생변수 가드: NaN→0, Inf→유한값
+                    future_exo = torch.nan_to_num(future_exo, nan=0.0, posinf=1e6, neginf=-1e6)
+                    self._nan_stat("future_exo", future_exo)
 
-                with autocast(self.cfg.amp_device, enabled=self.amp_enabled):
+                with autocast(
+                        device_type = self.cfg.amp_device,
+                        enabled=self.amp_enabled,
+                        dtype = self.dtype if self.dtype is not None else 'fp32'
+                ):
                     pred = self.adapter.forward(
                         model,
                         x,
                         future_exo=future_exo,
                         mode=("train" if train else "eval"),
                     )
+                    self._nan_stat("pred", pred)
                     loss = self._compute_loss(pred, y, is_val=(not train))
+                    self._nan_stat("loss_raw", loss)
                     reg = self.adapter.reg_loss(model)
                     if reg is not None:
+                        self._nan_stat("reg", reg)
                         loss = loss + reg
 
                 if train:
@@ -176,7 +221,12 @@ class CommonTrainer:
                     if tta_steps > 0 and self.adapter.uses_tta():
                         loss = self.adapter.tta_adapt(model, x_val, y_val, steps=tta_steps)
                         if loss is None:
-                            with autocast(self.cfg.amp_device, enabled=self.amp_enabled):
+                            with autocast(
+                                    device_type=self.cfg.amp_device,
+                                    enabled=self.amp_enabled,
+                                    dtype=self.dtype if self.dtype is not None else 'fp32'
+
+                            ):
                                 pred = self.adapter.forward(
                                     model, x_val, future_exo=future_exo, mode="eval"
                                 )
@@ -184,7 +234,11 @@ class CommonTrainer:
                                 loss = float(loss.detach())
                         val_total += loss
                     else:
-                        with autocast(self.cfg.amp_device, enabled=self.amp_enabled):
+                        with autocast(
+                                device_type=self.cfg.amp_device,
+                                enabled=self.amp_enabled,
+                                dtype=self.dtype if self.dtype is not None else 'fp32'
+                        ):
                             pred = self.adapter.forward(
                                 model, x_val, future_exo=future_exo, mode="eval"
                             )

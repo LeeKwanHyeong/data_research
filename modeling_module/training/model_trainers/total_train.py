@@ -5,7 +5,8 @@ from modeling_module.models.PatchMixer.common.configs import (
     PatchMixerConfigMonthly, PatchMixerConfigWeekly
 )
 from modeling_module.models.PatchTST.common.configs import PatchTSTConfigMonthly
-from modeling_module.models.Titan.common.configs import TitanConfigMonthly, TitanConfigPatchMonthly
+from modeling_module.models.Titan.common.configs import TitanConfigMonthly, TitanConfigPatchMonthly, \
+    TitanConfigPatchWeekly
 from modeling_module.models.model_builder import (
     build_patch_mixer_base, build_patch_mixer_quantile,
     build_titan_base, build_titan_lmm, build_patchTST_base, build_titan_seq2seq, build_titan_patch
@@ -63,64 +64,119 @@ def run_total_train_weekly(train_loader, val_loader, device='cuda', *, lookback,
     results: Dict[str, Dict] = {}
 
     # ---------------- PatchMixer ----------------
-    pm_base_config = PatchMixerConfigWeekly(
-        lookback=lookback,
-        horizon=horizon,
-        device=device,
-        loss_mode='point',
-        point_loss='mae'
+    # pm_base_config = PatchMixerConfigWeekly(
+    #     lookback=lookback,
+    #     horizon=horizon,
+    #     device=device,
+    #     loss_mode='point',
+    #     point_loss='mae'
+    # )
+    # pm_quantile_config = PatchMixerConfigWeekly(
+    #     lookback=lookback,
+    #     horizon=horizon,
+    #     device=device,
+    #     loss_mode='quantile',
+    #     quantiles=(0.1, 0.5, 0.9)
+    # )
+    #
+    # # 외생 콜백(주간: 52 주기 sin/cos)
+    # future_exo_cb = _make_calendar_cb_from_cfg(pm_base_config)
+    #
+    # # 모델 생성 (model_builder는 그대로 유지)
+    # pm_base_model = build_patch_mixer_base(pm_base_config)
+    # pm_quantile_model = build_patch_mixer_quantile(pm_quantile_config)
+    #
+    # # 모델이 외생을 실제로 쓸 수 있게 exo_head를 보강(필요 시)
+    # if future_exo_cb is not None:
+    #     _ensure_exo_head(pm_base_model, exo_dim=2)
+    #     _ensure_exo_head(pm_quantile_model, exo_dim=2)
+    #
+    # print(f"[EXO] base exo_dim={getattr(pm_base_model, 'exo_dim', 0)} "
+    #       f"exo_head? {hasattr(pm_base_model, 'exo_head') and pm_base_model.exo_head is not None}")
+    # print(f"[EXO] qmdl exo_dim={getattr(pm_quantile_model, 'exo_dim', 0)} "
+    #       f"exo_head? {hasattr(pm_quantile_model, 'exo_head') and pm_quantile_model.exo_head is not None}")
+    #
+    # print('PatchMixer Base (Weekly)')
+    # best_pm_base = train_patchmixer(
+    #     pm_base_model,
+    #     train_loader, val_loader,
+    #     lr=1e-3,
+    #     loss_mode='point',
+    #     point_loss='mae',
+    #     quantiles=(0.1, 0.5, 0.9),
+    #     use_intermittent=True,
+    #     future_exo_cb=future_exo_cb,   # ← 트레이너로 콜백 전달
+    #     exo_is_normalized=True         # RevIN 공간에서 가산하는 구조라면 True
+    # )
+    # results['PatchMixer Base'] = best_pm_base
+    #
+    # print('PatchMixer Quantile (Weekly)')
+    # best_pm_quantile = train_patchmixer(
+    #     pm_quantile_model,
+    #     train_loader, val_loader,
+    #     lr=1e-3,
+    #     loss_mode='quantile',
+    #     quantiles=(0.1, 0.5, 0.9),
+    #     use_intermittent=True,
+    #     future_exo_cb=future_exo_cb,
+    #     exo_is_normalized=True
+    # )
+    # results['PatchMixer Quantile'] = best_pm_quantile
+
+    # ---------------- Titan (point + TTA) ----------------
+    ti_config = TitanConfigPatchWeekly(
+        device = device,
+        lookback = lookback,
+        horizon = horizon,
+        loss_mode = 'point',
+        point_loss = 'huber'
     )
-    pm_quantile_config = PatchMixerConfigWeekly(
-        lookback=lookback,
-        horizon=horizon,
-        device=device,
-        loss_mode='quantile',
-        quantiles=(0.1, 0.5, 0.9)
+
+    ti_patch_config = TitanConfigPatchWeekly(
+        device = device,
+        lookback = lookback,
+        horizon = horizon,
+        loss_mode = 'point',
+        point_loss = 'huber'
     )
 
-    # 외생 콜백(주간: 52 주기 sin/cos)
-    future_exo_cb = _make_calendar_cb_from_cfg(pm_base_config)
+    ti_base = build_titan_base(ti_config)
+    ti_lmm = build_titan_lmm(ti_config)
+    ti_seq2seq = build_titan_seq2seq(ti_config)
+    ti_patch = build_titan_patch(ti_patch_config)
 
-    # 모델 생성 (model_builder는 그대로 유지)
-    pm_base_model = build_patch_mixer_base(pm_base_config)
-    pm_quantile_model = build_patch_mixer_quantile(pm_quantile_config)
-
-    # 모델이 외생을 실제로 쓸 수 있게 exo_head를 보강(필요 시)
-    if future_exo_cb is not None:
-        _ensure_exo_head(pm_base_model, exo_dim=2)
-        _ensure_exo_head(pm_quantile_model, exo_dim=2)
-
-    print(f"[EXO] base exo_dim={getattr(pm_base_model, 'exo_dim', 0)} "
-          f"exo_head? {hasattr(pm_base_model, 'exo_head') and pm_base_model.exo_head is not None}")
-    print(f"[EXO] qmdl exo_dim={getattr(pm_quantile_model, 'exo_dim', 0)} "
-          f"exo_head? {hasattr(pm_quantile_model, 'exo_head') and pm_quantile_model.exo_head is not None}")
-
-    print('PatchMixer Base (Weekly)')
-    best_pm_base = train_patchmixer(
-        pm_base_model,
+    print('Titan Base')
+    best_ti_base = train_titan(
+        ti_base,
         train_loader, val_loader,
-        lr=1e-3,
-        loss_mode='point',
-        point_loss='mae',
-        quantiles=(0.1, 0.5, 0.9),
-        use_intermittent=True,
-        future_exo_cb=future_exo_cb,   # ← 트레이너로 콜백 전달
-        exo_is_normalized=True         # RevIN 공간에서 가산하는 구조라면 True
+        lr = 1e-3, loss_mode = 'point', tta_steps = 3
     )
-    results['PatchMixer Base'] = best_pm_base
+    results['Titan Base'] = best_ti_base
 
-    print('PatchMixer Quantile (Weekly)')
-    best_pm_quantile = train_patchmixer(
-        pm_quantile_model,
+    print('Titan LMM')
+    best_ti_lmm = train_titan(
+        ti_lmm,
         train_loader, val_loader,
-        lr=1e-3,
-        loss_mode='quantile',
-        quantiles=(0.1, 0.5, 0.9),
-        use_intermittent=True,
-        future_exo_cb=future_exo_cb,
-        exo_is_normalized=True
+        lr = 1e-3, loss_mode = 'point', tta_steps = 3
     )
-    results['PatchMixer Quantile'] = best_pm_quantile
+    results['Titan LMM'] = best_ti_lmm
+
+    print('Titan Seq2Seq')
+    best_ti_seq2seq = train_titan(
+        ti_seq2seq,
+        train_loader, val_loader,
+        lr = 1e-3, loss_mode = 'point', tta_steps = 3
+    )
+    results['Titan Seq2Seq'] = best_ti_seq2seq
+
+    print('Titan Patch')
+    best_ti_patch = train_titan(
+        ti_patch,
+        train_loader, val_loader,
+        lr = 1e-3, loss_mode = 'point', tta_steps = 3
+    )
+    results['Titan Patch'] = best_ti_patch
+
 
     return results
 

@@ -96,17 +96,17 @@ class DefaultAdapter:
             # t: [B,H] or [B,H,1] or [B,H,Q]
             if t.dim() == 2:  # [B,H] -> [B,H,1]
                 t1 = t.unsqueeze(-1)
-                out = model.revin_layer(t1, 'denorm')
+                out = model.revin(t1, 'denorm')
                 return out.squeeze(-1)
             if t.dim() == 3 and t.size(-1) in (1, 3):  # [B,H,1] or [B,H,3] (예: quantiles)
                 outs = []
                 for i in range(t.size(-1)):
                     ti = t[..., i].unsqueeze(-1)  # [B,H,1]
-                    oi = model.revin_layer(ti, 'denorm').squeeze(-1)
+                    oi = model.revin(ti, 'denorm').squeeze(-1)
                     outs.append(oi)
                 return torch.stack(outs, dim=-1)  # [B,H,Q]
             # 기타 형상은 그대로 시도
-            return model.revin_layer(t, 'denorm')
+            return model.revin(t, 'denorm')
 
         if hasattr(model, "revin_layer"):
             if isinstance(y, dict):

@@ -21,12 +21,12 @@ class PatchMixerConfig(TrainingConfig):
     per_branch_dim: int = 128
     fusion: str = 'concat'
 
-    # ===== 신규: 달력/주기/외생 파라미터를 설정에서 일괄 관리 =====
-    date_type: Literal['M', 'W'] = 'M'           # 'M' 월간, 'W' 주간
-    season_period: int = 12                      # TemporalExpander의 사인/코사인 주기
-    max_harmonics: int = 8                       # TemporalExpander에서 쓰는 최대 하모닉 수
-    n_harmonics: int = 4                         # DecompositionQuantileHead용 Fourier K
-    f_out: int = 128                             # Expander 출력 차원
+    # Temporal Expander 옵션
+    date_type: Literal['M', 'W'] = 'M'                      # 'M' 월간, 'W' 주간
+    expander_season_period: int = 12                                 # TemporalExpander의 사인/코사인 주기
+    expander_max_harmonics: int = 8                                  # TemporalExpander에서 쓰는 최대 하모닉 수
+    expander_n_harmonics: int = 4                                    # DecompositionQuantileHead용 Fourier K
+    expander_f_out: int = 128                                        # Expander 출력 차원
 
     # Exogenous (현재 단계: calendar_sin_cos만 사용)
     use_calendar_exo: bool = True
@@ -44,9 +44,9 @@ class PatchMixerConfigMonthly(PatchMixerConfig):
     # 데이터 특성에 맞게 권장 기본값 예시
     lookback: int = 36
     horizon: int = 48
-    season_period: int = 12
-    max_harmonics: int = 8
-    n_harmonics: int = 6   # 월간은 낮은 K 권장(지나친 고주파 억제)
+    expander_season_period: int = 12
+    expander_max_harmonics: int = 8
+    expander_n_harmonics: int = 6   # 월간은 낮은 K 권장(지나친 고주파 억제)
 
 
 @dataclass
@@ -55,6 +55,6 @@ class PatchMixerConfigWeekly(PatchMixerConfig):
     date_type: str = 'W'
     lookback: int = 54
     horizon: int = 27
-    season_period: int = 52
-    max_harmonics: int = 16
-    n_harmonics: int = 8   # 주간은 계절 성분이 풍부해 K를 조금 더 허용
+    expander_season_period: int = 52
+    expander_max_harmonics: int = 16
+    expander_n_harmonics: int = 8   # 주간은 계절 성분이 풍부해 K를 조금 더 허용
