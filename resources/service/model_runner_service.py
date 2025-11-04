@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Iterable, Optional, Dict, Any, Callable
 import polars as pl
 
-from modeling_module.utils.exogenous_utils import calendar_cb
+from modeling_module.utils.exogenous_utils import calendar_sin_cos
 from resources.domain.forecast_usecase import ForecastUseCase
 from resources.domain.training_usecase import TrainingUseCase
 
@@ -28,7 +28,7 @@ class ModelRunnerService:
         *,
         data_loader: Optional[Iterable] = None,
         device: str = "cuda",
-        future_exo_cb: Optional[Callable] = calendar_cb,
+        future_exo_cb: Optional[Callable] = calendar_sin_cos,
         horizon: int = 120,
         target_channel: int = 0,
     ) -> pl.DataFrame:

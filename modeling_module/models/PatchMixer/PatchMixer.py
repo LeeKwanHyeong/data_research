@@ -6,7 +6,7 @@ from modeling_module.models.PatchMixer.common.configs import PatchMixerConfig
 from modeling_module.models.common_layers.RevIN import RevIN
 from modeling_module.models.common_layers.heads.quantile_heads.decomposition_quantile_head import \
     DecompositionQuantileHead
-from modeling_module.utils.exogenous_utils import _apply_exo_shift_linear
+from modeling_module.utils.exogenous_utils import apply_exo_shift_linear
 from modeling_module.utils.temporal_expander import TemporalExpander
 
 
@@ -18,17 +18,24 @@ class BaseModel(nn.Module):
     PatchMixer Backbone → TemporalExpander → per-step head
     + base(절편+기울기, α-게이트) + step-gate(Conv1d+τ) + DW residual
     """
-    def __init__(self, configs, exo_dim: int = 0):
+    def __init__(self, configs):
         super().__init__()
         self.model_name = 'PatchMixer BaseModel'
 
+        self.horizon = configs.horizon
+        self.f_out = configs.f_out
+
+
+
         self.backbone = PatchMixerBackbone(configs=configs)
         in_dim = self.backbone.patch_repr_dim
-        H = int(configs.horizon)
 
         self.expander = TemporalExpander(
-            d_in=in_dim, horizon=H, f_out=128, dropout=0.1,
-            use_sinus=True, season_period=52, max_harmonics=16, use_conv=True
+            d_in = in_dim, horizon = self.horizon, f_out = self.f_out, dropout = 0.1,
+            use_sinus = True,
+            season_period = int(getattr(configs, 'season_period', 52)),
+            max_harmonics = int(getattr(configs, 'max_harmonics', 16)),
+            use_conv = True
         )
 
         # RevIN(norm 전용; denorm은 forecaster)
@@ -40,22 +47,23 @@ class BaseModel(nn.Module):
         self.base_gate   = nn.Linear(in_dim, 1)
         nn.init.constant_(self.base_gate.bias, -2.5)  # 초기엔 resid 쪽이 크게
 
-        # head 경로
-        self.pre_ln = nn.LayerNorm(128)
+        self.pre_ln = nn.LayerNorm(self.f_out)
         self.head = nn.Sequential(
-            nn.Linear(128, 128),
+            nn.Linear(self.f_out, self.f_out),
             nn.GELU(),
-            nn.Linear(128, 1)
+            nn.Linear(self.f_out, 1)
         )
+
         self.resid_scale = nn.Parameter(torch.tensor(1.2))
 
         # ---- Step gate: H-방향 Conv + τ 가법 ----
-        self.gate_ln = nn.LayerNorm(128)
+        self.gate_ln = nn.LayerNorm(self.f_out)
+
 
         # 멀티스케일 컨볼루션: 3x, 5x, dilated-3 병렬 후 1x1로 축소
-        self.gate_conv_3 = nn.Conv1d(128, 32, kernel_size=3, padding=1, dilation=1)
-        self.gate_conv_5 = nn.Conv1d(128, 32, kernel_size=5, padding=2, dilation=1)
-        self.gate_conv_d3 = nn.Conv1d(128, 32, kernel_size=3, padding=2, dilation=2)
+        self.gate_conv_3 = nn.Conv1d(self.f_out, 32, kernel_size=3, padding=1, dilation=1)
+        self.gate_conv_5 = nn.Conv1d(self.f_out, 32, kernel_size=5, padding=2, dilation=1)
+        self.gate_conv_d3 = nn.Conv1d(self.f_out, 32, kernel_size=3, padding=2, dilation=2)
         self.gate_reduce = nn.Conv1d(96, 1, kernel_size=1)  # 32*3 -> 1
         self.gate_act = nn.GELU()
         self.gate_do = nn.Dropout(0.1)
@@ -76,8 +84,7 @@ class BaseModel(nn.Module):
         self.dw_gain = nn.Parameter(torch.tensor(1.0))
 
         # 외생
-        self.horizon = H
-        self.exo_dim = int(exo_dim)
+        self.exo_dim = int(configs.exo_dim)
         if self.exo_dim > 0:
             self.exo_head = nn.Sequential(
                 nn.Linear(self.exo_dim, 64),
@@ -89,12 +96,17 @@ class BaseModel(nn.Module):
 
         self.final_nonneg = True  # 추론시에만 clamp
 
-    def forward(self, x: torch.Tensor, future_exo: torch.Tensor | None = None) -> torch.Tensor:
+    def forward(self,
+                x: torch.Tensor,
+                future_exo: torch.Tensor | None = None,
+                *,
+                exo_is_normalized: bool = True
+                ) -> torch.Tensor:
         # 1) 정규화(denorm은 forecaster)
         x = self.revin(x, 'norm')                 # [B,L,C]
         z = self.backbone(x)                      # [B,D]
-        x_bhf = self.expander(z)                  # [B,H,128]
-        x_bhf_n = self.pre_ln(x_bhf)              # [B,H,128]
+        x_bhf = self.expander(z)                  # [B,H,F]
+        x_bhf_n = self.pre_ln(x_bhf)              # [B,H,F]
 
         B, H = z.size(0), self.horizon
         # t01 = torch.linspace(0, 1, H, device=z.device).unsqueeze(0)
@@ -114,7 +126,7 @@ class BaseModel(nn.Module):
 
 
         # 4) step gate (Conv1d on H + τ)
-        xg = self.gate_ln(x_bhf_n).transpose(1, 2)  # [B,128,H]
+        xg = self.gate_ln(x_bhf_n).transpose(1, 2)  # [B,F,H]
         g1 = self.gate_act(self.gate_conv_3(xg))  # [B,32,H]
         g2 = self.gate_act(self.gate_conv_5(xg))  # [B,32,H]
         g3 = self.gate_act(self.gate_conv_d3(xg))  # [B,32,H]
@@ -135,8 +147,18 @@ class BaseModel(nn.Module):
 
         # 6) exogenous(정규화 공간 기준이면 여기서 더함)
         if (self.exo_head is not None) and (future_exo is not None):
-            ex = self.exo_head(future_exo).squeeze(-1)             # [B,H]
-            y = y + ex
+            ex = apply_exo_shift_linear(
+                self.exo_head, future_exo,
+                horizon = self.horizon,
+                out_dtype = y.dtype,
+                out_device = y.device
+            )  # (B, H)
+            if exo_is_normalized:
+                # RevIN 기준 normalize space에서 더하고, 이후 한 번에 denorm
+                y = y + ex
+            else:
+                # 원단위 exo면 denorm 이후에 가산
+                pass
 
         # 7) scale/bias + H축 DW 곡률
         y = y * self.out_scale + self.out_bias
@@ -144,6 +166,9 @@ class BaseModel(nn.Module):
         y  = y + self.dw_gain * yc
 
         y = self.revin(y.unsqueeze(-1), 'denorm').squeeze(-1)
+        if (self.exo_head is not None) and (future_exo is not None) and (not exo_is_normalized):
+            # 원단위 exo는 역정규화 이후에 가산
+            y = y + ex
 
         # 8) 추론시에만 비음수 클램프
         if getattr(self, 'final_nonneg', False) and (not self.training):
@@ -152,84 +177,6 @@ class BaseModel(nn.Module):
 
         return y
 
-# -------------------------
-# Simple PatchMixer + Feature Branch
-# -------------------------
-class FeatureModel(nn.Module):
-    """
-    Timeseries + static/exogenous feature combined head.
-    ts_input:      (B, L, N)
-    feature_input: (B, F)
-    future_exo:    (B, Hx, exo_dim) | None
-    """
-    def __init__(self, configs: PatchMixerConfig, feature_dim: int = 4, exo_dim: int = 0):
-        super().__init__()
-        self.model_name = 'PatchMixer FeatureModel'
-
-        self.backbone = PatchMixerBackbone(configs = configs)
-
-        # Feature Branch
-        self.feature_out_dim = 8
-        self.feature_mlp = nn.Sequential(
-            nn.Linear(feature_dim, 16),
-            nn.ReLU(),
-            nn.Linear(16, self.feature_out_dim),
-            nn.ReLU()
-        )
-
-        # Patch representation projection
-        self.proj = nn.Sequential(
-            nn.Linear(self.backbone.patch_repr_dim, 128),
-            nn.ReLU(),
-            nn.Dropout(0.10)
-        )
-
-        combined_dim = 128 + self.feature_out_dim
-
-        self.fc = nn.Sequential(
-            nn.Linear(combined_dim, 64),
-            nn.ReLU(),
-            nn.Linear(64, configs.horizon)
-        )
-
-        self.horizon = int(configs.horizon)
-        self.exo_dim = int(exo_dim)
-        self.exo_head = None
-        if self.exo_dim > 0:
-            self.exo_head = nn.Sequential(
-                nn.Linear(self.exo_dim, 64),
-                nn.GELU(),
-                nn.Linear(64, 1),  # (B, Hx, 1)
-            )
-        self.revin = RevIN(configs.enc_in)
-
-    def forward(self,
-                ts_input: torch.Tensor,
-                feature_input: torch.Tensor,
-                future_exo: torch.Tensor | None = None
-                ) -> torch.Tensor:
-        """
-        ts_input: (B, L, N)
-        feature_input: (B, F)
-        """
-        ts_input = self.revin(ts_input, 'norm')
-        patch_repr = self.backbone(ts_input)                              # (B, a * d_model)
-        patch_repr = self.proj(patch_repr)                                # (B, 128)
-
-        feature_repr = self.feature_mlp(feature_input)                    # (B, feature_out_dim)
-        combined = torch.cat([patch_repr, feature_repr], dim = 1)  # (B, 128 + feature_out_dim)
-        out = self.fc(combined)
-
-        if (self.exo_head is not None) and (future_exo is not None):
-            ex = _apply_exo_shift_linear(
-                self.exo_head, future_exo,
-                horizon=self.horizon,
-                out_dtype=out.dtype,
-                out_device=out.device
-            )  # (B, H)
-            out = out + ex
-        # out = self.revin(out, 'denorm')
-        return out  # (B, H)
 # -------------------------
 # Simple PatchMixer + Decomposition Quantile Head
 # -------------------------
@@ -240,50 +187,54 @@ class QuantileModel(nn.Module):
     + (선택) exogenous shift 동일 적용
     """
     def __init__(self,
-                 base_configs,
-                 patch_cfgs = ((4, 2, 5), (8, 4, 7), (12, 6, 9)),
-                 fused_dim: int = 256,
-                 horizon: int | None = None,
-                 per_branch_dim: int = 128,
-                 fusion: str = 'concat',
-                 n_harmonics: int = 4,
-                 exo_dim: int = 0,
-                 f_out: int = 128 # <-- expander 출력 차원
+                 configs: PatchMixerConfig,
                  ):
         super().__init__()
         self.is_quantile = True
         self.model_name = 'PatchMixer QuantileModel'
+        self.patch_cfgs = configs.patch_cfgs
+        self.fused_dim = configs.fused_dim
+        self.horizon = configs.horizon
+        self.per_branch_dim = configs.per_branch_dim
+        self.fusion = configs.fusion
+        self.n_harmonics = configs.n_harmonics
+        self.exo_dim = configs.exo_dim
+        self.f_out = configs.f_out
 
-        H = horizon if horizon is not None else base_configs.horizon
-        self.horizon = int(H)
 
         # 1) Backbone: 전역 벡터 [B, D]
         self.backbone = MultiScalePatchMixerBackbone(
-            base_configs=base_configs,
-            patch_cfgs=patch_cfgs,
-            per_branch_dim=per_branch_dim,
-            fused_dim=fused_dim,
-            fusion=fusion,
+            base_configs=configs,
+            patch_cfgs=self.patch_cfgs,
+            per_branch_dim=self.per_branch_dim,
+            fused_dim=self.fused_dim,
+            fusion=self.fusion,
         )
         d_in = self.backbone.out_dim
 
         # 2) Temporal Expander: [B,D] -> [B,H,F]
-        self.expander = TemporalExpander(d_in=d_in, horizon=H, f_out=f_out, dropout=0.1)
+        self.expander = TemporalExpander(
+            d_in=d_in, horizon=self.horizon, f_out=self.f_out, dropout=0.1,
+            use_sinus=True,
+            season_period=int(getattr(configs, "season_period", 52)),
+            max_harmonics=int(getattr(configs, "max_harmonics", 16)),
+            use_conv=True
+        )
 
         # 3) Decomposition Quantile Head (V2): [B,H,F] -> [B,Q,H]
         self.head = DecompositionQuantileHead(
-            in_features=f_out,
+            in_features=self.f_out,
             quantiles=[0.1, 0.5, 0.9],
             hidden=128,
-            dropout=float(getattr(base_configs, 'head_dropout', 0.0) or 0.0),
+            dropout=float(getattr(configs, 'head_dropout', 0.0) or 0.0),
             mid=0.5,
             use_trend=True,
-            fourier_k=n_harmonics,
+            fourier_k=self.n_harmonics,
             agg="mean",
         )
 
         # (선택) exogenous shift
-        self.exo_dim = int(exo_dim)
+        self.exo_dim = int(self.exo_dim)
         self.exo_head = None
         if self.exo_dim > 0:
             self.exo_head = nn.Sequential(
@@ -292,7 +243,7 @@ class QuantileModel(nn.Module):
                 nn.Linear(64, 1)
             )
 
-        self.revin = RevIN(base_configs.enc_in)  # enc_in=1 가정
+        self.revin = RevIN(configs.enc_in)  # enc_in=1 가정
 
     def _denorm_quantiles_with_revin(self, q_bqh: torch.Tensor) -> torch.Tensor:
         """
@@ -344,7 +295,7 @@ class QuantileModel(nn.Module):
         #    - exo_is_normalized=True: RevIN 기준 공간에서 학습/입력된 exo라면 denorm 이전에 더함
         #    - exo_is_normalized=False: 원 단위라면 denorm 이후에 더해야 함
         if (self.exo_head is not None) and (future_exo is not None) and exo_is_normalized:
-            ex = _apply_exo_shift_linear(
+            ex = apply_exo_shift_linear(
                 self.exo_head, future_exo,
                 horizon=self.horizon,
                 out_dtype=q.dtype,
@@ -355,7 +306,7 @@ class QuantileModel(nn.Module):
 
         # 6) exogenous가 원 단위일 때는 여기서 더하세요.
         if (self.exo_head is not None) and (future_exo is not None) and (not exo_is_normalized):
-            ex = _apply_exo_shift_linear(
+            ex = apply_exo_shift_linear(
                 self.exo_head, future_exo,
                 horizon=self.horizon,
                 out_dtype=q.dtype,

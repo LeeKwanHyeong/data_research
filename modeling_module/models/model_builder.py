@@ -7,10 +7,6 @@ def build_patch_mixer_base(cfg: PatchMixerConfig):
     from modeling_module.models.PatchMixer.PatchMixer import BaseModel
     return BaseModel(cfg)
 
-def build_patch_mixer_feature(cfg: PatchMixerConfig):
-    from modeling_module.models.PatchMixer.PatchMixer import FeatureModel
-    return FeatureModel(cfg)
-
 def build_patch_mixer_quantile(cfg: PatchMixerConfig):
     from modeling_module.models.PatchMixer.PatchMixer import QuantileModel
     return QuantileModel(cfg)

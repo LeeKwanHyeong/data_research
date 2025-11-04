@@ -1,7 +1,6 @@
 from dataclasses import dataclass, field
 from typing import Tuple, Optional, Literal
 import torch
-LossMode = Literal['auto', 'point', 'quantile']
 
 
 @dataclass
@@ -11,6 +10,36 @@ class DecompositionConfig:
     stl_period: int = 12
     concat_mode: Literal["concat", "residual_only", "trend_only"] = "concat"
 
+# ---------------- Spike-aware Loss Configs ---------------- #
+@dataclass
+class SpikeLossConfig:
+    """
+    스파이크 친화 손실을 켤지/어떻게 섞을지에 대한 설정.
+    - enabled: True면 spike-friendly 조합 손실을 사용
+    - strategy: 'mix' | 'direct'
+        * 'mix'   : WeightedHuber + AsymmetricMSE를 (alpha, beta)로 섞음 (+ 옵션으로 baseline까지)
+        * 'direct': 단일 함수형 손실(예: huber_asymmetric)을 그대로 사용
+    - 아래 가중/임계값은 spikes나 과대예측 페널티를 제어
+    """
+    enabled: bool = True
+    strategy: Literal['mix', 'direct'] = 'mix'
+
+    # 공통 파라미터
+    huber_delta: float = 5.0
+    asym_up_weight: float = 2.0  # 과대예측( pred>y ) 가중
+    asym_down_weight: float = 1.0
+
+    # mix 전용(스파이크 위치 가중)
+    mad_k: float = 3.5          # 스파이크 탐지 임계(k-MAD)
+    w_spike: float = 6.0        # 스파이크 구간 가중
+    w_norm: float = 1.0         # 일반 구간 가중
+    alpha_huber: float = 0.7    # WeightedHuber 비중
+    beta_asym: float = 0.3      # AsymMSE 비중
+
+    # baseline(기존 LossComputer)와 혼합할지
+    mix_with_baseline: bool = False
+    gamma_baseline: float = 0.2
+
 @dataclass
 class TrainingConfig:
     # ------------Loader------------
@@ -19,21 +48,25 @@ class TrainingConfig:
     horizon: int = 27
 
     # ------------Training------------
-    epochs: int = 100
+    epochs: int = 50
     lr: float = 1e-4
     weight_decay: float = 1e-4
     t_max: int = 10                 # CosineAnnealingLR
     patience: int = 50
     max_grad_norm: float = 30.0
     amp_device: str = 'cuda'        # 'cuda' | 'cpu'
+
+
     # ------------Loss-------------
-    loss_mode: LossMode = 'auto'
-    point_loss: Literal['mae', 'mse', 'huber', 'pinball'] = 'mse'
-    huber_delta: float = 2.0
+    loss_mode: Literal['auto', 'point', 'quantile'] = 'auto'
+    point_loss: Literal['mae','mse','huber','pinball','huber_asym'] = 'mse'
+    huber_delta: float = 5.0
     q_star: float = 0.5             # point=pinball
     use_cost_q_star: bool = False
     Cu: float = 1.0; Co: float = 1.0 # newsvendor
     quantiles: Tuple[float, ...] = (0.1, 0.5, 0.9)
+
+
     # ------------Intermittent/Horizon Weight-------------
     use_intermittent: bool = True
     alpha_zero: float = 1.2
@@ -42,9 +75,16 @@ class TrainingConfig:
     cap: Optional[float] = None
     use_horizon_decay: bool = False
     tau_h: float = 24.0
+
+
     # ------------Validation Weight-------------
     val_use_weights: bool = False    # 공정평가면 False
+
+
     # ------------Exogenous Value --------------
     exo_dim = 2  # 미래 외생변수 차원(없으면 0)
     nonneg_head = True  # 수요 비음수 보장 (Softplus)
 
+
+    # ------------Spike-friendly Loss-------------- #
+    spike_loss: SpikeLossConfig = field(default_factory=SpikeLossConfig)
