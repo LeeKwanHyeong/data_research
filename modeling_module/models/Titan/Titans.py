@@ -16,32 +16,45 @@ from modeling_module.models.common_layers.heads.expander_head import ExpanderHea
 def _ensure_config_instance(config):
     return config() if isinstance(config, type) else config
 
-def _denorm_forecast_from_revin(revin, y_h: torch.Tensor) -> torch.Tensor:
-    """
-    y_h: [B, H]  (모델 출력, RevIN normalized space)
-    RevIN에서 저장된 mean/stdev/last를 이용해 [B,H]에 맞춰 역정규화.
-    subtract_last=True이면 last를 기준으로 복원.
-    """
-    # RevIN이 아직 통계가 없다면 그대로 반환
-    mean  = getattr(revin, "mean",  None)
-    stdev = getattr(revin, "stdev", None)
-    last  = getattr(revin, "last",  None)
-    if (stdev is None) or ((last is None) and (mean is None)):
+
+def _denorm_forecast_from_revin(
+    revin: RevIN,
+    y_h: torch.Tensor,                  # [B,H] (RevIN 공간)
+    *,
+    hist_x: Optional[torch.Tensor] = None,
+    ch: int = 0,
+    base_mix: float = 0.5,              # ← mean~last 혼합 가중(0~1)
+    floor_ratio: float = 0.0,
+    floor_min: float = 0.0
+) -> torch.Tensor:
+    mean  = getattr(revin, "_cached_mean", None)
+    std   = getattr(revin, "_cached_std",  None)
+    last  = getattr(revin, "_cached_last", None)
+
+    if (revin.subtract_last and last is None) or ((not revin.subtract_last) and (mean is None)):
         return y_h
 
-    # RevIN 통계는 보통 [B,1,C] 형태. (univariate면 C=1)
-    # C>1 멀티변량인 경우, 예측 대상 채널 index를 써서 골라주면 됩니다(여기선 0번 가정).
-    ch = 0
-    device = y_h.device
-    dtype  = y_h.dtype
-
-    st = stdev[..., ch].squeeze(1).to(device=device, dtype=dtype)      # [B]
-    if getattr(revin, "subtract_last", False) and (last is not None):
-        base = last[..., ch].squeeze(1).to(device=device, dtype=dtype)  # [B]
+    device, dtype = y_h.device, y_h.dtype
+    if revin.subtract_last:
+        base = last[..., ch].squeeze(1).to(device=device, dtype=dtype)
     else:
-        base = mean[..., ch].squeeze(1).to(device=device, dtype=dtype)  # [B]
+        m = mean[..., ch].squeeze(1).to(device=device, dtype=dtype)
+        if last is not None:
+            l = last[..., ch].squeeze(1).to(device=device, dtype=dtype)
+            w = float(base_mix)
+            base = w * l + (1.0 - w) * m
+        else:
+            base = m
 
-    return y_h * st.unsqueeze(1) + base.unsqueeze(1)                    # [B,H]
+    if revin.use_std:
+        st = std[..., ch].squeeze(1).to(device=device, dtype=dtype)
+        if (hist_x is not None) and (floor_ratio > 0.0 or floor_min > 0.0):
+            raw_std = hist_x[..., ch].std(dim=1).to(dtype=dtype)
+            floor = torch.clamp(floor_ratio * raw_std, min=floor_min)
+            st = torch.maximum(st, floor)
+        return y_h * st.unsqueeze(1) + base.unsqueeze(1)
+    else:
+        return y_h + base.unsqueeze(1)
 
 # =========================
 # Titan Base (point model)
@@ -49,9 +62,9 @@ def _denorm_forecast_from_revin(revin, y_h: torch.Tensor) -> torch.Tensor:
 class Model(nn.Module):
     """
     Titan BaseModel
-      - RevIN: norm-only inside model; NO denorm here (forecaster denorms)
+      - RevIN: norm-only inside model; NO direct self.revin(...,'denorm') on [B,H]
       - Encoder: MemoryEncoder
-      - Head: Linear(D->H) (+ Softplus if nonneg_head=True)
+      - Head: ExpanderHead (기본) or Linear(+Softplus)
       - Optional exogenous term (time-distributed)
     """
     is_quantile: bool = False
@@ -63,8 +76,13 @@ class Model(nn.Module):
         self.model_name = "Titan BaseModel"
         self.horizon = cfg.horizon
 
-        # RevIN (norm only)
-        self.revin = RevIN(num_features=cfg.input_dim, affine=True, subtract_last=True)
+        # 간헐수요 안전: 센터링 전용(표준편차 사용 X)
+        self.revin = RevIN(
+            num_features=cfg.input_dim,
+            affine=True,
+            subtract_last=False,
+            use_std=False,                 # ← 핵심: Titan만 센터링 전용
+        )
 
         # Backbone
         self.encoder = MemoryEncoder(
@@ -75,15 +93,15 @@ class Model(nn.Module):
         self.use_temporal_expander = getattr(cfg, "use_temporal_expander", True)
         if self.use_temporal_expander:
             self.output_head = ExpanderHead(
-                d_model = cfg.d_model,
-                horizon = cfg.horizon,
-                f_out = getattr(cfg, 'expander_f_out', 128),
-                nonneg = getattr(cfg, 'nonneg_head', True),
-                use_sinus = getattr(cfg, 'expander_use_sinus', True),
-                season_period = getattr(cfg, 'expander_season_period', 52),
-                max_harmonics = getattr(cfg, 'expander_max_harmonics', 16),
-                use_conv = getattr(cfg, 'expander_use_conv', True),
-                dropout = getattr(cfg, 'expander_dropout', 0.1)
+                d_model=cfg.d_model,
+                horizon=cfg.horizon,
+                f_out=getattr(cfg, 'expander_f_out', 128),
+                nonneg=getattr(cfg, 'nonneg_head', True),
+                use_sinus=getattr(cfg, 'expander_use_sinus', True),
+                season_period=getattr(cfg, 'expander_season_period', 52),
+                max_harmonics=getattr(cfg, 'expander_max_harmonics', 16),
+                use_conv=getattr(cfg, 'expander_use_conv', True),
+                dropout=getattr(cfg, 'expander_dropout', 0.1)
             )
         else:
             nonneg = getattr(cfg, 'nonneg_head', True)
@@ -103,64 +121,53 @@ class Model(nn.Module):
         else:
             self.exo_head = None
 
-        # Optional final clamp (safety net)
         self.final_clamp_nonneg = getattr(cfg, "final_clamp_nonneg", True)
 
     def forward(
         self,
-        x: torch.Tensor,                          # [B,L,C]
-        future_exo: Optional[torch.Tensor] = None,  # [B,H,exo_dim] or None
+        x: torch.Tensor,                             # [B,L,C]
+        future_exo: Optional[torch.Tensor] = None,   # [B,H,exo_dim] or None
         mode: Optional[str] = None,
-    ) -> torch.Tensor:                            # returns [B,H] in NORMALIZED space
+    ) -> torch.Tensor:                               # returns [B,H] (raw scale)
         # 1) RevIN normalize
-        x_n = self.revin(x, "norm")         # [B,L,C]
+        x_n = self.revin(x, "norm")                  # [B,L,C]
 
         # 2) Encode
-        enc = self.encoder(x_n)                   # [B,L,D]
+        enc = self.encoder(x_n)                      # [B,L,D]
         if enc.dim() != 3:
             raise RuntimeError(f"Encoder must return [B,L,D], got {tuple(enc.shape)}")
 
         # 3) Head (last token)
         z_last = enc[:, -1, :]
         if self.use_temporal_expander:
-            y_n = self.output_head(z_last)        # [B, H]
+            y_n = self.output_head(z_last)           # [B, H] (RevIN 공간)
         else:
-            y_n = self.output_proj(z_last)        # [B, H]
+            y_n = self.output_proj(z_last)           # [B, H]
 
-        # y_n = self.revin(y_n, 'denorm')
-        y_n = _denorm_forecast_from_revin(self.revin, y_n)
+        # 4) 안전 denorm ([B,H] 전용)
+        y = _denorm_forecast_from_revin(
+            self.revin, y_n, hist_x=x, ch=0, floor_ratio=0.0, floor_min=0.0
+        )
 
-        # 4) Optional exogenous addend
+        # 5) Optional exogenous addend (raw space에서 합산)
         if (self.exo_head is not None) and (future_exo is not None):
             if future_exo.dim() != 3 or future_exo.size(1) != self.horizon:
                 raise ValueError(
                     f"future_exo must be [B,H,exo_dim] with H={self.horizon}, got {tuple(future_exo.shape)}"
                 )
             exo_term = self.exo_head(future_exo).squeeze(-1)  # [B,H]
-            y_n = y_n + exo_term
+            y = y + exo_term
 
-        # 5) Optional final clamp in normalized space (keeps ≥0 after Softplus + addends)
         if self.final_clamp_nonneg:
-            y_n = torch.clamp_min(y_n, 0.0)
+            y = torch.clamp_min(y, 0.0)
 
-
-        # NOTE: NO denorm here — forecaster handles it consistently.
-        return y_n
+        return y
 
 
 # =========================
 # Titan + LMM
 # =========================
 class LMMModel(nn.Module):
-    """
-    Titan + LMM
-      - RevIN: norm-only inside model; NO denorm here
-      - Encoder: MemoryEncoder
-      - LMM: Local Memory Matching
-      - Head: Linear(D->H) (+ Softplus if nonneg_head=True)
-      - TrendCorrector
-      - Optional exogenous term
-    """
     is_quantile: bool = False
 
     def __init__(self, config: TitanConfig):
@@ -170,7 +177,12 @@ class LMMModel(nn.Module):
         self.model_name = "Titan LMMModel"
         self.horizon = cfg.horizon
 
-        self.revin = RevIN(num_features=cfg.input_dim, affine=True, subtract_last=True)
+        self.revin = RevIN(
+            num_features=cfg.input_dim,
+            affine=True,
+            subtract_last=False,
+            use_std=False,                 # 센터링 전용
+        )
 
         self.encoder = MemoryEncoder(
             cfg.input_dim, cfg.d_model, cfg.n_layers, cfg.n_heads, cfg.d_ff,
@@ -199,8 +211,6 @@ class LMMModel(nn.Module):
                 head.append(nn.Softplus())
             self.output_proj = nn.Sequential(*head)
 
-        # self.trend_corrector = TrendCorrector(d_model=cfg.d_model, out_dim=cfg.horizon)
-
         self.exo_dim = getattr(cfg, "exo_dim", 0)
         if self.exo_dim > 0:
             self.exo_head = nn.Sequential(
@@ -214,10 +224,6 @@ class LMMModel(nn.Module):
         self.final_clamp_nonneg = getattr(cfg, "final_clamp_nonneg", True)
 
     def _collect_memories(self, enc: torch.Tensor) -> torch.Tensor:
-        """
-        Assemble memory for LMM: contextual + persistent + encoded.
-        Returns [B,M,D].
-        """
         B, L, D = enc.shape
         mem_chunks = []
 
@@ -247,66 +253,44 @@ class LMMModel(nn.Module):
 
     def forward(
         self,
-        x: torch.Tensor,                          # [B,L,C]
-        future_exo: Optional[torch.Tensor] = None,  # [B,H,exo_dim] or None
+        x: torch.Tensor,                             # [B,L,C]
+        future_exo: Optional[torch.Tensor] = None,   # [B,H,exo_dim] or None
         mode: str = "train",
-    ) -> torch.Tensor:                            # returns [B,H] in NORMALIZED space
-        # 1) RevIN normalize
+    ) -> torch.Tensor:                               # [B,H] (raw scale)
         x_n = self.revin(x, "norm")
-
-        # 2) Encode
-        enc = self.encoder(x_n)                   # [B,L,D]
+        enc = self.encoder(x_n)
         if enc.dim() != 3:
             raise RuntimeError(f"Encoder must return [B,L,D], got {tuple(enc.shape)}")
 
-        # 3) LMM augmentation
-        memory = self._collect_memories(enc)      # [B,M,D]
-        enhanced = self.lmm(enc, memory)          # [B,L,D]
-
-        # 4) Head (last token)
+        memory = self._collect_memories(enc)
+        enhanced = self.lmm(enc, memory)
+        enhanced = enc + enhanced  # ← residual (추가)
         z_last = enhanced[:, -1, :]
         if self.use_temporal_expander:
-            y_core_n = self.output_head(z_last)     # [B, H]
+            y_core_n = self.output_head(z_last)      # [B,H]
         else:
-            y_core_n = self.output_proj(z_last)     # [B, H]
+            y_core_n = self.output_proj(z_last)      # [B,H]
 
+        y = _denorm_forecast_from_revin(self.revin, y_core_n, hist_x=x, ch=0)
 
-        # 5) Trend correction (vector input)
-        # y_n = y_core_n + self.trend_corrector(enhanced[:, -1, :])  # [B,H]
-
-        y_n = y_core_n
-        # y_n = self.revin(y_n, 'denorm')
-        y_n = _denorm_forecast_from_revin(self.revin, y_n)
-
-        # 6) Optional exogenous term
         if (self.exo_head is not None) and (future_exo is not None):
             if future_exo.dim() != 3 or future_exo.size(1) != self.horizon:
                 raise ValueError(
                     f"future_exo must be [B,H,exo_dim] with H={self.horizon}, got {tuple(future_exo.shape)}"
                 )
-            exo_term = self.exo_head(future_exo).squeeze(-1)  # [B,H]
-            y_n = y_n + exo_term
+            exo_term = self.exo_head(future_exo).squeeze(-1)
+            y = y + exo_term
 
         if self.final_clamp_nonneg:
-            y_n = torch.clamp_min(y_n, 0.0)
+            y = torch.clamp_min(y, 0.0)
 
-
-        return y_n
+        return y
 
 
 # =========================
 # Titan Patch + LMM
 # =========================
 class PatchLMMModel(nn.Module):
-    """
-    Patch-based Titan + LMM
-      - RevIN: norm-only inside model; NO denorm here
-      - Encoder: PatchMemoryEncoder
-      - LMM
-      - Head (+ Softplus if nonneg_head=True)
-      - TrendCorrector
-      - Optional exogenous term
-    """
     is_quantile: bool = False
 
     def __init__(self, config: TitanConfig):
@@ -317,7 +301,12 @@ class PatchLMMModel(nn.Module):
         self.horizon = getattr(cfg, "horizon", getattr(cfg, "output_horizon", None))
         assert self.horizon is not None, "config.horizon (or output_horizon) is required"
 
-        self.revin = RevIN(num_features=cfg.input_dim, affine=True, subtract_last=True)
+        self.revin = RevIN(
+            num_features=cfg.input_dim,
+            affine=True,
+            subtract_last=False,
+            use_std=False,                 # 센터링 전용
+        )
 
         # Patch-based encoder
         self.encoder = PatchMemoryEncoder(
@@ -358,9 +347,6 @@ class PatchLMMModel(nn.Module):
                 head.append(nn.Softplus())
             self.output_proj = nn.Sequential(*head)
 
-        # self.trend_corrector = TrendCorrector(d_model=cfg.d_model, out_dim=self.horizon)
-
-        # Which memory to use for LMM: 'encoded' | 'context'
         self.lmm_memory_source = getattr(cfg, "lmm_memory_source", "encoded")
 
         self.exo_dim = getattr(cfg, "exo_dim", 0)
@@ -376,7 +362,6 @@ class PatchLMMModel(nn.Module):
         self.final_clamp_nonneg = getattr(cfg, "final_clamp_nonneg", True)
 
     def _get_lmm_memory(self, enc: torch.Tensor) -> torch.Tensor:
-        """Return [B,M,D] memory tensor for LMM."""
         B, Lp, D = enc.shape
         if self.lmm_memory_source == "context":
             ctx = None
@@ -390,69 +375,46 @@ class PatchLMMModel(nn.Module):
 
     def forward(
         self,
-        x: torch.Tensor,                           # [B,L,C]
-        future_exo: Optional[torch.Tensor] = None, # [B,H,exo_dim] or None
+        x: torch.Tensor,                             # [B,L,C]
+        future_exo: Optional[torch.Tensor] = None,   # [B,H,exo_dim] or None
         mode: str = "train",
-    ) -> torch.Tensor:                             # returns [B,H] in NORMALIZED space
-        # 1) RevIN normalize
+    ) -> torch.Tensor:                               # [B,H] (raw scale)
         x_n = self.revin(x, "norm")
-
-        # 2) Encode
-        enc = self.encoder(x_n)                    # [B,L',D]
+        enc = self.encoder(x_n)
         if enc.dim() != 3:
             raise RuntimeError(f"Encoder must return [B,L,D], got {tuple(enc.shape)}")
 
-        # 3) LMM
-        memory = self._get_lmm_memory(enc)         # [B,M,D]
+        memory = self._get_lmm_memory(enc)
         if memory.dim() == 2:
             memory = memory.unsqueeze(0).expand(enc.size(0), -1, -1)
-        enhanced = self.lmm(enc, memory)           # [B,L',D]
+        enhanced = self.lmm(enc, memory)
 
-        # 4) Head
-        # y_core_n = self.output_proj(enhanced[:, -1, :])   # [B,H]
         z_last = enhanced[:, -1, :]
         if self.use_temporal_expander:
-            y_core_n = self.output_head(z_last)     # [B,H]
+            y_core_n = self.output_head(z_last)      # [B,H]
         else:
-            y_core_n = self.output_proj(z_last)     # [B,H]
+            y_core_n = self.output_proj(z_last)      # [B,H]
 
-        # 5) Trend (vector input)
-        # y_n = y_core_n + self.trend_corrector(enhanced[:, -1, :])  # [B,H]
-        y_n = y_core_n
+        y = _denorm_forecast_from_revin(self.revin, y_core_n, hist_x=x, ch=0)
 
-
-        # y_n = self.revin(y_n, 'denorm')
-        y_n = _denorm_forecast_from_revin(self.revin, y_n)
-
-        # 6) Optional exogenous addend
         if (self.exo_head is not None) and (future_exo is not None):
             if future_exo.dim() != 3 or future_exo.size(1) != self.horizon:
                 raise ValueError(
                     f"future_exo must be [B,H,exo_dim] with H={self.horizon}, got {tuple(future_exo.shape)}"
                 )
-            exo_term = self.exo_head(future_exo).squeeze(-1)  # [B,H]
-            y_n = y_n + exo_term
+            exo_term = self.exo_head(future_exo).squeeze(-1)
+            y = y + exo_term
 
         if self.final_clamp_nonneg:
-            y_n = torch.clamp_min(y_n, 0.0)
+            y = torch.clamp_min(y, 0.0)
 
-
-        return y_n
+        return y
 
 
 # =========================
 # Titan LMM Seq2Seq
 # =========================
 class LMMSeq2SeqModel(nn.Module):
-    """
-    Titan LMM Seq2Seq
-      - RevIN: norm-only inside model; NO denorm here
-      - Encoder: MemoryEncoder
-      - Decoder: TitanDecoder (causal)
-      - Head: time-distributed Linear→(Softplus optional)→squeeze
-      - TrendCorrector
-      - Optional exogenous term
-    """
     is_quantile: bool = False
 
     def __init__(self, config: TitanConfig):
@@ -463,7 +425,12 @@ class LMMSeq2SeqModel(nn.Module):
         self.horizon = getattr(cfg, "horizon", getattr(cfg, "output_horizon", None))
         assert self.horizon is not None, "config.horizon is required"
 
-        self.revin = RevIN(num_features=cfg.input_dim, affine=True, subtract_last=True)
+        self.revin = RevIN(
+            num_features=cfg.input_dim,
+            affine=True,
+            subtract_last=False,
+            use_std=False,                 # 센터링 전용
+        )
 
         self.encoder = MemoryEncoder(
             cfg.input_dim, cfg.d_model, cfg.n_layers, cfg.n_heads, cfg.d_ff,
@@ -510,87 +477,42 @@ class LMMSeq2SeqModel(nn.Module):
         x: torch.Tensor,                              # [B,L,C]
         future_exo: Optional[torch.Tensor] = None,    # [B,H,exo_dim] or None
         mode: str = "train",
-    ) -> torch.Tensor:                                # returns [B,H] in NORMALIZED space
-        # 1) RevIN normalize
+    ) -> torch.Tensor:                                # [B,H] (raw scale)
         x_n = self.revin(x, "norm")
-
-        # 2) Encode
-        enc = self.encoder(x_n)                       # [B,L,D]
+        enc = self.encoder(x_n)
         if enc.dim() != 3:
             raise RuntimeError(f"Encoder must return [B,L,D], got {tuple(enc.shape)}")
 
-        # 3) Decode (causal)
         dec = self.decoder(enc, future_exo)           # [B,H,D]
 
-        # 4) Time-distributed head
+        z_last = enc[:, -1, :]  # [B,D]
+        dec = dec + z_last.unsqueeze(1).expand(-1, self.horizon, -1)  # ← residual
+
+
         y_core_n = self.output_proj(dec).squeeze(-1)  # [B,H]
+        y_core_n = y_core_n + self.trend_corrector(enc[:, -1, :])  # [B,H]
 
-        # 5) Trend (vector input)
-        y_n = y_core_n + self.trend_corrector(enc[:, -1, :])  # [B,H]
+        y = _denorm_forecast_from_revin(self.revin, y_core_n, hist_x=x, ch=0)
 
-        # 6) Optional exogenous addend
         if (self.exo_head is not None) and (future_exo is not None):
             if future_exo.dim() != 3 or future_exo.size(1) != self.horizon:
                 raise ValueError(
                     f"future_exo must be [B,H,exo_dim] with H={self.horizon}, got {tuple(future_exo.shape)}"
                 )
-            exo_term = self.exo_head(future_exo).squeeze(-1)  # [B,H]
-            y_n = y_n + exo_term
+            exo_term = self.exo_head(future_exo).squeeze(-1)
+            y = y + exo_term
 
         if self.final_clamp_nonneg:
-            y_n = torch.clamp_min(y_n, 0.0)
+            y = torch.clamp_min(y, 0.0)
 
-        # y_n = self.revin(y_n, 'denorm')
-        y_n = _denorm_forecast_from_revin(self.revin, y_n)
-
-        return y_n
-
-
-# =========================
-# Titan FeatureModel
-# =========================
-class FeatureModel(nn.Module):
-    """
-    Titan FeatureModel
-      - Encoder: MemoryEncoder
-      - Simple feature projection and fusion (add)
-      - Head: Linear(D -> H)
-      - RevIN: not applied here by design
-    """
-    is_quantile: bool = False
-
-    def __init__(self, config: TitanConfig, feature_dim: int = 7):
-        super().__init__()
-        cfg = _ensure_config_instance(config)
-
-        self.model_name = "Titan FeatureModel"
-        self.horizon = cfg.horizon
-
-        self.encoder = MemoryEncoder(
-            cfg.input_dim, cfg.d_model, cfg.n_layers, cfg.n_heads, cfg.d_ff,
-            cfg.contextual_mem_size, cfg.persistent_mem_size
-        )
-
-        self.feature_proj = nn.Linear(feature_dim, cfg.d_model)
-        self.output_proj = nn.Linear(cfg.d_model, cfg.horizon)
-
-    def forward(self, x: torch.Tensor, feature_x: torch.Tensor) -> torch.Tensor:
-        enc = self.encoder(x)                        # [B,L,D]
-        if enc.dim() != 3:
-            raise RuntimeError(f"Encoder must return [B,L,D], got {tuple(enc.shape)}")
-
-        feat = self.feature_proj(feature_x).unsqueeze(1)  # [B,1,D]
-        combined = enc[:, -1, :] + feat.squeeze(1)       # [B,D]
-        return self.output_proj(combined)                # [B,H]
+        return y
 
 
 # =========================
 # Test-Time Memory Manager
 # =========================
 class TestTimeMemoryManager:
-    """
-    Lightweight TTA (Test-Time Adaptation) helper for Titan-family models.
-    """
+    """Lightweight TTA helper for Titan-family models."""
     def __init__(self, model: nn.Module, lr: float = 1e-4):
         self.model = model
         self.optimizer = optim.Adam(model.parameters(), lr=lr)
@@ -598,9 +520,6 @@ class TestTimeMemoryManager:
 
     @torch.no_grad()
     def add_context(self, new_context: torch.Tensor) -> None:
-        """
-        Push contextual memory to every encoder layer (MAC).
-        """
         device = next(self.model.parameters()).device
         new_context = new_context.to(device).detach()
         if not hasattr(self.model, "encoder") or not hasattr(self.model.encoder, "layers"):
@@ -610,9 +529,6 @@ class TestTimeMemoryManager:
                 block.attn.update_contextual_memory(new_context)
 
     def adapt(self, x_new: torch.Tensor, y_new: torch.Tensor, steps: int = 1) -> float:
-        """
-        Simple supervised TTA loop (use sparingly).
-        """
         device = next(self.model.parameters()).device
         x_new = x_new.to(device).float()
         y_new = y_new.to(device).float()

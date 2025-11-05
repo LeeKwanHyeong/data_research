@@ -30,6 +30,7 @@ class TitanConfig(TrainingConfig):
     expander_max_harmonics: int = 8
     expander_n_harmonics: int = 4
     expander_f_out: int = 128
+    final_clamp_nonneg: bool = True
 
     # Exogenous
     use_calendar_exo: bool = True

@@ -147,33 +147,43 @@ def run_total_train_weekly(train_loader, val_loader, device='cuda', *, lookback,
 
     print('Titan Base')
     best_ti_base = train_titan(
-        ti_base,
-        train_loader, val_loader,
-        lr = 1e-3, loss_mode = 'point', tta_steps = 3
+        ti_base, train_loader, val_loader,
+        lr=1e-3,
+        loss_mode='quantile',  # ← 포인트 대신
+        q_star=0.9,  # ← 상향 편향
+        use_cost_q_star=True,  # ← 부족비용 가중
+        Cu=4.0, Co=1.0,  # ← 부족:초과 비용 비
+        tta_steps=3,
     )
     results['Titan Base'] = best_ti_base
 
     print('Titan LMM')
     best_ti_lmm = train_titan(
-        ti_lmm,
-        train_loader, val_loader,
-        lr = 1e-3, loss_mode = 'point', tta_steps = 3
+        ti_lmm, train_loader, val_loader,
+        lr=1e-3,
+        loss_mode='quantile',
+        q_star=0.9, use_cost_q_star=True, Cu=4.0, Co=1.0,
+        tta_steps=3,
     )
     results['Titan LMM'] = best_ti_lmm
 
     print('Titan Seq2Seq')
     best_ti_seq2seq = train_titan(
-        ti_seq2seq,
-        train_loader, val_loader,
-        lr = 1e-3, loss_mode = 'point', tta_steps = 3
+        ti_seq2seq, train_loader, val_loader,
+        lr=1e-3,
+        loss_mode='quantile',
+        q_star=0.9, use_cost_q_star=True, Cu=4.0, Co=1.0,
+        tta_steps=3,
     )
     results['Titan Seq2Seq'] = best_ti_seq2seq
 
     print('Titan Patch')
     best_ti_patch = train_titan(
-        ti_patch,
-        train_loader, val_loader,
-        lr = 1e-3, loss_mode = 'point', tta_steps = 3
+        ti_patch, train_loader, val_loader,
+        lr=1e-3,
+        loss_mode='quantile',
+        q_star=0.9, use_cost_q_star=True, Cu=4.0, Co=1.0,
+        tta_steps=3,
     )
     results['Titan Patch'] = best_ti_patch
 
