@@ -158,3 +158,148 @@ x → MultiScalePatchMixerBackbone(fused_dim=256)
 •	Pinball Loss를 통해 신뢰구간(80%) 기반 불확실성 추정 가능
 
 
+### 1) PatchMixer **BaseModel** (Point Forecast)
+
+```mermaid
+flowchart LR
+    subgraph Inference["PatchMixer BaseModel — Forward( )"]
+      X["x ∈ ℝ[B,L,N]"] --> RVN["RevIN(norm)"]
+      RVN --> BB["PatchMixerBackbone\n• unfold & project W_P\n• depthwise token mixer (Conv1d D-wise)\n• channel mixer (1x1 Conv)\n• var-pooling (mean over N)\n⇒ z ∈ ℝ[B,D]"]
+      BB --> EXP["TemporalExpander\n• sinus pos-enc (season_period, harmonics)\n• optional conv\n⇒ x_bhf ∈ ℝ[B,H,F]"]
+      EXP --> LN["LayerNorm(F)"]
+      LN --> RESID["Residual MLP Head\nLinear→GELU→Linear\n⇒ resid ∈ ℝ[B,H] (zero-mean)"]
+      BB --> BASEB["base_head_b(z) ⇒ b ∈ ℝ[B,1]"]
+      BB --> BASEM["base_head_m(z) ⇒ m ∈ ℝ[B,1]"]
+      BASEB --> BASE["base = b + m⋅t (t: linspace[-1,1]) ⇒ ℝ[B,H]"]
+      BASEM --> BASE
+      BB --> AGATE["base_gate(z) ⇒ α ∈ (0,1)ᵝ\n(bias init=-2.5)"]
+      LN --> GCONV["Step-Gate over H\n• Conv1d k=3,5,dilated3 → concat\n• 1x1 reduce → g_logit\n• τ term + bias/gain/temp\n• clamp & sigmoid → gate ∈ ℝ[B,H]"]
+      GCONV --> MIX
+      RESID --> MIX
+      BASE --> MIX
+      AGATE --> MIX
+      MIX["y = α·base + (1-α)·(gate·resid)"] --> EXO{"future_exo ?"}
+      EXO -->|Yes & normalized| EXA["apply_exo_shift_linear(exo_head)\nadd in normalized space"]
+      EXO -->|Yes & raw-unit| EXB["(denorm 이후 add)"]
+      EXO -->|No| PASS["(skip)"]
+      EXA --> SCALE
+      PASS --> SCALE
+      SCALE["scale/bias: y = y·out_scale + out_bias"] --> DW["Depthwise(1D) Residual\n(kernel=3) → add\n(local curvature)"]
+      DW --> DENORM["RevIN(denorm)"]
+      DENORM --> CLAMP{"inference mode ?"}
+      CLAMP -->|Yes| NN["clamp_min(0)"]
+      CLAMP -->|No| OUT
+      NN --> OUT["ŷ ∈ ℝ[B,H]"]
+    end
+
+```
+
+### 2) PatchMixer **QuantileModel** (q10, q50, q90)
+
+```mermaid
+flowchart LR
+    subgraph Forward["PatchMixer QuantileModel — Forward( )"]
+      X["x ∈ ℝ[B,L,N]"] --> RVN["RevIN(norm)"]
+      RVN --> MSBB["MultiScalePatchMixerBackbone\n• branches: (patch_len,stride,kernel)\n• per-branch proj→per_branch_dim\n• fusion: concat or gated\n⇒ z ∈ ℝ[B,fused_dim]"]
+      MSBB --> EXP["TemporalExpander\n⇒ x_bhf ∈ ℝ[B,H,F]"]
+      EXP --> DQH["DecompositionQuantileHead(V2)\n• trend(+)\n• Fourier K (n_harmonics)\n• quantiles=[.1,.5,.9]\n⇒ q ∈ ℝ[B,3,H] (normalized)"]
+      DQH --> EXO{"future_exo ?"}
+      EXO -->|Yes & normalized| EXA["apply_exo_shift_linear\n(add per-horizon)"]
+      EXO -->|Yes & raw-unit| EXB["(denorm 이후 add)"]
+      EXO -->|No| PASS["(skip)"]
+      EXA --> SLICE["Per-h step denorm via RevIN\n(분위수별/시점별 슬라이스)"]
+      PASS --> SLICE
+      SLICE --> CLAMP{"inference mode ?"}
+      CLAMP -->|Yes| NN["clamp_min(0)"]
+      CLAMP -->|No| OUT
+      NN --> OUT["q_raw ∈ ℝ[B,3,H]"]
+    end
+
+```
+
+---
+
+### 3) **PatchMixerBackbone** (단일 스케일)
+
+```mermaid
+flowchart TB
+    subgraph Backbone["PatchMixerBackbone"]
+      X["x ∈ ℝ[B,L,N]"] --> TP["permute → (B,N,L)"]
+      TP --> PAD["ReplicationPad1d((0,stride))"]
+      PAD --> UNF["unfold(P=patch_len, step=stride)\n⇒ (B,N,A,P)"]
+      UNF --> PROJ["W_P: ℝ[P]→ℝ[d_model]\n⇒ (B,N,A,D)"]
+      PROJ --> RESH["reshape → (B*N, A, D)"]
+      RESH --> PERM["permute → (B*N, D, A)"]
+      PERM -->|× e_layers| MIX["PatchMixerLayer (repeat)\n• token mixer: depthwise Conv1d(D-wise)\n• channel mixer: 1x1 Conv\n• residual add"]
+      MIX --> FLAT["flatten → (B*N, D·A)"]
+      FLAT --> UNV["view → (B,N,D·A)"]
+      UNV --> POOL["mean over N\n⇒ z ∈ ℝ[B,D·A]"]
+    end
+
+```
+
+---
+
+### 4) **MultiScalePatchMixerBackbone** (병렬 분기 + 융합)
+
+```mermaid
+flowchart LR
+    subgraph MS["MultiScalePatchMixerBackbone"]
+      X["x ∈ ℝ[B,L,N]"] --> B1["Branch #1\n(pl,st,ks)"]
+      X --> B2["Branch #2\n(pl,st,ks)"]
+      X --> B3["Branch #3\n(pl,st,ks)"]
+      B1 --> P1["Linear → per_branch_dim"]
+      B2 --> P2["Linear → per_branch_dim"]
+      B3 --> P3["Linear → per_branch_dim"]
+      P1 --> FUS
+      P2 --> FUS
+      P3 --> FUS
+      FUS{"fusion = 'concat' or 'gated'?"}
+      FUS -->|concat| CAT["concat([Bᵢ]) → Linear\n⇒ z ∈ ℝ[B,fused_dim]"]
+      FUS -->|gated| GT["softmax(gates)·stack([Bᵢ]) → Linear\n⇒ z ∈ ℝ[B,fused_dim]"]
+    end
+
+```
+
+---
+
+### 5) **TemporalExpander**(개념 흐름)
+
+```mermaid
+flowchart LR
+    Z["z ∈ ℝ[B,D]"] --> REP["repeat/expand to H"]
+    REP --> FEAT["concat:
+    • sinus/cos seasonals (period, K)
+    • optional conv over H
+	    ⇒ x_bhf ∈ ℝ[B,H,F]"]
+
+```
+
+---
+
+### 6) **Dynamic Patching** 변형(선택): MoS & Learnable Offset
+
+```mermaid
+flowchart TB
+    subgraph MoS["DynamicPatcherMoS (Mixture-of-Strides)"]
+      X["x ∈ ℝ[B,L,N]"] --> GATE["gate_net(xᵗ) ⇒ softmax K"]
+      X --> PBR1["SimpleUnfoldProjector(P1,S1)\n⇒ (B*N,A1,D)"]
+      X --> PBR2["SimpleUnfoldProjector(P2,S2)\n⇒ (B*N,A2,D)"]
+      X --> PBR3["SimpleUnfoldProjector(P3,S3)\n⇒ (B*N,A3,D)"]
+      PBR1 --> PAD1["pad to A_max"]
+      PBR2 --> PAD2["pad to A_max"]
+      PBR3 --> PAD3["pad to A_max"]
+      PAD1 --> SUM
+      PAD2 --> SUM
+      PAD3 --> SUM
+      GATE --> SUM
+      SUM["∑(gateₖ · Zₖ) ⇒ (B*N,A_max,D)"]
+    end
+
+    subgraph OFF["DynamicOffsetPatcher (Learnable Offsets)"]
+      X2["x ∈ ℝ[B,L,N]"] --> OFFH["off_head ⇒ δ ∈ ℝ[B,A]\n(tanh·max_off)"]
+      OFFH --> GRID["anchors + δ → sample grid\n(grid_sample on 1D)"]
+      GRID --> WP["W_P ⇒ (B*N,A,D)"]
+    end
+
+```

@@ -294,37 +294,37 @@ class DefaultAdapter:
             return out
         raise TypeError(f"Model output is not a Tensor/tuple/dict: {type(out)}")
 
-    def _denorm_like_revin(self, model, y):
-        def _denorm_tensor(t):
-            if t.dim() == 2:  # [B,H] -> [B,H,1]
-                t1 = t.unsqueeze(-1)
-                out = model.revin(t1, 'denorm')
-                return out.squeeze(-1)
-            if t.dim() == 3 and t.size(-1) in (1, 3):  # [B,H,1] or [B,H,3]
-                outs = []
-                for i in range(t.size(-1)):
-                    ti = t[..., i].unsqueeze(-1)
-                    oi = model.revin(ti, 'denorm').squeeze(-1)
-                    outs.append(oi)
-                return torch.stack(outs, dim=-1)
-            return model.revin(t, 'denorm')
+    # def _denorm_like_revin(self, model, y):
+    #     def _denorm_tensor(t):
+    #         if t.dim() == 2:  # [B,H] -> [B,H,1]
+    #             t1 = t.unsqueeze(-1)
+    #             out = model.revin(t1, 'denorm')
+    #             return out.squeeze(-1)
+    #         if t.dim() == 3 and t.size(-1) in (1, 3):  # [B,H,1] or [B,H,3]
+    #             outs = []
+    #             for i in range(t.size(-1)):
+    #                 ti = t[..., i].unsqueeze(-1)
+    #                 oi = model.revin(ti, 'denorm').squeeze(-1)
+    #                 outs.append(oi)
+    #             return torch.stack(outs, dim=-1)
+    #         return model.revin(t, 'denorm')
+    #
+    #     if hasattr(model, "revin_layer"):
+    #         if isinstance(y, dict):
+    #             y = dict(y)
+    #             if "point" in y:
+    #                 y["point"] = _denorm_tensor(y["point"])
+    #             if "q" in y:
+    #                 y["q"] = _denorm_tensor(y["q"])
+    #             return y
+    #         return _denorm_tensor(y)
+    #     return y
 
-        if hasattr(model, "revin_layer"):
-            if isinstance(y, dict):
-                y = dict(y)
-                if "point" in y:
-                    y["point"] = _denorm_tensor(y["point"])
-                if "q" in y:
-                    y["q"] = _denorm_tensor(y["q"])
-                return y
-            return _denorm_tensor(y)
-        return y
-
-    def _maybe_denorm(self, model, y):
-        try:
-            return self._denorm_like_revin(model, y)
-        except Exception:
-            return y
+    # def _maybe_denorm(self, model, y):
+    #     try:
+    #         return self._denorm_like_revin(model, y)
+    #     except Exception:
+    #         return y
 
     # -------------------- main --------------------
     def forward(self, model, x_batch, *, future_exo=None, mode=None):
@@ -343,14 +343,14 @@ class DefaultAdapter:
                 if len(x_batch) == 2 and future_exo is None:
                     x_only, exo = x_batch
                     out = self._call_model(model, x_only, future_exo=exo, mode=mode)
-                    if hasattr(model, "revin_layer"):
-                        out = self._maybe_denorm(model, out)
+                    # if hasattr(model, "revin_layer"):
+                    #     out = self._maybe_denorm(model, out)
                     return self._as_tensor(out)
                 x_batch = x_batch[0]
 
         out = self._call_model(model, x_batch, future_exo=future_exo, mode=mode)
-        if hasattr(model, "revin_layer"):
-            out = self._maybe_denorm(model, out)
+        # if hasattr(model, "revin_layer"):
+        #     out = self._maybe_denorm(model, out)
         return self._as_tensor(out)
 
     # -------------------- optional hooks --------------------

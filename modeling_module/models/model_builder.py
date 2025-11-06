@@ -28,11 +28,11 @@ def build_titan_seq2seq(cfg: TitanConfig):
 
 def build_patchTST_base(cfg: PatchTSTConfig):
     from modeling_module.models.PatchTST.supervised.PatchTST import PatchTSTPointModel
-    return PatchTSTPointModel(cfg)
+    return PatchTSTPointModel.from_config(cfg)
 
 def build_patchTST_quantile(cfg: PatchTSTConfig):
     from modeling_module.models.PatchTST.supervised.PatchTST import PatchTSTQuantileModel
-    return PatchTSTQuantileModel(cfg)
+    return PatchTSTQuantileModel.from_config(cfg)
 
 
 

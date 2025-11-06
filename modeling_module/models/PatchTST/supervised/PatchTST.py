@@ -1,8 +1,10 @@
 import torch
 from torch import nn
 
+from modeling_module.models.PatchTST.common.configs import PatchTSTConfig
 from modeling_module.models.PatchTST.supervised.backbone import SupervisedBackbone
 from modeling_module.models.common_layers.RevIN import RevIN
+
 
 
 # ------------------------------
@@ -79,6 +81,10 @@ class PatchTSTPointModel(nn.Module):
         # Forecaster 호환: 속성명을 revin_layer로 통일
         self.revin_layer = RevIN(num_features=cfg.c_in)
 
+    @classmethod
+    def from_config(cls, config: "PatchTSTConfig"):
+        return cls(cfg=config)
+
     def forward(self, x_b_l_c: torch.Tensor, future_exo=None, mode=None) -> torch.Tensor:
         """
         x_b_l_c: [B, L, C] (원공간)
@@ -113,6 +119,10 @@ class PatchTSTQuantileModel(nn.Module):
 
         # Forecaster 호환: 속성명을 revin_layer로 통일
         self.revin_layer = RevIN(num_features=cfg.c_in)
+
+    @classmethod
+    def from_config(cls, config: "PatchTSTConfig"):
+        return cls(cfg=config)
 
     def forward(self, x_b_l_c: torch.Tensor, future_exo=None, mode=None):
         """

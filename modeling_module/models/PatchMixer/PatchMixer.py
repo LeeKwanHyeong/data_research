@@ -9,7 +9,6 @@ from modeling_module.models.common_layers.heads.quantile_heads.decomposition_qua
 from modeling_module.utils.exogenous_utils import apply_exo_shift_linear
 from modeling_module.utils.temporal_expander import TemporalExpander
 
-
 # -------------------------
 # Simple PatchMixer -> Horizon regression
 # -------------------------

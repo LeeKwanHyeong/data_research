@@ -5,6 +5,7 @@ import copy
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 class PatchMixerLayer(nn.Module):
     """
@@ -12,17 +13,18 @@ class PatchMixerLayer(nn.Module):
     - depthwise conv는 채널(D) 기준, 길이는 A 방향
     - 출력 shape 동일: (B*, D, A)
     """
-    def __init__(self, d_model: int, kernel_size: int = 5, dropout: float = 0.0):
+    def __init__(self, d_model: int, kernel_size: int = 5, dropout: float = 0.0, dilation: int = 1):
         super().__init__()
         self.d_model = d_model
+        self.ks = int(kernel_size)
+        self.dilation = int(dilation)
 
+        # Conv는 padding=0로 두고, forward에서 동적으로 pad
         self.token_mixer = nn.Sequential(
             nn.Conv1d(
-                in_channels=d_model,
-                out_channels=d_model,
-                kernel_size=kernel_size,
-                padding="same",
-                groups=d_model,   # depthwise
+                in_channels=d_model, out_channels=d_model,
+                kernel_size=self.ks, stride=1, padding=0,  # ★ 0
+                dilation=self.dilation, groups=d_model  # depthwise
             ),
             nn.GELU(),
             nn.BatchNorm1d(d_model),
@@ -34,13 +36,24 @@ class PatchMixerLayer(nn.Module):
         )
         self.dropout = nn.Dropout(dropout)
 
+    def _same_pad_1d(self, L: int) -> tuple[int, int]:
+        # SAME padding 총량 = dil*(ks-1)
+        total = self.dilation * (self.ks - 1)
+        left = total // 2
+        right = total - left
+        return left, right
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: (B*, D, A)
         res = x
-        x = self.token_mixer(x)     # (B*, D, A)
-        x = self.channel_mixer(x)   # (B*, D, A)
+        L = x.size(-1)
+        pl, pr = self._same_pad_1d(L)
+        if pl or pr:
+            x = F.pad(x, (pl, pr))   # (left, right)
+        x = self.token_mixer(x)      # (B*, D, A) 길이 보존
+        x = self.channel_mixer(x)
         x = self.dropout(x)
-        return x + res              # (B*, D, A)
+        return x + res                # 길이 동일 → 문제 없음
 
 
 class PatchMixerBackbone(nn.Module):

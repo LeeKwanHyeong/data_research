@@ -5,19 +5,16 @@ from dataclasses import asdict, is_dataclass
 from typing import Optional, Callable
 
 import torch
+from torch.utils.data import DataLoader, WeightedRandomSampler
+
 from modeling_module.training.adapters import TitanAdapter, DefaultAdapter
-from modeling_module.training.config import TrainingConfig
+from modeling_module.training.config import TrainingConfig, StageConfig, apply_stage
 from modeling_module.training.engine import CommonTrainer
 from modeling_module.utils.exogenous_utils import calendar_sin_cos
 
 
 def _pick_future_exo_cb(model, user_cb: Optional[Callable]) -> Optional[Callable]:
-    """
-    외생변수 콜백 선택 우선순위:
-    1) 사용자가 명시적으로 준 콜백
-    2) model.config.use_calendar_exo=True 또는 exo_dim>0 → calendar_sin_cos
-    3) 그 외 None
-    """
+    """우선순위: 사용자 콜백 > 모델이 캘린더 사용 → calendar_sin_cos > 없음"""
     if user_cb is not None:
         return user_cb
 
@@ -34,32 +31,58 @@ def _pick_future_exo_cb(model, user_cb: Optional[Callable]) -> Optional[Callable
 
     return calendar_sin_cos if use_calendar else None
 
+
 def _dump_cfg(cfg):
     data = asdict(cfg) if is_dataclass(cfg) else cfg.__dict__
     print("[train_titan] Effective TrainingConfig:")
     print(json.dumps(data, indent=2, ensure_ascii=False, default=str))
+
+
+def _maybe_make_spike_loader(train_loader: DataLoader, enable: bool) -> DataLoader:
+    """
+    2단계에서만 스파이크 샘플을 더 자주 보게 하는 간단 오버샘플러.
+    Dataset에 `sample_is_spike` (bool array-like)가 있으면 가중 샘플러 적용.
+    """
+    if (not enable) or (not hasattr(train_loader.dataset, "sample_is_spike")):
+        return train_loader
+
+    import numpy as np
+    m = np.asarray(train_loader.dataset.sample_is_spike, dtype=bool)
+    w = np.where(m, 3.0, 1.0).astype("float32")  # 스파이크:기본 = 3:1
+    sampler = WeightedRandomSampler(weights=w, num_samples=len(w), replacement=True)
+
+    return DataLoader(
+        train_loader.dataset,
+        batch_size=train_loader.batch_size,
+        sampler=sampler,
+        num_workers=train_loader.num_workers,
+        pin_memory=getattr(train_loader, "pin_memory", True),
+        drop_last=getattr(train_loader, "drop_last", False),
+        collate_fn=getattr(train_loader, "collate_fn", None),
+    )
+
 
 def train_titan(
     model,
     train_loader,
     val_loader,
     *,
+    stages: list[StageConfig] | None = None,
     train_cfg: Optional[TrainingConfig] = None,
     future_exo_cb=None,
 ):
     """
-    - train_cfg가 있으면 그 값을 우선 사용
-    - 개별 인자(lr, loss_mode 등)는 train_cfg가 None일 때만 fallback으로 적용
+    2-stage 커리큘럼 지원:
+      - stages 가 없으면 기존처럼 train_cfg 한 번만 학습
+      - stages 가 있으면 각 StageConfig로 train_cfg를 덮어써서 연속 학습
     """
+    assert train_cfg is not None, "train_cfg는 필수입니다."
 
-    adapter = DefaultAdapter()  # Titan 전용 어댑터 사용 중이면 여기서 교체
+    # 외생변수 콜백 자동 선택(사용자 지정이 우선)
+    future_exo_cb = _pick_future_exo_cb(model, future_exo_cb)
 
-    _dump_cfg(train_cfg)
-
-    # amp_device 기본값 처리
+    # AMP 설정
     amp_device = getattr(train_cfg, "amp_device", "cuda")
-
-    # 사용자가 cfg에 amp_dtype를 문자열로 줄 수도 있으니 안전하게 해석
     amp_dtype_str = getattr(train_cfg, "amp_dtype", "bf16")
     if isinstance(amp_dtype_str, torch.dtype):
         amp_dtype = amp_dtype_str
@@ -72,94 +95,37 @@ def train_titan(
         elif s in ("fp32", "float32"):
             amp_dtype = torch.float32
         else:
-            amp_dtype = torch.bfloat16  # 기본값
-
+            amp_dtype = torch.bfloat16
     amp_enabled = (amp_device == "cuda" and torch.cuda.is_available())
+    autocast_input = dict(device_type=amp_device, enabled=amp_enabled, dtype=amp_dtype)
 
-    autocast_input = {
-        "device_type": amp_device,
-        "enabled": amp_enabled,
-        "dtype": amp_dtype,  # ← 문자열이 아닌 torch.dtype 로 전달
-    }
+    adapter = DefaultAdapter()  # 필요 시 TitanAdapter로 교체
 
-    trainer = CommonTrainer(
-        cfg=train_cfg,
-        adapter=adapter,
-        future_exo_cb=future_exo_cb,
-        logger=print,
-        autocast_input=autocast_input,
-    )
-    model = trainer.fit(model, train_loader, val_loader, tta_steps=2)
-    return {
-        "model": model,
-        "cfg": train_cfg,
-    }
+    # 스테이지 목록 구성 (없으면 단일 스테이지)
+    if not stages or len(stages) == 0:
+        stages = [StageConfig(epochs=train_cfg.epochs, spike_enabled=train_cfg.spike_loss.enabled)]
 
-# def train_titan(
-#     model,
-#     train_loader,
-#     val_loader,
-#     *,
-#     future_exo_cb: Optional[Callable] = None,  # 외생변수 생성 콜백(선택)
-#     exo_is_normalized: bool = True,            # 어댑터/모델에서 필요 시 사용할 힌트
-#     tta_steps: int = 0,
-#     **overrides
-# ):
-#     """
-#     Titan 학습 트레이너 (PatchMixer/PatchTST 스타일 정렬)
-#     - TrainingConfig + CommonTrainer + TitanAdapter 사용
-#     - model.config/use_calendar_exo/exo_dim 여부에 따라 캘린더 sin/cos 자동 주입
-#     - TTA는 어댑터 훅만 유지(기본 비활성)
-#     """
-#     # 1) 기본 하이퍼파라미터 + 사용자 override
-#     base_cfg = dict(
-#         loss_mode="point",
-#         point_loss="huber_asym",
-#         use_intermittent=True,
-#         val_use_weights=False,
-#     )
-#
-#     # TrainingConfig 필드로 제한하여 깨끗하게 반영
-#     allowed = {
-#         "device","lookback","horizon","epochs","lr","weight_decay","t_max",
-#         "patience","max_grad_norm","amp_device","huber_delta","q_star",
-#         "use_cost_q_star","Cu","Co","quantiles","use_intermittent","alpha_zero",
-#         "alpha_pos","gamma_run","cap","use_horizon_decay","tau_h","val_use_weights"
-#     }
-#     clean_overrides = {k: v for k, v in overrides.items() if k in allowed}
-#     base_cfg.update(clean_overrides)
-#     cfg = TrainingConfig(**base_cfg)
-#
-#     # 2) 외생변수 콜백 결정
-#     fe_cb = _pick_future_exo_cb(model, future_exo_cb)
-#
-#     # 3) AMP 설정(bf16 추천)
-#     amp_device: str = getattr(cfg, "amp_device", "cuda")
-#     amp_enabled: bool = (amp_device == "cuda" and torch.cuda.is_available())
-#     autocast_input = dict(
-#         device_type=amp_device,
-#         enabled=amp_enabled,
-#         dtype=torch.bfloat16,
-#     )
-#
-#     # 4) 공통 트레이너 실행
-#     adapter = TitanAdapter()
-#     trainer = CommonTrainer(
-#         cfg,
-#         adapter,
-#         logger=print,
-#         metrics_fn=None,
-#         future_exo_cb=fe_cb,
-#         autocast_input=autocast_input,
-#     )
-#
-#     best_model = trainer.fit(model, train_loader, val_loader, tta_steps=tta_steps)
-#
-#     # 5) 로깅
-#     print(
-#         f"[EXO-train] exo_dim={getattr(model, 'exo_dim', 0)} "
-#         f"exo_head? {hasattr(model, 'exo_head') and (getattr(model, 'exo_head') is not None)} "
-#         f"future_exo_cb? {fe_cb is not None} "
-#         f"tta_steps={tta_steps}"
-#     )
-#     return best_model
+    best = None
+    for i, stg in enumerate(stages, 1):
+        # 스테이지별 cfg 적용
+        cfg_i = apply_stage(train_cfg, stg)
+        print(f"\n[train_titan] ===== Stage {i}/{len(stages)} =====")
+        print(f"  - spike: {'ON' if cfg_i.spike_loss.enabled else 'OFF'}")
+        print(f"  - epochs: {cfg_i.epochs} | lr={cfg_i.lr} | horizon_decay={cfg_i.use_horizon_decay}")
+        _dump_cfg(cfg_i)
+
+        # (선택) 2단계에서만 오버샘플링 적용
+        tl_i = _maybe_make_spike_loader(train_loader, enable=cfg_i.spike_loss.enabled)
+
+        # 스테이지 트레이너 생성 및 실행
+        trainer = CommonTrainer(
+            cfg=cfg_i,
+            adapter=adapter,
+            future_exo_cb=future_exo_cb,
+            logger=print,
+            autocast_input=autocast_input,
+        )
+        model = trainer.fit(model, tl_i, val_loader, tta_steps=2)
+        best = {"model": model, "cfg": cfg_i}
+
+    return best

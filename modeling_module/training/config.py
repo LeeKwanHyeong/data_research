@@ -1,6 +1,8 @@
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Tuple, Optional, Literal
 import torch
+
+
 
 
 @dataclass
@@ -40,6 +42,9 @@ class SpikeLossConfig:
     # baseline(기존 LossComputer)와 혼합할지
     mix_with_baseline: bool = False
     gamma_baseline: float = 0.2
+
+    def with_enabled(self, flag: bool) -> "SpikeLossConfig":
+        return replace(self, enabled=bool(flag))
 
 
 @dataclass
@@ -90,3 +95,43 @@ class TrainingConfig:
 
     # ------------Spike-friendly Loss-------------- #
     spike_loss: SpikeLossConfig = field(default_factory=SpikeLossConfig)
+
+    def copy_with(self, **kwargs) -> "TrainingConfig":
+        """dataclasses.replace 래퍼: 지정한 필드만 바꾼 사본을 반환"""
+        return replace(self, **kwargs)
+
+@dataclass
+class StageConfig:
+    epochs: int
+    # 이 스테이지에서 덮어쓸 옵션들만 선택적으로 지정
+    spike_enabled: Optional[bool] = None
+    lr: Optional[float] = None
+    use_horizon_decay: Optional[bool] = None
+    tau_h: Optional[float] = None
+    huber_delta: Optional[float] = None
+    # (선택) 스파이크 가중·정의 강화
+    w_spike: Optional[float] = None
+    mad_k: Optional[float] = None
+    asym_down_weight: Optional[float] = None
+
+def apply_stage(base: TrainingConfig, stg: StageConfig) -> TrainingConfig:
+    cfg = replace(base)
+    if stg.spike_enabled is not None:
+        cfg.spike_loss.enabled = stg.spike_enabled
+    if stg.lr is not None:
+        cfg.lr = stg.lr
+    if stg.use_horizon_decay is not None:
+        cfg.use_horizon_decay = stg.use_horizon_decay
+    if stg.tau_h is not None:
+        cfg.tau_h = stg.tau_h
+    if stg.huber_delta is not None:
+        cfg.huber_delta = stg.huber_delta
+    if stg.w_spike is not None:
+        cfg.spike_loss.w_spike = stg.w_spike
+    if stg.mad_k is not None:
+        cfg.spike_loss.mad_k = stg.mad_k
+    if stg.asym_down_weight is not None:
+        cfg.spike_loss.asym_down_weight = stg.asym_down_weight
+    # 이 스테이지에서만 쓸 epoch 수
+    cfg.epochs = stg.epochs
+    return cfg
