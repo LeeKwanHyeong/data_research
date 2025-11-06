@@ -530,5 +530,3 @@ class MultiPartDataModule:
             )
 
         return DataLoader(ds, batch_size = self.batch_size, shuffle = False)
-
-

@@ -102,48 +102,48 @@ def run_total_train_weekly(
     results: Dict[str, Dict] = {}
 
     # ---------------- PatchMixer ----------------
-    # pm_base_config = PatchMixerConfigWeekly(
-    #         lookback = lookback,
-    #         horizon = horizon,
-    #         device = device,
-    #         loss_mode = 'point',
-    #         point_loss = 'mae'
-    #     )
-    #
-    # pm_quantile_config = PatchMixerConfigWeekly(
-    #     lookback = lookback,
-    #     horizon = horizon,
-    #     device = device,
-    #     loss_mode = 'quantile',
-    #     quantiles = (0.1, 0.5, 0.9)
-    # )
-    #
-    #
-    # pm_base_model = build_patch_mixer_base(pm_base_config)
-    # pm_quantile_model = build_patch_mixer_quantile(pm_quantile_config)
-    #
-    # print('PatchMixer Base (Weekly)')
-    # best_pm_base = train_patchmixer(
-    #     pm_base_model,
-    #     train_loader, val_loader,
-    #     train_cfg= point_train_cfg,  # cfg 선택
-    #     stages=stages,
-    #     future_exo_cb=future_exo_cb,
-    #     exo_is_normalized=True
-    # )
-    # results['PatchMixer Base'] = best_pm_base
-    #
-    # print('PatchMixer Quantile (Weekly)')
-    # best_pm_quantile = train_patchmixer(
-    #     pm_quantile_model,
-    #     train_loader, val_loader,
-    #     train_cfg=quantile_train_cfg,
-    #     stages=stages,
-    #     future_exo_cb=future_exo_cb,
-    #     exo_is_normalized=True
-    # )
-    # results['PatchMixer Quantile'] = best_pm_quantile
-    #
+    pm_base_config = PatchMixerConfigWeekly(
+            lookback = lookback,
+            horizon = horizon,
+            device = device,
+            loss_mode = 'point',
+            point_loss = 'mae'
+        )
+
+    pm_quantile_config = PatchMixerConfigWeekly(
+        lookback = lookback,
+        horizon = horizon,
+        device = device,
+        loss_mode = 'quantile',
+        quantiles = (0.1, 0.5, 0.9)
+    )
+
+
+    pm_base_model = build_patch_mixer_base(pm_base_config)
+    pm_quantile_model = build_patch_mixer_quantile(pm_quantile_config)
+
+    print('PatchMixer Base (Weekly)')
+    best_pm_base = train_patchmixer(
+        pm_base_model,
+        train_loader, val_loader,
+        train_cfg= point_train_cfg,  # cfg 선택
+        stages=stages,
+        future_exo_cb=future_exo_cb,
+        exo_is_normalized=True
+    )
+    results['PatchMixer Base'] = best_pm_base
+
+    print('PatchMixer Quantile (Weekly)')
+    best_pm_quantile = train_patchmixer(
+        pm_quantile_model,
+        train_loader, val_loader,
+        train_cfg=quantile_train_cfg,
+        stages=stages,
+        future_exo_cb=future_exo_cb,
+        exo_is_normalized=True
+    )
+    results['PatchMixer Quantile'] = best_pm_quantile
+
     # # ---------------- Titan (Quantile + TTA) ----------------
     # ti_config = TitanConfig(
     #     lookback=lookback,
@@ -199,55 +199,55 @@ def run_total_train_weekly(
 
     # ---------------- PatchTST ----------------
 
-    print('PatchTST Base')
-    pt_point_config = PatchTSTConfig(
-        device=device,
-        lookback=lookback,
-        horizon=horizon,
-        loss_mode='point',
-        point_loss='huber',  # 권장
-        c_in=1,  # 입력 채널
-        d_model=256,
-        n_layers=3,
-        patch_len=16,
-        stride=8,
-    )
-    pt_base = build_patchTST_base(pt_point_config)
-
-    pt_quantile_config = PatchTSTConfig(
-        device=device,
-        lookback=lookback,
-        horizon=horizon,
-        loss_mode='quantile',
-        quantiles=(0.1, 0.5, 0.9),
-        c_in=1,
-        d_model=256,
-        n_layers=3,
-        patch_len=16,
-        stride=8,
-    )
-    pt_quantile = build_patchTST_quantile(pt_quantile_config)
-
-    print('PatchTST Base (Weekly)')
-    best_pt_base = train_patchtst(
-        pt_base,
-        train_loader, val_loader,
-        train_cfg=point_train_cfg,
-        stages=stages,
-        future_exo_cb=future_exo_cb,
-    )
-    results['PatchTST Base'] = best_pt_base
-
-    print('PatchTST Quantile (Weekly)')
-    best_pt_quantile = train_patchtst(
-        pt_quantile,
-        train_loader, val_loader,
-        train_cfg=quantile_train_cfg,
-        stages=stages,
-        future_exo_cb=future_exo_cb,
-        exo_is_normalized=True
-    )
-    results['PatchTST Quantile'] = best_pt_quantile
+    # print('PatchTST Base')
+    # pt_point_config = PatchTSTConfig(
+    #     device=device,
+    #     lookback=lookback,
+    #     horizon=horizon,
+    #     loss_mode='point',
+    #     point_loss='huber',  # 권장
+    #     c_in=1,  # 입력 채널
+    #     d_model=256,
+    #     n_layers=3,
+    #     patch_len=16,
+    #     stride=8,
+    # )
+    # pt_base = build_patchTST_base(pt_point_config)
+    #
+    # pt_quantile_config = PatchTSTConfig(
+    #     device=device,
+    #     lookback=lookback,
+    #     horizon=horizon,
+    #     loss_mode='quantile',
+    #     quantiles=(0.1, 0.5, 0.9),
+    #     c_in=1,
+    #     d_model=256,
+    #     n_layers=3,
+    #     patch_len=16,
+    #     stride=8,
+    # )
+    # pt_quantile = build_patchTST_quantile(pt_quantile_config)
+    #
+    # print('PatchTST Base (Weekly)')
+    # best_pt_base = train_patchtst(
+    #     pt_base,
+    #     train_loader, val_loader,
+    #     train_cfg=point_train_cfg,
+    #     stages=stages,
+    #     future_exo_cb=future_exo_cb,
+    # )
+    # results['PatchTST Base'] = best_pt_base
+    #
+    # print('PatchTST Quantile (Weekly)')
+    # best_pt_quantile = train_patchtst(
+    #     pt_quantile,
+    #     train_loader, val_loader,
+    #     train_cfg=quantile_train_cfg,
+    #     stages=stages,
+    #     future_exo_cb=future_exo_cb,
+    #     exo_is_normalized=True
+    # )
+    # results['PatchTST Quantile'] = best_pt_quantile
 
 
     return results

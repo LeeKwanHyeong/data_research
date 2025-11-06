@@ -83,17 +83,20 @@ class BaseModel(nn.Module):
         self.dw_gain = nn.Parameter(torch.tensor(1.0))
 
         # 외생
-        self.exo_dim = int(configs.exo_dim)
+        self.exo_dim = int(getattr(configs, 'exo_dim', 0))
+        self.exo_head = None
         if self.exo_dim > 0:
-            self.exo_head = nn.Sequential(
-                nn.Linear(self.exo_dim, 64),
-                nn.GELU(),
-                nn.Linear(64, 1)
-            )
-        else:
-            self.exo_head = None
+            self._build_exo_head(self.exo_dim)
 
         self.final_nonneg = True  # 추론시에만 clamp
+
+    def _build_exo_head(self, E: int):
+        self.exo_head = nn.Sequential(
+            nn.Linear(E, 64),
+            nn.GELU(),
+            nn.Linear(64, 1)
+        )
+        self.exo_dim = int(E)
 
     def forward(self,
                 x: torch.Tensor,
@@ -145,18 +148,28 @@ class BaseModel(nn.Module):
         y = alpha * base + (1.0 - alpha) * (gate * resid)          # [B,H]
 
         # 6) exogenous(정규화 공간 기준이면 여기서 더함)
-        if (self.exo_head is not None) and (future_exo is not None):
+        if future_exo is not None:
+            # 안전장치: exo_head가 없거나 in_features가 다르면 1회 보정
+            if (self.exo_head is None) or (future_exo.size(-1) != self.exo_dim):
+                new_E = int(future_exo.size(-1))
+                # 경고: 최적은 학습 전에 세팅하는 것
+                if self.training:
+                    print(f"[PatchMixer/BaseModel][warn] exo_dim mismatch "
+                          f"(model={self.exo_dim}, batch={new_E}). "
+                          f"Rebuilding exo_head on-the-fly. "
+                          f"Prefer setting exo_dim before optimizer is built.")
+                self._build_exo_head(new_E)
+
             ex = apply_exo_shift_linear(
                 self.exo_head, future_exo,
-                horizon = self.horizon,
-                out_dtype = y.dtype,
-                out_device = y.device
-            )  # (B, H)
+                horizon=self.horizon,
+                out_dtype=y.dtype,
+                out_device=y.device
+            )
             if exo_is_normalized:
-                # RevIN 기준 normalize space에서 더하고, 이후 한 번에 denorm
                 y = y + ex
             else:
-                # 원단위 exo면 denorm 이후에 가산
+                # denorm 이후 가산 (기존 로직 유지)
                 pass
 
         # 7) scale/bias + H축 DW 곡률
@@ -233,16 +246,20 @@ class QuantileModel(nn.Module):
         )
 
         # (선택) exogenous shift
-        self.exo_dim = int(self.exo_dim)
+        self.exo_dim = int(getattr(configs, 'exo_dim', 0))
         self.exo_head = None
         if self.exo_dim > 0:
-            self.exo_head = nn.Sequential(
-                nn.Linear(self.exo_dim, 64),
-                nn.GELU(),
-                nn.Linear(64, 1)
-            )
+            self._build_exo_head(self.exo_dim)
 
         self.revin = RevIN(configs.enc_in)  # enc_in=1 가정
+
+    def _build_exo_head(self, E: int):
+        self.exo_head = nn.Sequential(
+            nn.Linear(E, 64),
+            nn.GELU(),
+            nn.Linear(64, 1)
+        )
+        self.exo_dim = int(E)
 
     def _denorm_quantiles_with_revin(self, q_bqh: torch.Tensor) -> torch.Tensor:
         """
@@ -290,28 +307,28 @@ class QuantileModel(nn.Module):
 
         q = self._ensure_bqh(q, self.horizon, qlen=3)
 
-        # 4) (선택) exogenous shift
-        #    - exo_is_normalized=True: RevIN 기준 공간에서 학습/입력된 exo라면 denorm 이전에 더함
-        #    - exo_is_normalized=False: 원 단위라면 denorm 이후에 더해야 함
-        if (self.exo_head is not None) and (future_exo is not None) and exo_is_normalized:
-            ex = apply_exo_shift_linear(
-                self.exo_head, future_exo,
-                horizon=self.horizon,
-                out_dtype=q.dtype,
-                out_device=q.device
-            )  # (B, H)
-            q = q + ex.unsqueeze(1)          # (B, 3, H)
+        if future_exo is not None:
+            if (self.exo_head is None) or (future_exo.size(-1) != self.exo_dim):
+                new_E = int(future_exo.size(-1))
+                if self.training:
+                    print(f"[PatchMixer/QuantileModel][warn] exo_dim mismatch "
+                          f"(model={self.exo_dim}, batch={new_E}). "
+                          f"Rebuilding exo_head on-the-fly. "
+                          f"Prefer setting exo_dim before optimizer is built.")
+                self._build_exo_head(new_E)
 
+            if exo_is_normalized:
+                ex = apply_exo_shift_linear(self.exo_head, future_exo,
+                                            horizon=self.horizon,
+                                            out_dtype=q.dtype, out_device=q.device)
+                q = q + ex.unsqueeze(1)
+            else:
+                # denorm 이후 가산 (기존 로직 유지)
+                ex = apply_exo_shift_linear(self.exo_head, future_exo,
+                                            horizon=self.horizon,
+                                            out_dtype=q.dtype, out_device=q.device)
+                q = q + ex.unsqueeze(1)
 
-        # 6) exogenous가 원 단위일 때는 여기서 더하세요.
-        if (self.exo_head is not None) and (future_exo is not None) and (not exo_is_normalized):
-            ex = apply_exo_shift_linear(
-                self.exo_head, future_exo,
-                horizon=self.horizon,
-                out_dtype=q.dtype,
-                out_device=q.device
-            )  # (B, H)
-            q = q + ex.unsqueeze(1)          # (B, 3, H)
 
         qs = []
         for i in range(q.size(-1)):

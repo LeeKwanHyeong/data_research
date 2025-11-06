@@ -6,6 +6,8 @@ from dataclasses import asdict, is_dataclass
 from typing import Optional, Callable
 
 import torch
+import torch.nn as nn  # NEW: exo_head 재구성을 위해
+
 from torch.utils.data import DataLoader, WeightedRandomSampler
 
 from modeling_module.training.adapters import PatchMixerAdapter, DefaultAdapter
@@ -18,6 +20,48 @@ def _dump_cfg(cfg):
     data = asdict(cfg) if is_dataclass(cfg) else cfg.__dict__
     print("[train_patchmixer] Effective TrainingConfig:")
     print(json.dumps(data, indent=2, ensure_ascii=False, default=str))
+
+def _infer_exo_dim_from_cb(future_exo_cb, horizon: int, device: str = "cpu") -> int:
+    if future_exo_cb is None:
+        return 0
+    fe = future_exo_cb(0, horizon, device=device)  # (H,E) 가정
+    if isinstance(fe, torch.Tensor):
+        return int(fe.size(-1))
+    try:
+        # numpy/리스트 등
+        return int(fe.shape[-1])
+    except Exception:
+        return 0
+
+def _ensure_model_exo_head(model, exo_dim: int):
+    """
+    model.exo_dim 과 exo_dim(E)가 다르면 exo_head를 재구성.
+    """
+    # 모델이 exo_head를 제공하지 않는다면 스킵
+    if not hasattr(model, "exo_dim"):
+        return model
+
+    current = int(getattr(model, "exo_dim", 0))
+    if exo_dim <= 0:
+        # 외생 안 쓰는 경우: exo_head 제거
+        if getattr(model, "exo_head", None) is not None:
+            model.exo_head = None
+        model.exo_dim = 0
+        return model
+
+    # 이미 일치하면 패스
+    if current == exo_dim and getattr(model, "exo_head", None) is not None:
+        return model
+
+    # (재)구성
+    model.exo_head = nn.Sequential(
+        nn.Linear(exo_dim, 64),
+        nn.GELU(),
+        nn.Linear(64, 1)
+    )
+    model.exo_dim = int(exo_dim)
+    print(f"[train_patchmixer] exo_head rebuilt with exo_dim={exo_dim}")
+    return model
 
 
 def _maybe_make_spike_loader(train_loader: DataLoader, enable: bool) -> DataLoader:
@@ -61,6 +105,15 @@ def train_patchmixer(
       - stages 가 있으면 각 StageConfig로 train_cfg를 덮어써서 연속 학습
     """
     assert train_cfg is not None, "train_cfg는 필수입니다."
+
+    # (A) 여기서 exo_dim(E) 자동 추론 후, 모델의 exo_head를 미리 세팅
+    horizon = getattr(model, "horizon", None) or getattr(train_cfg, "horizon", None)
+    if horizon is None:
+        raise ValueError("horizon을 model 또는 train_cfg에서 찾을 수 없습니다.")
+    E = _infer_exo_dim_from_cb(future_exo_cb, horizon, device="cpu")
+    model = _ensure_model_exo_head(model, E)
+    print(
+        f"[EXO-setup] inferred E={E}, model.exo_dim={getattr(model, 'exo_dim', None)}, has_head={model.exo_head is not None}")
 
     # AMP 설정(bf16 기본)
     amp_device = getattr(train_cfg, "amp_device", "cuda")

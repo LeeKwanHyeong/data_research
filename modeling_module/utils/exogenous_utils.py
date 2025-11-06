@@ -31,60 +31,6 @@ def compose_exo_calendar_cb(date_type: str = "W", *, sincos: bool = True):
         return exo  # (H,E)
     return cb
 
-
-@torch.no_grad()
-def warranty_features_for_batch(
-    start_idx: int,
-    H: int,
-    *,
-    expiry_idx_b: torch.Tensor,
-    sigma: float = 2.0,
-    norm_k: float = 10.0,
-    device="cpu"
-) -> torch.Tensor:
-    # (기존 그대로)
-    B = int(expiry_idx_b.numel())
-    t = torch.arange(start_idx, start_idx + H, device=device, dtype=torch.float32)  # [H]
-    tB = t.unsqueeze(0).expand(B, -1)                       # [B,H]
-    expB = expiry_idx_b.to(device).view(B, 1).float()       # [B,1]
-    step = (tB >= expB).float()
-    diff = tB - expB
-    bump = torch.exp(-0.5 * (diff / (sigma + 1e-6)) ** 2)
-    tte  = torch.clamp((expB - tB) / norm_k, min=-1.0, max=1.0)
-    feats = torch.stack([step, bump, tte], dim=-1)          # [B,H,3]
-    return feats
-
-
-@torch.no_grad()
-def compose_exo_warranty_cb(
-    get_expiry_idx_fn,
-    *,
-    add_calendar: bool = True,
-    date_type: Literal['M','W'] = 'W',
-    sigma: float = 2.0,
-    norm_k: float = 10.0,
-):
-    """
-    반환: future_exo_cb(start_idx, H, device, batch_meta) -> [B,H,D_exo]
-    - batch_meta로부터 각 샘플별 만료 절대주차를 받아 warranty-features 생성
-    - add_calendar=True면 sin/cos를 앞에 concat ([B,H,2] + [B,H,3] = [B,H,5])
-    """
-    def _cb(start_idx: int, H: int, device="cpu", batch_meta=None):
-        expiry_idx_b = get_expiry_idx_fn(batch_meta)  # [B]
-        wty = warranty_features_for_batch(
-            start_idx, H, expiry_idx_b=expiry_idx_b,
-            sigma=sigma, norm_k=norm_k, device=device
-        )  # [B,H,3]
-        if add_calendar:
-            cal = calendar_sin_cos(start_idx, H, device=device, date_type=date_type)  # [H,2]
-            calB = cal.unsqueeze(0).expand(wty.size(0), -1, -1)                      # [B,H,2]
-            exo = torch.cat([calB, wty], dim=-1)                                     # [B,H,5]
-        else:
-            exo = wty
-        return exo
-    return _cb
-
-
 # ===== 공용 유틸 =====
 def apply_exo_shift_linear(head: nn.Module,
                             future_exo: torch.Tensor,
@@ -107,3 +53,128 @@ def apply_exo_shift_linear(head: nn.Module,
     else:
         pad = torch.zeros(B, horizon - Hx, device=out_device, dtype=out_dtype)
         return torch.cat([ex, pad], dim=1)
+
+
+
+'''사용 예시
+# 주차(YYYYWW) 기준, sin/cos + age/H + in_warranty + 남은기간(정규화)
+future_exo_cb = compose_exo_calendar_age_warranty_cb(
+    date_type='W',
+    use_sincos=True,
+    use_age=True,
+    use_warranty=True,
+    wty_month=24.0,          # 파트별로 다르면 파트 루프에서 주입
+    age_origin_idx=first_idx, # 해당 파트의 최초 판매 절대 index
+    age_norm_mode='H',        # age/H
+)
+
+# 추론 시: dataset/collate에서
+fe = future_exo_cb(start_idx, H, device='cpu')  # (H, E)'''
+
+
+def compose_exo_calendar_age_warranty_cb(
+    *,
+    date_type: Literal['W', 'M'] = 'W',
+    use_sincos: bool = True,
+    use_age: bool = True,
+    use_warranty: bool = True,
+    wty_month: Optional[float] = None,
+    age_origin_idx: Optional[int] = None,
+    age_norm_mode: Literal['H', 'const', 'none'] = 'H',
+    age_norm_div: Optional[float] = None,
+    include_in_warranty_flag: bool = True,
+    include_time_to_warranty_end: bool = True,
+) -> callable:
+    """
+    Returns:
+        cb(start_idx: int, H: int, device='cpu') -> Tensor[H, E]
+
+    Features (in order, if enabled):
+      1) sin, cos (period = 52 if 'W', 12 if 'M')
+      2) age (절대/상대 시퀀스; 정규화 옵션)
+      3) warranty:
+          - in_warranty (0/1)
+          - time_to_warranty_end (0~1 정규화)
+
+    Args:
+      date_type: 'W'(주차) 또는 'M'(월차)
+      use_sincos: 캘린더 계절성 사용 여부
+      use_age: 절대 순서(age) 사용 여부
+      use_warranty: 워런티 관련 피처 사용 여부
+      wty_month: 보증 개월 (None이면 워런티 피처 미생성)
+      age_origin_idx: age를 0으로 두고 싶은 기준 인덱스(절대 index). None이면 t 자체를 age로 사용
+      age_norm_mode:
+         - 'H'    : age / H
+         - 'const': age / (age_norm_div 또는 100.0)
+         - 'none' : 정규화 없음
+      include_in_warranty_flag: in_warranty(0/1) 포함 여부
+      include_time_to_warranty_end: 보증 종료까지 남은 기간(0~1) 포함 여부
+    """
+    if date_type == 'W':
+        period = 52
+        # 'W'일 때 보증 기간 단위는 '주'로 환산
+        def _wty_units(months: float) -> float:
+            return float(months) * 4.345  # 월→주 근사
+    elif date_type == 'M':
+        period = 12
+        # 'M'일 때 보증 기간 단위는 '월'
+        def _wty_units(months: float) -> float:
+            return float(months)
+    else:
+        raise ValueError("date_type must be 'W' or 'M'.")
+
+    def _normalize_age(age: torch.Tensor, H: int) -> torch.Tensor:
+        if age_norm_mode == 'H':
+            denom = float(max(1, H))
+            return age / denom
+        elif age_norm_mode == 'const':
+            denom = float(age_norm_div) if (age_norm_div is not None) else 100.0
+            return age / max(1.0, denom)
+        else:
+            return age
+
+    def cb(start_idx: int, H: int, device: str = "cpu") -> torch.Tensor:
+        # 절대 인덱스 t: [start_idx, ..., start_idx+H-1]
+        t = torch.arange(start_idx, start_idx + H, device=device, dtype=torch.float32)
+        feats = []
+
+        # 1) sin/cos
+        if use_sincos:
+            feats.append(torch.sin(2 * torch.pi * t / period).unsqueeze(-1))
+            feats.append(torch.cos(2 * torch.pi * t / period).unsqueeze(-1))
+
+        # 2) age (sequence)
+        if use_age:
+            if age_origin_idx is None:
+                age = t
+            else:
+                age = t - float(age_origin_idx)
+                # 음수 방지(옵션): 보통 추론 시에는 start_idx >= age_origin_idx라 0 이상이나,
+                # 안전하게 음수면 0으로 클리핑
+                age = torch.clamp(age, min=0.0)
+            age = _normalize_age(age, H).unsqueeze(-1)
+            feats.append(age)
+
+        # 3) warranty
+        if use_warranty and (wty_month is not None):
+            w_units = _wty_units(wty_month)  # 주/월 단위로 환산된 보증 기간
+            # age가 없는 경우를 대비하여 age_raw 정의
+            if age_origin_idx is None:
+                age_raw = t
+            else:
+                age_raw = torch.clamp(t - float(age_origin_idx), min=0.0)
+
+            if include_in_warranty_flag:
+                in_wty = (age_raw < w_units).to(torch.float32).unsqueeze(-1)
+                feats.append(in_wty)
+
+            if include_time_to_warranty_end:
+                rem = torch.clamp(w_units - age_raw, min=0.0)
+                rem_norm = (rem / max(1.0, float(w_units))).unsqueeze(-1)
+                feats.append(rem_norm)
+
+        if not feats:
+            return torch.zeros(H, 0, device=device, dtype=torch.float32)
+        return torch.cat(feats, dim=-1)  # (H, E)
+
+    return cb
