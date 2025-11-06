@@ -1,109 +1,165 @@
+from __future__ import annotations
+
+import json
+from dataclasses import asdict, is_dataclass
 from typing import Optional, Callable
 
-from modeling_module.models.Titan.Titans import TestTimeMemoryManager
-from modeling_module.training.adapters import TitanAdapter
+import torch
+from modeling_module.training.adapters import TitanAdapter, DefaultAdapter
 from modeling_module.training.config import TrainingConfig
 from modeling_module.training.engine import CommonTrainer
 from modeling_module.utils.exogenous_utils import calendar_sin_cos
-import torch
+
+
+def _pick_future_exo_cb(model, user_cb: Optional[Callable]) -> Optional[Callable]:
+    """
+    외생변수 콜백 선택 우선순위:
+    1) 사용자가 명시적으로 준 콜백
+    2) model.config.use_calendar_exo=True 또는 exo_dim>0 → calendar_sin_cos
+    3) 그 외 None
+    """
+    if user_cb is not None:
+        return user_cb
+
+    use_calendar = False
+    exo_dim = int(getattr(model, "exo_dim", 0))
+
+    model_cfg = getattr(model, "config", None)
+    if model_cfg is not None:
+        use_calendar = bool(getattr(model_cfg, "use_calendar_exo", False))
+        exo_dim = int(getattr(model_cfg, "exo_dim", exo_dim))
+
+    if not use_calendar:
+        use_calendar = (exo_dim > 0)
+
+    return calendar_sin_cos if use_calendar else None
+
+def _dump_cfg(cfg):
+    data = asdict(cfg) if is_dataclass(cfg) else cfg.__dict__
+    print("[train_titan] Effective TrainingConfig:")
+    print(json.dumps(data, indent=2, ensure_ascii=False, default=str))
 
 def train_titan(
     model,
     train_loader,
     val_loader,
     *,
-    future_exo_cb: Optional[Callable] = None,  # ← 외생변수 생성 콜백(선택)
-    exo_is_normalized: bool = True,            # ← 어댑터/모델에서 필요시 사용할 힌트
-    tta_steps: int = 0,
-    **overrides
+    train_cfg: Optional[TrainingConfig] = None,
+    future_exo_cb=None,
 ):
     """
-    Titan 학습 트레이너(외생변수 지원, 침습 최소화).
-    - future_exo_cb가 주어지면 해당 콜백을 사용해 (B,H,D_exo) 생성 후 모델에 전달.
-    - future_exo_cb가 None이면 다음 우선순위로 자동 선택:
-        1) 모델이 exo_dim > 0 이고, 모델(또는 내부 config)에 use_calendar_exo가 True → calendar_sin_cos 사용
-        2) 그 외 → 외생변수 미사용(None)
-    - TrainingConfig에 존재하지 않는 override 키는 정리하여 안전 적용.
+    - train_cfg가 있으면 그 값을 우선 사용
+    - 개별 인자(lr, loss_mode 등)는 train_cfg가 None일 때만 fallback으로 적용
     """
 
-    # ===== 1) TrainingConfig 기본값 + overrides 정리 =====
-    base_cfg = dict(
-        loss_mode="point",      # Titan 기본
-        point_loss="huber",
-    )
+    adapter = DefaultAdapter()  # Titan 전용 어댑터 사용 중이면 여기서 교체
 
-    # TrainingConfig에서 허용하는 키들만 통과(패턴: patchmixer_train.py와 유사)
-    cfg_keys = {
-        "device", "lookback", "horizon", "epochs", "lr", "weight_decay",
-        "t_max", "patience", "max_grad_norm", "amp_device",
-        "loss_mode", "point_loss", "huber_delta",
-        "quantiles", "q_star", "use_cost_q_star", "Cu", "Co",
-        "use_intermittent", "alpha_zero", "alpha_pos", "gamma_run", "cap",
-        "use_horizon_decay", "tau_h", "val_use_weights"
-    }
-    clean_overrides = {k: v for k, v in overrides.items() if k in cfg_keys}
-    base_cfg.update(clean_overrides)
-    cfg = TrainingConfig(**base_cfg)
+    _dump_cfg(train_cfg)
 
-    # ===== 2) 외생변수 콜백 선택 로직 =====
-    # - 가장 명시적인 사용자의 인자(future_exo_cb)를 우선.
-    # - 없으면 모델 설정을 점검해 calendar_sin_cos를 기본 제공.
-    #   (configs.py: use_calendar_exo / exo_dim 참조)
-    #   모델이 config 속성을 보관하지 않아도 exo_dim 기준으로 결정 가능.
-    if future_exo_cb is not None:
-        fe_cb = future_exo_cb
+    # amp_device 기본값 처리
+    amp_device = getattr(train_cfg, "amp_device", "cuda")
+
+    # 사용자가 cfg에 amp_dtype를 문자열로 줄 수도 있으니 안전하게 해석
+    amp_dtype_str = getattr(train_cfg, "amp_dtype", "bf16")
+    if isinstance(amp_dtype_str, torch.dtype):
+        amp_dtype = amp_dtype_str
     else:
-        use_calendar = False
-        # 모델이 내부에 config를 보관하는 경우 우대
-        model_cfg = getattr(model, "config", None)
-        if model_cfg is not None:
-            use_calendar = bool(getattr(model_cfg, "use_calendar_exo", False))
-            exo_dim = int(getattr(model_cfg, "exo_dim", getattr(model, "exo_dim", 0)))
+        s = str(amp_dtype_str).lower()
+        if s in ("bf16", "bfloat16"):
+            amp_dtype = torch.bfloat16
+        elif s in ("fp16", "float16", "half"):
+            amp_dtype = torch.float16
+        elif s in ("fp32", "float32"):
+            amp_dtype = torch.float32
         else:
-            exo_dim = int(getattr(model, "exo_dim", 0))
+            amp_dtype = torch.bfloat16  # 기본값
 
-        if not use_calendar:
-            # config가 없거나 False여도, exo_dim>0이면 calendar를 기본 제공
-            use_calendar = (exo_dim > 0)
+    amp_enabled = (amp_device == "cuda" and torch.cuda.is_available())
 
-        fe_cb = calendar_sin_cos if use_calendar else None
+    autocast_input = {
+        "device_type": amp_device,
+        "enabled": amp_enabled,
+        "dtype": amp_dtype,  # ← 문자열이 아닌 torch.dtype 로 전달
+    }
 
-    # ===== 3) TTA 매니저/어댑터 구성(기존 로직 유지) =====
-    def factory(m):  # 기존 Test-Time Memory Manager 유지
-        return TestTimeMemoryManager(m, lr=cfg.lr)
-
-    adapter = TitanAdapter(
-        tta_manager_factory=factory,
-        # 필요 시 어댑터가 참조하도록 힌트 전달(사용하지 않으면 무시)
-    )
-
-    amp_device: str = "cuda"
-    amp_dtype: str = "bf16"  # "fp16" 대신 기본 "bf16" 권장 (5080 지원)
-    amp_enabled: bool = True
-    use_bf16 = (amp_dtype.lower() == "bf16")
-    autocast_input = dict(
-        device_type=amp_device,
-        enabled=amp_enabled,
-        dtype=(torch.bfloat16 if use_bf16 else torch.float16),
-    )
-
-    # ===== 4) CommonTrainer 실행 =====
     trainer = CommonTrainer(
-        cfg,
-        adapter,
+        cfg=train_cfg,
+        adapter=adapter,
+        future_exo_cb=future_exo_cb,
         logger=print,
-        metrics_fn=None,
-        future_exo_cb=fe_cb,    # ← 핵심: 외생변수 콜백 전달
-        autocast_input = autocast_input,
+        autocast_input=autocast_input,
     )
-    best_model = trainer.fit(model, train_loader, val_loader, tta_steps=tta_steps)
+    model = trainer.fit(model, train_loader, val_loader, tta_steps=2)
+    return {
+        "model": model,
+        "cfg": train_cfg,
+    }
 
-    # ===== 5) 로깅 =====
-    print(
-        f"[EXO-train] exo_dim={getattr(model, 'exo_dim', 0)} "
-        f"exo_head? {hasattr(model, 'exo_head') and (getattr(model, 'exo_head') is not None)} "
-        f"future_exo_cb? {fe_cb is not None} "
-        f"tta_steps={tta_steps}"
-    )
-
-    return best_model
+# def train_titan(
+#     model,
+#     train_loader,
+#     val_loader,
+#     *,
+#     future_exo_cb: Optional[Callable] = None,  # 외생변수 생성 콜백(선택)
+#     exo_is_normalized: bool = True,            # 어댑터/모델에서 필요 시 사용할 힌트
+#     tta_steps: int = 0,
+#     **overrides
+# ):
+#     """
+#     Titan 학습 트레이너 (PatchMixer/PatchTST 스타일 정렬)
+#     - TrainingConfig + CommonTrainer + TitanAdapter 사용
+#     - model.config/use_calendar_exo/exo_dim 여부에 따라 캘린더 sin/cos 자동 주입
+#     - TTA는 어댑터 훅만 유지(기본 비활성)
+#     """
+#     # 1) 기본 하이퍼파라미터 + 사용자 override
+#     base_cfg = dict(
+#         loss_mode="point",
+#         point_loss="huber_asym",
+#         use_intermittent=True,
+#         val_use_weights=False,
+#     )
+#
+#     # TrainingConfig 필드로 제한하여 깨끗하게 반영
+#     allowed = {
+#         "device","lookback","horizon","epochs","lr","weight_decay","t_max",
+#         "patience","max_grad_norm","amp_device","huber_delta","q_star",
+#         "use_cost_q_star","Cu","Co","quantiles","use_intermittent","alpha_zero",
+#         "alpha_pos","gamma_run","cap","use_horizon_decay","tau_h","val_use_weights"
+#     }
+#     clean_overrides = {k: v for k, v in overrides.items() if k in allowed}
+#     base_cfg.update(clean_overrides)
+#     cfg = TrainingConfig(**base_cfg)
+#
+#     # 2) 외생변수 콜백 결정
+#     fe_cb = _pick_future_exo_cb(model, future_exo_cb)
+#
+#     # 3) AMP 설정(bf16 추천)
+#     amp_device: str = getattr(cfg, "amp_device", "cuda")
+#     amp_enabled: bool = (amp_device == "cuda" and torch.cuda.is_available())
+#     autocast_input = dict(
+#         device_type=amp_device,
+#         enabled=amp_enabled,
+#         dtype=torch.bfloat16,
+#     )
+#
+#     # 4) 공통 트레이너 실행
+#     adapter = TitanAdapter()
+#     trainer = CommonTrainer(
+#         cfg,
+#         adapter,
+#         logger=print,
+#         metrics_fn=None,
+#         future_exo_cb=fe_cb,
+#         autocast_input=autocast_input,
+#     )
+#
+#     best_model = trainer.fit(model, train_loader, val_loader, tta_steps=tta_steps)
+#
+#     # 5) 로깅
+#     print(
+#         f"[EXO-train] exo_dim={getattr(model, 'exo_dim', 0)} "
+#         f"exo_head? {hasattr(model, 'exo_head') and (getattr(model, 'exo_head') is not None)} "
+#         f"future_exo_cb? {fe_cb is not None} "
+#         f"tta_steps={tta_steps}"
+#     )
+#     return best_model

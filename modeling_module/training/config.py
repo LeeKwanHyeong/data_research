@@ -25,7 +25,7 @@ class SpikeLossConfig:
     strategy: Literal['mix', 'direct'] = 'mix'
 
     # 공통 파라미터
-    huber_delta: float = 5.0
+    huber_delta: float = 2.0
     asym_up_weight: float = 2.0  # 과대예측( pred>y ) 가중
     asym_down_weight: float = 1.0
 
@@ -33,12 +33,14 @@ class SpikeLossConfig:
     mad_k: float = 3.5          # 스파이크 탐지 임계(k-MAD)
     w_spike: float = 6.0        # 스파이크 구간 가중
     w_norm: float = 1.0         # 일반 구간 가중
+    w_cap = 12.0
     alpha_huber: float = 0.7    # WeightedHuber 비중
     beta_asym: float = 0.3      # AsymMSE 비중
 
     # baseline(기존 LossComputer)와 혼합할지
     mix_with_baseline: bool = False
     gamma_baseline: float = 0.2
+
 
 @dataclass
 class TrainingConfig:
@@ -48,7 +50,7 @@ class TrainingConfig:
     horizon: int = 27
 
     # ------------Training------------
-    epochs: int = 200
+    epochs: int = 1
     lr: float = 1e-4
     weight_decay: float = 1e-4
     t_max: int = 10                 # CosineAnnealingLR
@@ -59,7 +61,7 @@ class TrainingConfig:
 
     # ------------Loss-------------
     loss_mode: Literal['auto', 'point', 'quantile'] = 'auto'
-    point_loss: Literal['mae','mse','huber','pinball','huber_asym'] = 'mse'
+    point_loss: Literal['mae','mse','huber','pinball','huber_asym', None] = 'mse'
     huber_delta: float = 5.0
     q_star: float = 0.5             # point=pinball
     use_cost_q_star: bool = False
@@ -83,7 +85,7 @@ class TrainingConfig:
 
     # ------------Exogenous Value --------------
     exo_dim = 2  # 미래 외생변수 차원(없으면 0)
-    nonneg_head = True  # 수요 비음수 보장 (Softplus)
+    nonneg_head = False  # 수요 비음수 보장 (Softplus)
 
 
     # ------------Spike-friendly Loss-------------- #

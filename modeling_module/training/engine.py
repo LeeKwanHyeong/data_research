@@ -1,4 +1,7 @@
 import copy
+import json
+from dataclasses import asdict, is_dataclass
+
 import torch
 from torch.amp import autocast, GradScaler
 
@@ -35,6 +38,16 @@ class CommonTrainer:
             self.amp_device = autocast_input['device_type']
             self.enabled = autocast_input['enabled']
             self.dtype = autocast_input['dtype']
+
+        def _dump(obj, title):
+            data = asdict(obj) if is_dataclass(obj) else obj.__dict__
+            self.logger(f"[CommonTrainer] {title}")
+            self.logger(json.dumps(data, indent=2, ensure_ascii=False, default=str))
+
+        _dump(self.cfg, "TrainingConfig (final)")
+        # 어댑터 쪽 파라미터가 있으면 같이 출력
+        if hasattr(self.adapter, "cfg"):
+            _dump(self.adapter.cfg, "Adapter Config")
 
 
         # self.amp_enabled = False

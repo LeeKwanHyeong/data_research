@@ -4,7 +4,6 @@ import os, torch
 
 from modeling_module.models.PatchMixer.common.configs import PatchMixerConfigMonthly
 from modeling_module.models.PatchTST.common.configs import PatchTSTConfigMonthly, HeadConfig, AttentionConfig
-from modeling_module.models.Titan.common.configs import TitanConfigMonthly
 from modeling_module.training.config import DecompositionConfig
 
 
@@ -54,8 +53,8 @@ def _rebuild_patchtst(cfgd: dict):
         cfgd["decomp"] = DecompositionConfig(**cfgd["decomp"])
     return PatchTSTConfigMonthly(**cfgd)
 
-def _rebuild_titan(cfgd: dict):
-    return TitanConfigMonthly(**cfgd)
+# def _rebuild_titan(cfgd: dict):
+#     return TitanConfigMonthly(**cfgd)
 
 def _rebuild_patchmixer(cfgd: dict):
     return PatchMixerConfigMonthly(**cfgd)

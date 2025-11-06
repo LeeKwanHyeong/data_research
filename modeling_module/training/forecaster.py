@@ -234,7 +234,7 @@ class DMSForecaster:
         horizon: Optional[int] = None,
         device: Optional[torch.device] = None,
         extend: str = "ims",                    # {'ims','error'}
-        context_policy: str = "once",           # {'once','per_step','off'}
+        context_policy: str = "per_step",           # {'once','per_step','off'}
         y_true: Optional[torch.Tensor] = None,  # (RAW) TF target
         teacher_forcing_ratio: float = 0.0,
 

@@ -1,546 +1,227 @@
+from __future__ import annotations
+from dataclasses import asdict
 from typing import Optional
 
 import torch
 import torch.nn as nn
-import torch.optim as optim
 
-from modeling_module.models.Titan.backbone import MemoryEncoder, PatchMemoryEncoder
-from modeling_module.models.Titan.common.configs import TitanConfig
-from modeling_module.models.Titan.common.decoder import TitanDecoder
-from modeling_module.models.Titan.common.memory import LMM
+__all__ = [
+    "TitanBaseModel",
+    "TitanLMMModel",
+    "TitanSeq2SeqModel",
+]
+
 from modeling_module.models.common_layers.RevIN import RevIN
-from modeling_module.models.common_layers.TrendCorrector import TrendCorrector
-from modeling_module.models.common_layers.heads.expander_head import ExpanderHead
+
+# --- 패키지/로컬 모두 대응 가능한 유연한 임포트 ---
+try:
+    from modeling_module.models.Titan.backbone import MemoryEncoder
+    from modeling_module.models.Titan.common.decoder import TitanDecoder
+except Exception:
+    from backbone import MemoryEncoder          # type: ignore
+    from decoder import TitanDecoder            # type: ignore
+
+# TitanConfig 는 configs.py 에 정의되어 있다고 가정
+try:
+    from modeling_module.models.Titan.common.configs import TitanConfig
+except Exception:
+    try:
+        from configs import TitanConfig         # type: ignore
+    except Exception:
+        TitanConfig = None                      # type: ignore
 
 
-def _ensure_config_instance(config):
-    return config() if isinstance(config, type) else config
+def _merge_cfg_kwargs(cfg_obj, **kwargs):
+    """cfg(dataclass)와 kwargs 병합. kwargs 우선."""
+    cfg_dict = asdict(cfg_obj) if cfg_obj is not None else {}
+    cfg_dict.update(kwargs)
+    return cfg_dict
 
 
-def _denorm_forecast_from_revin(
-    revin: RevIN,
-    y_h: torch.Tensor,                  # [B,H] (RevIN 공간)
-    *,
-    hist_x: Optional[torch.Tensor] = None,
-    ch: int = 0,
-    base_mix: float = 0.5,              # ← mean~last 혼합 가중(0~1)
-    floor_ratio: float = 0.0,
-    floor_min: float = 0.0
-) -> torch.Tensor:
-    mean  = getattr(revin, "_cached_mean", None)
-    std   = getattr(revin, "_cached_std",  None)
-    last  = getattr(revin, "_cached_last", None)
-
-    if (revin.subtract_last and last is None) or ((not revin.subtract_last) and (mean is None)):
-        return y_h
-
-    device, dtype = y_h.device, y_h.dtype
-    if revin.subtract_last:
-        base = last[..., ch].squeeze(1).to(device=device, dtype=dtype)
-    else:
-        m = mean[..., ch].squeeze(1).to(device=device, dtype=dtype)
-        if last is not None:
-            l = last[..., ch].squeeze(1).to(device=device, dtype=dtype)
-            w = float(base_mix)
-            base = w * l + (1.0 - w) * m
-        else:
-            base = m
-
-    if revin.use_std:
-        st = std[..., ch].squeeze(1).to(device=device, dtype=dtype)
-        if (hist_x is not None) and (floor_ratio > 0.0 or floor_min > 0.0):
-            raw_std = hist_x[..., ch].std(dim=1).to(dtype=dtype)
-            floor = torch.clamp(floor_ratio * raw_std, min=floor_min)
-            st = torch.maximum(st, floor)
-        return y_h * st.unsqueeze(1) + base.unsqueeze(1)
-    else:
-        return y_h + base.unsqueeze(1)
-
-# =========================
-# Titan Base (point model)
-# =========================
-class Model(nn.Module):
+class _TitanBase(nn.Module):
     """
-    Titan BaseModel
-      - RevIN: norm-only inside model; NO direct self.revin(...,'denorm') on [B,H]
-      - Encoder: MemoryEncoder
-      - Head: ExpanderHead (기본) or Linear(+Softplus)
-      - Optional exogenous term (time-distributed)
+    공통 베이스: config 보관 + Encoder/Decoder 조립
+    - 외생변수/비음수 클램프 등 공통 옵션은 여기서 통일
     """
-    is_quantile: bool = False
-
-    def __init__(self, config: TitanConfig):
+    def __init__(self, *, config: Optional["TitanConfig"]=None, **kwargs):
         super().__init__()
-        cfg = _ensure_config_instance(config)
+        params = _merge_cfg_kwargs(config, **kwargs)
 
-        self.model_name = "Titan BaseModel"
-        self.horizon = cfg.horizon
+        # Core
+        self.input_dim: int = int(params["input_dim"])
+        self.lookback: int = int(params["lookback"])
+        self.horizon: int = int(params["horizon"])
+        self.d_model: int = int(params.get("d_model", 256))
+        self.n_layers: int = int(params.get("n_layers", 3))
+        self.n_heads: int = int(params.get("n_heads", 4))
+        self.d_ff: int = int(params.get("d_ff", 512))
+        self.dropout: float = float(params.get("dropout", 0.1))
 
-        # 간헐수요 안전: 센터링 전용(표준편차 사용 X)
+        # RevIN 옵션 (configs.py에 이미 존재)
+        self.use_revin = bool(params.get("use_revin", True))
+        self.revin_subtract_last = bool(params.get("revin_subtract_last", False))
+        self.revin_affine = bool(params.get("revin_affine", True))
+        self.revin_use_std = bool(params.get("revin_use_std", True))
+
+        # Memory/LMM
+        self.contextual_mem_size: int = int(params.get("contextual_mem_size", 256))
+        self.persistent_mem_size: int = int(params.get("persistent_mem_size", 64))
+
+        # Exogenous
+        self.use_exogenous: bool = bool(params.get("use_exogenous", False))
+        self.exo_dim: int = int(params.get("exo_dim", 0))
+        self.use_calendar_exo: bool = bool(params.get("use_calendar_exo", False))
+
+        # Output constraint
+        self.final_clamp_nonneg: bool = bool(params.get("final_clamp_nonneg", False))
+
+        # Seq2Seq decoder 전용 파라미터(필요 시 사용)
+        self.dec_layers: int = int(params.get("dec_layers", 2))
+        self.dec_heads: int = int(params.get("dec_heads", 4))
+        self.dec_d_ff: int = int(params.get("dec_d_ff", 512))
+        self.dec_dropout: float = float(params.get("dec_dropout", 0.1))
+
+        # 원본 config 보관(트레이너가 참조 가능)
+        self.config = config
+
+        self.target_channel = int(params.get("target_channel", 0))
         self.revin = RevIN(
-            num_features=cfg.input_dim,
-            affine=True,
-            subtract_last=False,
-            use_std=False,                 # ← 핵심: Titan만 센터링 전용
-        )
+            num_features=1,  # 단일 타깃 채널 기준
+            affine=self.revin_affine,
+            subtract_last=self.revin_subtract_last,
+            use_std=self.revin_use_std
+        ) if self.use_revin else None
 
-        # Backbone
+        # Encoder
         self.encoder = MemoryEncoder(
-            cfg.input_dim, cfg.d_model, cfg.n_layers, cfg.n_heads, cfg.d_ff,
-            cfg.contextual_mem_size, cfg.persistent_mem_size
+            self.input_dim,
+            self.d_model,
+            self.n_layers,
+            self.n_heads,
+            self.d_ff,
+            self.contextual_mem_size,
+            self.persistent_mem_size,
+            self.dropout,
         )
 
-        self.use_temporal_expander = getattr(cfg, "use_temporal_expander", True)
-        if self.use_temporal_expander:
-            self.output_head = ExpanderHead(
-                d_model=cfg.d_model,
-                horizon=cfg.horizon,
-                f_out=getattr(cfg, 'expander_f_out', 128),
-                nonneg=getattr(cfg, 'nonneg_head', True),
-                use_sinus=getattr(cfg, 'expander_use_sinus', True),
-                season_period=getattr(cfg, 'expander_season_period', 52),
-                max_harmonics=getattr(cfg, 'expander_max_harmonics', 16),
-                use_conv=getattr(cfg, 'expander_use_conv', True),
-                dropout=getattr(cfg, 'expander_dropout', 0.1)
-            )
-        else:
-            nonneg = getattr(cfg, 'nonneg_head', True)
-            head = [nn.Linear(cfg.d_model, cfg.horizon)]
-            if nonneg:
-                head.append(nn.Softplus())
-            self.output_proj = nn.Sequential(*head)
+    @classmethod
+    def from_config(cls, config: "TitanConfig"):
+        return cls(config=config)
 
-        # Optional exogenous term
-        self.exo_dim = getattr(cfg, "exo_dim", 0)
-        if self.exo_dim > 0:
-            self.exo_head = nn.Sequential(
-                nn.Linear(self.exo_dim, cfg.d_model),
-                nn.GELU(),
-                nn.Linear(cfg.d_model, 1)  # → [B,H,1] then squeeze
-            )
-        else:
-            self.exo_head = None
+    def _clamp(self, y: torch.Tensor) -> torch.Tensor:
+        return y.clamp_min(0) if self.final_clamp_nonneg else y
 
-        self.final_clamp_nonneg = getattr(cfg, "final_clamp_nonneg", True)
+    # 입력 x: [B, L, C] -> RevIN(norm) -> [B, L, C]
+    def _maybe_revin_norm(self, x: torch.Tensor) -> torch.Tensor:
+        if (self.revin is None) or (x.size(-1) == 0):
+            print('revin is None So cannot normalize')
+            return x
+        # 타깃 채널만 정규화/복원(멀티채널 안전)
+        tc = self.target_channel
+        x_t = x[:, :, tc:tc+1]
+        x_t = self.revin(x_t, mode='norm')   # [B,L,1]
+        x = x.clone()
+        x[:, :, tc:tc+1] = x_t
+        return x
 
-    def forward(
-        self,
-        x: torch.Tensor,                             # [B,L,C]
-        future_exo: Optional[torch.Tensor] = None,   # [B,H,exo_dim] or None
-        mode: Optional[str] = None,
-    ) -> torch.Tensor:                               # returns [B,H] (raw scale)
-        # 1) RevIN normalize
-        x_n = self.revin(x, "norm")                  # [B,L,C]
+    # 출력 y: [B, H] -> RevIN(denorm) -> [B, H]
+    def _maybe_revin_denorm(self, y: torch.Tensor) -> torch.Tensor:
+        if (self.revin is None) or (y.dim() != 2):
+            print('revin is None so cannot denormalize')
+            return y
+        # RevIN은 [B,L,C] 형태를 기대하므로 H축을 L로 보고, C=1로 맞춰 복원
+        y_in = y.unsqueeze(-1)       # [B, H, 1]
+        y_out = self.revin(y_in, mode='denorm')  # [B, H, 1]
+        return y_out.squeeze(-1)
 
-        # 2) Encode
-        enc = self.encoder(x_n)                      # [B,L,D]
-        if enc.dim() != 3:
-            raise RuntimeError(f"Encoder must return [B,L,D], got {tuple(enc.shape)}")
-
-        # 3) Head (last token)
-        z_last = enc[:, -1, :]
-        if self.use_temporal_expander:
-            y_n = self.output_head(z_last)           # [B, H] (RevIN 공간)
-        else:
-            y_n = self.output_proj(z_last)           # [B, H]
-
-        # 4) 안전 denorm ([B,H] 전용)
-        y = _denorm_forecast_from_revin(
-            self.revin, y_n, hist_x=x, ch=0, floor_ratio=0.0, floor_min=0.0
-        )
-
-        # 5) Optional exogenous addend (raw space에서 합산)
-        if (self.exo_head is not None) and (future_exo is not None):
-            if future_exo.dim() != 3 or future_exo.size(1) != self.horizon:
-                raise ValueError(
-                    f"future_exo must be [B,H,exo_dim] with H={self.horizon}, got {tuple(future_exo.shape)}"
-                )
-            exo_term = self.exo_head(future_exo).squeeze(-1)  # [B,H]
-            y = y + exo_term
-
-        if self.final_clamp_nonneg:
-            y = torch.clamp_min(y, 0.0)
-
-        return y
+    def _clamp(self, y: torch.Tensor) -> torch.Tensor:
+        return y.clamp_min(0) if self.final_clamp_nonneg else y
 
 
-# =========================
-# Titan + LMM
-# =========================
-class LMMModel(nn.Module):
-    is_quantile: bool = False
-
-    def __init__(self, config: TitanConfig):
-        super().__init__()
-        cfg = _ensure_config_instance(config)
-
-        self.model_name = "Titan LMMModel"
-        self.horizon = cfg.horizon
-
-        self.revin = RevIN(
-            num_features=cfg.input_dim,
-            affine=True,
-            subtract_last=False,
-            use_std=False,                 # 센터링 전용
-        )
-
-        self.encoder = MemoryEncoder(
-            cfg.input_dim, cfg.d_model, cfg.n_layers, cfg.n_heads, cfg.d_ff,
-            cfg.contextual_mem_size, cfg.persistent_mem_size
-        )
-
-        self.lmm = LMM(d_model=cfg.d_model, top_k=getattr(cfg, "lmm_top_k", 5))
-
-        self.use_temporal_expander = getattr(cfg, "use_temporal_expander", True)
-        if self.use_temporal_expander:
-            self.output_head = ExpanderHead(
-                d_model=cfg.d_model,
-                horizon=cfg.horizon,
-                f_out=getattr(cfg, 'expander_f_out', 128),
-                nonneg=getattr(cfg, 'nonneg_head', True),
-                use_sinus=getattr(cfg, 'expander_use_sinus', True),
-                season_period=getattr(cfg, 'expander_season_period', 52),
-                max_harmonics=getattr(cfg, 'expander_max_harmonics', 16),
-                use_conv=getattr(cfg, 'expander_use_conv', True),
-                dropout=getattr(cfg, 'expander_dropout', 0.1)
-            )
-        else:
-            nonneg = getattr(cfg, 'nonneg_head', True)
-            head = [nn.Linear(cfg.d_model, cfg.horizon)]
-            if nonneg:
-                head.append(nn.Softplus())
-            self.output_proj = nn.Sequential(*head)
-
-        self.exo_dim = getattr(cfg, "exo_dim", 0)
-        if self.exo_dim > 0:
-            self.exo_head = nn.Sequential(
-                nn.Linear(self.exo_dim, cfg.d_model),
-                nn.GELU(),
-                nn.Linear(cfg.d_model, 1)
-            )
-        else:
-            self.exo_head = None
-
-        self.final_clamp_nonneg = getattr(cfg, "final_clamp_nonneg", True)
-
-    def _collect_memories(self, enc: torch.Tensor) -> torch.Tensor:
-        B, L, D = enc.shape
-        mem_chunks = []
-
-        # contextual memory (latest available)
-        ctx = None
-        for layer in self.encoder.layers:
-            m = getattr(layer.attn, "contextual_memory", None)
-            if m is not None and m.numel() > 0:
-                ctx = m
-        if ctx is not None:
-            if ctx.dim() == 2:
-                ctx = ctx.unsqueeze(0).expand(B, -1, -1)  # [B,M,D]
-            elif ctx.dim() == 3 and ctx.size(0) != B:
-                ctx = ctx.expand(B, -1, -1)
-            mem_chunks.append(ctx)
-
-        # persistent memory (from last layer)
-        pm = getattr(self.encoder.layers[-1].attn, "persistent_memory", None)
-        if pm is not None and pm.numel() > 0:
-            mem_chunks.append(pm.unsqueeze(0).expand(B, -1, -1))  # [B,M,D]
-
-        # encoded tokens
-        mem_chunks.append(enc)
-
-        memory = torch.cat(mem_chunks, dim=1)  # [B,M_tot,D]
-        return memory
-
-    def forward(
-        self,
-        x: torch.Tensor,                             # [B,L,C]
-        future_exo: Optional[torch.Tensor] = None,   # [B,H,exo_dim] or None
-        mode: str = "train",
-    ) -> torch.Tensor:                               # [B,H] (raw scale)
-        x_n = self.revin(x, "norm")
-        enc = self.encoder(x_n)
-        if enc.dim() != 3:
-            raise RuntimeError(f"Encoder must return [B,L,D], got {tuple(enc.shape)}")
-
-        memory = self._collect_memories(enc)
-        enhanced = self.lmm(enc, memory)
-        enhanced = enc + enhanced  # ← residual (추가)
-        z_last = enhanced[:, -1, :]
-        if self.use_temporal_expander:
-            y_core_n = self.output_head(z_last)      # [B,H]
-        else:
-            y_core_n = self.output_proj(z_last)      # [B,H]
-
-        y = _denorm_forecast_from_revin(self.revin, y_core_n, hist_x=x, ch=0)
-
-        if (self.exo_head is not None) and (future_exo is not None):
-            if future_exo.dim() != 3 or future_exo.size(1) != self.horizon:
-                raise ValueError(
-                    f"future_exo must be [B,H,exo_dim] with H={self.horizon}, got {tuple(future_exo.shape)}"
-                )
-            exo_term = self.exo_head(future_exo).squeeze(-1)
-            y = y + exo_term
-
-        if self.final_clamp_nonneg:
-            y = torch.clamp_min(y, 0.0)
-
-        return y
-
-
-# =========================
-# Titan Patch + LMM
-# =========================
-class PatchLMMModel(nn.Module):
-    is_quantile: bool = False
-
-    def __init__(self, config: TitanConfig):
-        super().__init__()
-        cfg = _ensure_config_instance(config)
-
-        self.model_name = "Titan PatchLMMModel"
-        self.horizon = getattr(cfg, "horizon", getattr(cfg, "output_horizon", None))
-        assert self.horizon is not None, "config.horizon (or output_horizon) is required"
-
-        self.revin = RevIN(
-            num_features=cfg.input_dim,
-            affine=True,
-            subtract_last=False,
-            use_std=False,                 # 센터링 전용
-        )
-
-        # Patch-based encoder
-        self.encoder = PatchMemoryEncoder(
-            input_dim=cfg.input_dim,
-            d_model=cfg.d_model,
-            n_layers=cfg.n_layers,
-            n_heads=cfg.n_heads,
-            d_ff=cfg.d_ff,
-            contextual_mem_size=cfg.contextual_mem_size,
-            persistent_mem_size=cfg.persistent_mem_size,
-            patch_len=getattr(cfg, "patch_len", 12),
-            patch_stride=getattr(cfg, "patch_stride", 8),
-            n_mixer_blocks=getattr(cfg, "n_mixer_blocks", 2),
-            mixer_hidden=getattr(cfg, "mixer_hidden", 2 * cfg.d_model),
-            mixer_kernel=getattr(cfg, "mixer_kernel", 7),
-            dropout=getattr(cfg, "dropout", 0.1),
-        )
-
-        self.lmm = LMM(d_model=cfg.d_model, top_k=getattr(cfg, "lmm_top_k", 5))
-
-        self.use_temporal_expander = getattr(cfg, "use_temporal_expander", True)
-        if self.use_temporal_expander:
-            self.output_head = ExpanderHead(
-                d_model=cfg.d_model,
-                horizon=cfg.horizon,
-                f_out=getattr(cfg, 'expander_f_out', 128),
-                nonneg=getattr(cfg, 'nonneg_head', True),
-                use_sinus=getattr(cfg, 'expander_use_sinus', True),
-                season_period=getattr(cfg, 'expander_season_period', 52),
-                max_harmonics=getattr(cfg, 'expander_max_harmonics', 16),
-                use_conv=getattr(cfg, 'expander_use_conv', True),
-                dropout=getattr(cfg, 'expander_dropout', 0.1)
-            )
-        else:
-            nonneg = getattr(cfg, 'nonneg_head', True)
-            head = [nn.Linear(cfg.d_model, cfg.horizon)]
-            if nonneg:
-                head.append(nn.Softplus())
-            self.output_proj = nn.Sequential(*head)
-
-        self.lmm_memory_source = getattr(cfg, "lmm_memory_source", "encoded")
-
-        self.exo_dim = getattr(cfg, "exo_dim", 0)
-        if self.exo_dim > 0:
-            self.exo_head = nn.Sequential(
-                nn.Linear(self.exo_dim, cfg.d_model),
-                nn.GELU(),
-                nn.Linear(cfg.d_model, 1)
-            )
-        else:
-            self.exo_head = None
-
-        self.final_clamp_nonneg = getattr(cfg, "final_clamp_nonneg", True)
-
-    def _get_lmm_memory(self, enc: torch.Tensor) -> torch.Tensor:
-        B, Lp, D = enc.shape
-        if self.lmm_memory_source == "context":
-            ctx = None
-            for layer in self.encoder.layers:
-                mem = getattr(layer.attn, "contextual_memory", None)
-                if mem is not None and mem.numel() > 0:
-                    ctx = mem  # [M,D]
-            if ctx is not None:
-                return ctx.unsqueeze(0).expand(B, -1, -1)  # [B,M,D]
-        return enc  # [B,L',D]
-
-    def forward(
-        self,
-        x: torch.Tensor,                             # [B,L,C]
-        future_exo: Optional[torch.Tensor] = None,   # [B,H,exo_dim] or None
-        mode: str = "train",
-    ) -> torch.Tensor:                               # [B,H] (raw scale)
-        x_n = self.revin(x, "norm")
-        enc = self.encoder(x_n)
-        if enc.dim() != 3:
-            raise RuntimeError(f"Encoder must return [B,L,D], got {tuple(enc.shape)}")
-
-        memory = self._get_lmm_memory(enc)
-        if memory.dim() == 2:
-            memory = memory.unsqueeze(0).expand(enc.size(0), -1, -1)
-        enhanced = self.lmm(enc, memory)
-
-        z_last = enhanced[:, -1, :]
-        if self.use_temporal_expander:
-            y_core_n = self.output_head(z_last)      # [B,H]
-        else:
-            y_core_n = self.output_proj(z_last)      # [B,H]
-
-        y = _denorm_forecast_from_revin(self.revin, y_core_n, hist_x=x, ch=0)
-
-        if (self.exo_head is not None) and (future_exo is not None):
-            if future_exo.dim() != 3 or future_exo.size(1) != self.horizon:
-                raise ValueError(
-                    f"future_exo must be [B,H,exo_dim] with H={self.horizon}, got {tuple(future_exo.shape)}"
-                )
-            exo_term = self.exo_head(future_exo).squeeze(-1)
-            y = y + exo_term
-
-        if self.final_clamp_nonneg:
-            y = torch.clamp_min(y, 0.0)
-
-        return y
-
-
-# =========================
-# Titan LMM Seq2Seq
-# =========================
-class LMMSeq2SeqModel(nn.Module):
-    is_quantile: bool = False
-
-    def __init__(self, config: TitanConfig):
-        super().__init__()
-        cfg = _ensure_config_instance(config)
-
-        self.model_name = "Titan LMMSeq2SeqModel"
-        self.horizon = getattr(cfg, "horizon", getattr(cfg, "output_horizon", None))
-        assert self.horizon is not None, "config.horizon is required"
-
-        self.revin = RevIN(
-            num_features=cfg.input_dim,
-            affine=True,
-            subtract_last=False,
-            use_std=False,                 # 센터링 전용
-        )
-
-        self.encoder = MemoryEncoder(
-            cfg.input_dim, cfg.d_model, cfg.n_layers, cfg.n_heads, cfg.d_ff,
-            cfg.contextual_mem_size, cfg.persistent_mem_size
-        )
-
-        n_dec_layers = getattr(cfg, "n_dec_layers", 1)
-        dec_dropout = getattr(cfg, "dec_dropout", 0.1)
-        exo_dim = getattr(cfg, "exo_dim", 0)
-
+class TitanBaseModel(_TitanBase):
+    """
+    Encoder-only: TitanDecoder를 수평(H) 차원 투영기로 사용하고 Linear로 1채널 예측.
+    """
+    def __init__(self, *, config: Optional["TitanConfig"]=None, **kwargs):
+        super().__init__(config=config, **kwargs)
         self.decoder = TitanDecoder(
-            d_model=cfg.d_model,
-            n_layers=n_dec_layers,
-            n_heads=cfg.n_heads,
-            d_ff=cfg.d_ff,
-            dropout=dec_dropout,
+            d_model=self.d_model,
+            n_layers=1,
+            n_heads=self.n_heads,
+            d_ff=self.d_ff,
+            dropout=self.dropout,
             horizon=self.horizon,
-            exo_dim=exo_dim,
-            causal=True
+            exo_dim=(self.exo_dim if self.use_exogenous else 0),
         )
+        self.proj = nn.Linear(self.d_model, 1)
 
-        nonneg = getattr(cfg, "nonneg_head", True)
-        self.output_proj = nn.Sequential(
-            nn.Linear(cfg.d_model, 1),
-            nn.Softplus() if nonneg else nn.Identity()
+    def forward(self, x: torch.Tensor, *, future_exo: torch.Tensor | None = None) -> torch.Tensor:
+        # 1) RevIN norm (입력 전처리) ---------------------
+        x = self._maybe_revin_norm(x)  # [B,L,C]
+
+        # 2) Encoder-Decoder-Head -------------------------
+        memory = self.encoder(x)  # [B,L,D]
+        dec = self.decoder(memory, future_exo)  # [B,H,D]
+        y = self.proj(dec).squeeze(-1)  # [B,H]
+
+        # 3) RevIN denorm (출력 복원) ---------------------
+        y = self._maybe_revin_denorm(y)  # [B,H]
+
+        # 4) 최종 제약(비음수 등) -------------------------
+        return self._clamp(y)
+
+
+class TitanLMMModel(_TitanBase):
+    """
+    LMM 특화 디코딩이 필요하면 TitanDecoder 내부에서 분기하도록 구성(여기선 공용 Decoder 사용).
+    """
+    def __init__(self, *, config: Optional["TitanConfig"]=None, **kwargs):
+        super().__init__(config=config, **kwargs)
+        self.decoder = TitanDecoder(
+            d_model=self.d_model,
+            n_layers=1,
+            n_heads=self.n_heads,
+            d_ff=self.d_ff,
+            dropout=self.dropout,
+            horizon=self.horizon,
+            exo_dim=(self.exo_dim if self.use_exogenous else 0),
         )
+        self.proj = nn.Linear(self.d_model, 1)
 
-        self.trend_corrector = TrendCorrector(d_model=cfg.d_model, out_dim=self.horizon)
-
-        self.exo_dim = getattr(cfg, "exo_dim", 0)
-        if self.exo_dim > 0:
-            self.exo_head = nn.Sequential(
-                nn.Linear(self.exo_dim, cfg.d_model),
-                nn.GELU(),
-                nn.Linear(cfg.d_model, 1)
-            )
-        else:
-            self.exo_head = None
-
-        self.final_clamp_nonneg = getattr(cfg, "final_clamp_nonneg", True)
-
-    def forward(
-        self,
-        x: torch.Tensor,                              # [B,L,C]
-        future_exo: Optional[torch.Tensor] = None,    # [B,H,exo_dim] or None
-        mode: str = "train",
-    ) -> torch.Tensor:                                # [B,H] (raw scale)
-        x_n = self.revin(x, "norm")
-        enc = self.encoder(x_n)
-        if enc.dim() != 3:
-            raise RuntimeError(f"Encoder must return [B,L,D], got {tuple(enc.shape)}")
-
-        dec = self.decoder(enc, future_exo)           # [B,H,D]
-
-        z_last = enc[:, -1, :]  # [B,D]
-        dec = dec + z_last.unsqueeze(1).expand(-1, self.horizon, -1)  # ← residual
+    def forward(self, x: torch.Tensor, *, future_exo: torch.Tensor | None = None) -> torch.Tensor:
+        # 1) RevIN norm (입력 전처리) ---------------------
+        x = self._maybe_revin_norm(x)  # [B,L,C]
+        memory = self.encoder(x)
+        dec = self.decoder(memory, future_exo)
+        y = self.proj(dec).squeeze(-1)
+        # 3) RevIN denorm (출력 복원) ---------------------
+        y = self._maybe_revin_denorm(y)  # [B,H]
+        return self._clamp(y)
 
 
-        y_core_n = self.output_proj(dec).squeeze(-1)  # [B,H]
-        y_core_n = y_core_n + self.trend_corrector(enc[:, -1, :])  # [B,H]
+class TitanSeq2SeqModel(_TitanBase):
+    """
+    Seq2Seq: 다층 디코더를 이용하여 미래 H 단계의 컨텍스트를 생성 후 1채널 예측.
+    """
+    def __init__(self, *, config: Optional["TitanConfig"]=None, **kwargs):
+        super().__init__(config=config, **kwargs)
+        self.decoder = TitanDecoder(
+            d_model=self.d_model,
+            n_layers=self.dec_layers,
+            n_heads=self.dec_heads,
+            d_ff=self.dec_d_ff,
+            dropout=self.dec_dropout,
+            horizon=self.horizon,
+            exo_dim=(self.exo_dim if self.use_exogenous else 0),
+        )
+        self.proj = nn.Linear(self.d_model, 1)
 
-        y = _denorm_forecast_from_revin(self.revin, y_core_n, hist_x=x, ch=0)
-
-        if (self.exo_head is not None) and (future_exo is not None):
-            if future_exo.dim() != 3 or future_exo.size(1) != self.horizon:
-                raise ValueError(
-                    f"future_exo must be [B,H,exo_dim] with H={self.horizon}, got {tuple(future_exo.shape)}"
-                )
-            exo_term = self.exo_head(future_exo).squeeze(-1)
-            y = y + exo_term
-
-        if self.final_clamp_nonneg:
-            y = torch.clamp_min(y, 0.0)
-
-        return y
-
-
-# =========================
-# Test-Time Memory Manager
-# =========================
-class TestTimeMemoryManager:
-    """Lightweight TTA helper for Titan-family models."""
-    def __init__(self, model: nn.Module, lr: float = 1e-4):
-        self.model = model
-        self.optimizer = optim.Adam(model.parameters(), lr=lr)
-        self.loss_fn = nn.MSELoss()
-
-    @torch.no_grad()
-    def add_context(self, new_context: torch.Tensor) -> None:
-        device = next(self.model.parameters()).device
-        new_context = new_context.to(device).detach()
-        if not hasattr(self.model, "encoder") or not hasattr(self.model.encoder, "layers"):
-            return
-        for block in self.model.encoder.layers:
-            if hasattr(block, "attn") and hasattr(block.attn, "update_contextual_memory"):
-                block.attn.update_contextual_memory(new_context)
-
-    def adapt(self, x_new: torch.Tensor, y_new: torch.Tensor, steps: int = 1) -> float:
-        device = next(self.model.parameters()).device
-        x_new = x_new.to(device).float()
-        y_new = y_new.to(device).float()
-
-        self.model.train()
-        last_loss = 0.0
-        for _ in range(steps):
-            pred = self.model(x_new)
-            loss = self.loss_fn(pred, y_new)
-            self.optimizer.zero_grad()
-            loss.backward()
-            self.optimizer.step()
-            last_loss = float(loss.item())
-        self.model.eval()
-        return last_loss
+    def forward(self, x: torch.Tensor, *, future_exo: torch.Tensor | None = None) -> torch.Tensor:
+        # 1) RevIN norm (입력 전처리) ---------------------
+        x = self._maybe_revin_norm(x)  # [B,L,C]
+        memory = self.encoder(x)               # [B, L, D]
+        dec = self.decoder(memory, future_exo) # [B, H, D]
+        y = self.proj(dec).squeeze(-1)         # [B, H]
+        # 3) RevIN denorm (출력 복원) ---------------------
+        y = self._maybe_revin_denorm(y)  # [B,H]
+        return self._clamp(y)

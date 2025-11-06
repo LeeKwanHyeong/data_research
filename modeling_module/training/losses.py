@@ -64,7 +64,7 @@ class LossComputer:
       - Quantile: pinball (가중/마스크 가능)
       - Point   : mae / mse / huber / pinball(q*) / huber_asym(비대칭 Huber)
       - Spike   : cfg.spike_loss.enabled=True 일 때
-                  - strategy='mix'    → Weighted-Huber(스파이크 가중) + AsymMSE 블렌딩
+                  - strategy='mix'    → Weighted-Huber(스파이크 가중 + horizon 가중) + AsymMSE 블렌딩
                   - strategy='direct' → point_loss='huber_asym' 단독 사용
 
     차이:
@@ -121,7 +121,7 @@ class LossComputer:
 
     @staticmethod
     def weighted_huber(y_hat: torch.Tensor, y_true: torch.Tensor,
-                       weight: torch.Tensor, delta: float = 5.0) -> torch.Tensor:
+                       weight: torch.Tensor, delta: float = 2.0) -> torch.Tensor:
         err = y_hat - y_true
         abs_e = err.abs()
         huber = torch.where(abs_e <= delta, 0.5 * err * err, delta * (abs_e - 0.5 * delta))
@@ -135,7 +135,7 @@ class LossComputer:
 
     @staticmethod
     def huber_asymmetric(pred: torch.Tensor, y: torch.Tensor, *,
-                         delta: float = 5.0, up_w: float = 2.0, down_w: float = 1.0,
+                         delta: float = 2.0, up_w: float = 2.0, down_w: float = 1.0,
                          weight: torch.Tensor | None = None) -> torch.Tensor:
         err = pred - y
         abs_e = err.abs()
@@ -145,6 +145,35 @@ class LossComputer:
         if weight is not None:
             loss = loss * weight
         return loss.mean()
+
+    # --- NEW: horizon 가중(평균 1로 정규화) ---
+    def _horizon_weights(self, y: torch.Tensor) -> torch.Tensor:
+        """
+        cfg.use_horizon_decay=True 이면 [B,H] 형태의 horizon 가중을 반환.
+        tau_h<1: 근미래 강조, tau_h>1: 후반부 강조. 평균 1로 정규화.
+        """
+        use_hd = bool(getattr(self.cfg, "use_horizon_decay", False))
+        if not use_hd:
+            # 가중 1
+            if y.dim() == 3 and y.size(1) == 1:
+                return torch.ones_like(y.squeeze(1))
+            return torch.ones_like(y)
+
+        tau_h = float(getattr(self.cfg, "tau_h", 1.0))
+        if y.dim() == 3 and y.size(1) == 1:
+            H = y.size(-1)
+            base = y.squeeze(1)
+        elif y.dim() == 2:
+            H = y.size(-1)
+            base = y
+        else:
+            # 마지막 축을 horizon으로 가정
+            H = y.size(-1)
+            base = y.view(y.size(0), -1)
+
+        hw = tau_h ** torch.arange(H, device=base.device, dtype=base.dtype)  # 0..H-1
+        hw = hw / (hw.mean() + 1e-12)  # 평균 1 정규화
+        return hw.unsqueeze(0).expand(base.size(0), H)
 
     # ---------- single entry ----------
     def compute(self, pred: torch.Tensor | dict, y: torch.Tensor, *, is_val: bool) -> torch.Tensor:
@@ -183,30 +212,60 @@ class LossComputer:
                 pred, y, getattr(self.cfg, "quantiles", [0.1, 0.5, 0.9]), weights
             )
 
-        # 1) Spike 전략: 'mix' → 블렌딩
+        # 1) Spike 전략: 'mix' → 블렌딩 (+ horizon 가중 주입)
         if spike_enabled and strategy == "mix":
             y_hat = self._unwrap_point(pred)
-            slv = sl  # dict 또는 네임스페이스 가정
-            k       = float(getattr(slv, "mad_k", 3.5))
-            w_spike = float(getattr(slv, "w_spike", 6.0))
-            w_norm  = float(getattr(slv, "w_norm", 1.0))
-            delta   = float(getattr(slv, "huber_delta", getattr(self.cfg, "huber_delta", 5.0)))
-            up_w    = float(getattr(slv, "asym_up_weight", 2.0))
-            a       = float(getattr(slv, "alpha_huber", 0.7))
-            b       = float(getattr(slv, "beta_asym", 0.3))
-            mix_with_baseline = bool(getattr(slv, "mix_with_baseline", False))
-            gamma   = float(getattr(slv, "gamma_baseline", 0.2))
+            slv = sl
 
-            w = self.make_spike_weight(y, k=k, w_spike=w_spike, w_norm=w_norm)
-            loss_huber = self.weighted_huber(y_hat, y, w, delta=delta)
-            loss_asym  = self.asymmetric_mse(y_hat, y, up_w=up_w)
+            k = float(getattr(slv, "mad_k", 3.5))
+            w_spike = float(getattr(slv, "w_spike", 6.0))
+            w_norm = float(getattr(slv, "w_norm", 1.0))
+            delta = float(getattr(slv, "huber_delta", getattr(self.cfg, "huber_delta", 2.0)))
+
+            # NEW: asym up/down 둘 다 사용
+            up_w = float(getattr(slv, "asym_up_weight", 1.0))
+            down_w = float(getattr(slv, "asym_down_weight", 1.0))
+
+            a = float(getattr(slv, "alpha_huber", 0.7))
+            b = float(getattr(slv, "beta_asym", 0.3))
+            mix_with_baseline = bool(getattr(slv, "mix_with_baseline", False))
+            gamma = float(getattr(slv, "gamma_baseline", 0.0))
+
+            # 1) 스파이크 가중
+            w_sp = self.make_spike_weight(y, k=k, w_spike=w_spike, w_norm=w_norm)  # [B,H]
+            # 2) 호라이즌 가중(평균 1로 정규화)
+            hw = self._horizon_weights(y)  # [B,H]
+
+            # 검증에서 가중 끄고 싶으면 cfg.val_use_weights=False
+            if is_val and not getattr(self.cfg, "val_use_weights", True):
+                w_eff = torch.ones_like(w_sp)
+            else:
+                w_eff = w_sp * hw
+
+            # NEW: 가중 평균 1로 정규화 (스케일 바이어스 방지)
+            w_eff = w_eff / (w_eff.mean() + 1e-12)
+
+            # (옵션) 상한으로 과도한 샘플 폭주 방지
+            w_cap = float(getattr(slv, "w_cap", 12.0))
+            if w_cap > 0:
+                w_eff = torch.clamp(w_eff, max=w_cap)
+
+            # Weighted Huber
+            err = y_hat - y
+            abs_e = err.abs()
+            huber = torch.where(abs_e <= delta, 0.5 * err * err, delta * (abs_e - 0.5 * delta))
+            loss_huber = (w_eff * huber).mean()
+
+            # NEW: 비대칭 제곱오차 (언더/오버 모두 가중)
+            mse = err.pow(2)
+            w_asym = torch.where(err > 0, torch.full_like(mse, up_w), torch.full_like(mse, down_w))
+            loss_asym = (w_eff * w_asym * mse).mean()
+
             loss = a * loss_huber + b * loss_asym
 
             if mix_with_baseline:
                 base = self._compute_point_base(pred, y, is_val=is_val)
-                base = self._as_tensor(base, y_hat) or (y_hat - y).abs().mean()
                 loss = loss + gamma * base
-
             return loss
 
         # 2) Spike 전략: 'direct' → point_loss='huber_asym' 경로
@@ -260,3 +319,45 @@ class LossComputer:
             use_horizon_decay=getattr(self.cfg, "use_horizon_decay", False),
             tau_h=getattr(self.cfg, "tau_h", 1.0),
         )
+
+
+# --- 이하 유틸(기존 유지) ---
+def huber_loss(x: torch.Tensor, y: torch.Tensor, delta: float = 1.0) -> torch.Tensor:
+    return F.huber_loss(x, y, delta=delta)
+
+def pinball_loss(yhat: torch.Tensor, y: torch.Tensor, q: float) -> torch.Tensor:
+    diff = y - yhat
+    return torch.maximum(q * diff, (q - 1) * diff).mean()
+
+def asymmetric_mse(yhat: torch.Tensor, y: torch.Tensor, up_w: float = 2.0, down_w: float = 1.0) -> torch.Tensor:
+    diff = yhat - y
+    w = torch.where(diff >= 0, torch.as_tensor(up_w, device=diff.device), torch.as_tensor(down_w, device=diff.device))
+    return (w * diff.pow(2)).mean()
+
+def detect_spikes(y: torch.Tensor, k: float = 3.5) -> torch.Tensor:
+    # MAD-based spike mask on last dim
+    med = y.median(dim=-2, keepdim=True).values if y.dim() >= 2 else y.median()
+    mad = (y - med).abs().median(dim=-2, keepdim=True).values + 1e-8
+    z = (y - med).abs() / mad
+    return (z >= k).float()
+
+def spike_friendly_loss(yhat: torch.Tensor, y: torch.Tensor, cfg: TrainingConfig) -> torch.Tensor:
+    sc = cfg.spike_loss
+    if not sc.enabled:
+        return huber_loss(yhat, y, delta=cfg.huber_delta)
+
+    if sc.strategy == 'direct':
+        return F.huber_loss(yhat, y, delta=sc.huber_delta) * 0.7 + asymmetric_mse(yhat, y, sc.asym_up_weight, sc.asym_down_weight) * 0.3
+
+    # mix: spike 가중치
+    mask = detect_spikes(y, k=sc.mad_k)
+    w = mask * sc.w_spike + (1 - mask) * sc.w_norm
+    loss_h = F.huber_loss(yhat, y, delta=sc.huber_delta, reduction='none')
+    loss_a = (yhat - y).pow(2)
+    # 비대칭 가중
+    loss_a = torch.where(yhat >= y, loss_a * sc.asym_up_weight, loss_a * sc.asym_down_weight)
+    loss = sc.alpha_huber * (w * loss_h).mean() + sc.beta_asym * (w * loss_a).mean()
+
+    if sc.mix_with_baseline:
+        loss = (1 - sc.gamma_baseline) * loss + sc.gamma_baseline * huber_loss(yhat, y, delta=cfg.huber_delta)
+    return loss

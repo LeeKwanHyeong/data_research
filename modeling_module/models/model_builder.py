@@ -11,25 +11,20 @@ def build_patch_mixer_quantile(cfg: PatchMixerConfig):
     from modeling_module.models.PatchMixer.PatchMixer import QuantileModel
     return QuantileModel(cfg)
 
+# --- Titan builders (Titans.py 리팩토링 버전: config 기반) ---
 def build_titan_base(cfg: TitanConfig):
-    from modeling_module.models.Titan.Titans import Model
-    return Model(cfg)
+    from modeling_module.models.Titan.Titans import TitanBaseModel
+    # 리팩토링된 Titans는 from_config 지원
+    return TitanBaseModel.from_config(cfg)
 
 def build_titan_lmm(cfg: TitanConfig):
-    from modeling_module.models.Titan.Titans import LMMModel
-    return LMMModel(cfg)
+    from modeling_module.models.Titan.Titans import TitanLMMModel
+    return TitanLMMModel.from_config(cfg)
 
 def build_titan_seq2seq(cfg: TitanConfig):
-    from modeling_module.models.Titan.Titans import LMMSeq2SeqModel
-    return LMMSeq2SeqModel(cfg)
+    from modeling_module.models.Titan.Titans import TitanSeq2SeqModel
+    return TitanSeq2SeqModel.from_config(cfg)
 
-def build_titan_patch(cfg: TitanConfig):
-    from modeling_module.models.Titan.Titans import PatchLMMModel
-    return PatchLMMModel(cfg)
-
-def build_titan_feature(cfg: TitanConfig):
-    from modeling_module.models.Titan.Titans import FeatureModel
-    return FeatureModel(cfg)
 
 def build_patchTST_base(cfg: PatchTSTConfig):
     from modeling_module.models.PatchTST.supervised.PatchTST import PatchTSTPointModel

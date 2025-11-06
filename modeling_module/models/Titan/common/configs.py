@@ -1,121 +1,52 @@
+# configs.py
+from __future__ import annotations
 from dataclasses import dataclass
-from typing import Literal
-
-from modeling_module.training.config import TrainingConfig
 
 
 @dataclass
-class TitanConfig(TrainingConfig):
-    batch_size: int = 128               # 한 번의 학습/추론에서 처리할 시계열 샘플 개수 (배치 크기)
-    # lookback: int = 36                  # 입력 시계열의 과거 타임스텝 길이 (모델 입력 시 고려하는 시점 수)
-    # horizon: int = 48                   # 예측할 미래 타임스텝 길이 (출력 시점 수)
-    input_dim: int = 1                  # 각 타임스텝에서의 피처(feature) 개수 (예: 단변량=1, 다변량>1)
-    d_model: int = 64                   # 모델 내부 임베딩 차원 (토큰/패치가 변환되는 은닉 공간의 차원)
-    n_layers: int = 2                   # Transformer 또는 Titan 블록의 층(layer) 개수
-    n_heads: int = 4                    # Multi-Head Attention에서 병렬로 사용하는 어텐션 헤드 수
-    d_ff: int = 256                     # 피드포워드 네트워크(FFN) 내부 차원 (확장된 은닉층 크기)
-    contextual_mem_size: int = 64       # MAC(Memory-as-Context)에서 사용하는 컨텍스트 메모리 슬롯 개수
-    persistent_mem_size: int = 16       # MAC에서 사용하는 영구 메모리(persistent memory) 슬롯 개수
+class TitanConfig:
+    lookback: int = 52
+    horizon: int = 27
+    d_model: int = 256
+    input_dim: int = 1
+    n_layers: int = 3
+    n_heads: int = 4
+    d_ff: int = 512
+    dropout: float = 0.1
 
-    # --------------- Decoder -----------------
-    n_dec_layers = 1                    # 1~2 권장
-    dec_dropout = 0.1
+    # LMM(메모리)
+    use_lmm: bool = False
+    contextual_mem_size: int = 256
+    persistent_mem_size: int = 64
 
-    # --------------- Temporal Expander Option -----------------
-    date_type: Literal['M', 'W'] = 'M'
+    # RevIN
+    use_revin: bool = True
+    revin_use_std: bool = True
+    revin_subtract_last: bool = False
+    revin_affine: bool = True
+
+    # Expander 옵션(계절/저주파 강화)
     use_temporal_expander: bool = True
-    expander_use_sinus: bool = True
+    expander_f_out: int = 32
+    expander_max_harmonics: int = 6
+    expander_n_harmonics: int = 6
     expander_use_conv: bool = True
-    expander_season_period: int = 12
-    expander_max_harmonics: int = 8
-    expander_n_harmonics: int = 4
-    expander_f_out: int = 128
-    final_clamp_nonneg: bool = True
 
     # Exogenous
-    use_calendar_exo: bool = True
+    use_exogenous: bool = True
     exo_dim: int = 2
 
-    @property
-    def output_horizon(self) -> int:
-        return self.horizon
+    # 출력 제약
+    final_clamp_nonneg: bool = False
 
-@dataclass
-class TitanConfigPatchMonthly(TitanConfig):
-    batch_size = 128
-    input_dim = 1
-    d_model = 64
-    n_layers = 2
-    n_heads = 4
-    d_ff = 256
-    contextual_mem_size = 64
-    persistent_mem_size = 16
 
-    # Patch/Mixer
-    patch_len = 12
-    patch_stride = 6
-    n_mixer_blocks = 2
-    mixer_hidden = 64  # None이면 2*d_model로 자동 설정
-    mixer_kernel = 7
-    dropout = 0.1
+    # Head 유형: 'expander' | 'linear' | 'seq2seq'
+    head_type: str = 'expander'
 
-    # LMM/Head
-    lmm_top_k = 5
-    lmm_memory_source = "encoded"  # 'encoded' | 'context'
-    nonneg_head = True
 
-    date_type = 'M'
-    lookback: int = 36
-    horizon: int = 48
-    expander_season_period: int = 12
-    expander_max_harmonics = 8
-    expander_n_harmonics: int = 6
 
-@dataclass
-class TitanConfigPatchWeekly(TitanConfig):
-    batch_size = 128
-    input_dim = 1
-    d_model = 64
-    n_layers = 2
-    n_heads = 4
-    d_ff = 256
-    contextual_mem_size = 64
-    persistent_mem_size = 16
-
-    # Patch/Mixer
-    patch_len = 12
-    patch_stride = 6
-    n_mixer_blocks = 2
-    mixer_hidden = 64  # None이면 2*d_model로 자동 설정
-    mixer_kernel = 7
-    dropout = 0.1
-
-    # LMM/Head
-    lmm_top_k = 5
-    lmm_memory_source = "encoded"  # 'encoded' | 'context'
-    nonneg_head = True
-
-    date_type: str = 'W'
-    lookback: int = 54
-    horizon: int = 27
-    expander_season_period: int = 52
-    expander_max_harmonics: int = 16
-    expander_n_harmonics: int = 8
-
-@dataclass
-class TitanConfigMonthly(TitanConfig):
-    date_type: str = 'M'
-    lookback: int = 36
-    horizon: int = 48
-    expander_season_period: int = 12
-    expander_max_harmonics: int = 8
-    expander_n_harmonics: int = 6
-
-@dataclass
-class TitanConfigWeekly(TitanConfig):
-    date_type: str = 'W'
-    lookback: int = 54
-    horizon: int = 27
-    expander_season_period: int = 52
-    expander_max_harmonics: int = 16
-    expander_n_harmonics: int = 8
+    # Seq2Seq 디코더 옵션
+    dec_n_layers: int = 2
+    dec_n_heads: int = 4
+    dec_d_ff: int = 512
+    dec_dropout: float = 0.1
