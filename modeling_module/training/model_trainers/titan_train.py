@@ -10,6 +10,7 @@ from torch.utils.data import DataLoader, WeightedRandomSampler
 from modeling_module.training.adapters import TitanAdapter, DefaultAdapter
 from modeling_module.training.config import TrainingConfig, StageConfig, apply_stage
 from modeling_module.training.engine import CommonTrainer
+from modeling_module.training.losses import make_pspa_fn
 from modeling_module.utils.exogenous_utils import calendar_sin_cos
 
 
@@ -124,6 +125,7 @@ def train_titan(
             future_exo_cb=future_exo_cb,
             logger=print,
             autocast_input=autocast_input,
+            extra_loss_fn=make_pspa_fn()
         )
         model = trainer.fit(model, tl_i, val_loader, tta_steps=2)
         best = {"model": model, "cfg": cfg_i}

@@ -24,6 +24,7 @@ class CommonTrainer:
         logger=print,
         future_exo_cb=None,
         autocast_input = None,
+        extra_loss_fn = None
     ):
         self.cfg = cfg
         self.adapter: DefaultAdapter = adapter
@@ -33,6 +34,7 @@ class CommonTrainer:
         self.future_exo_cb = future_exo_cb
         self.amp_enabled = (self.cfg.amp_device == "cuda" and torch.cuda.is_available())
         self.autocast_input = autocast_input
+        self.extra_loss_fn = extra_loss_fn
 
         if autocast_input is not None:
             self.amp_device = autocast_input['device_type']
@@ -180,6 +182,10 @@ class CommonTrainer:
                     )
                     self._nan_stat("pred", pred)
                     loss = self._compute_loss(pred, y, is_val=(not train))
+
+                    if self.extra_loss_fn is not None:
+                        loss += self.extra_loss_fn(x, pred, self.cfg)
+
                     self._nan_stat("loss_raw", loss)
                     reg = self.adapter.reg_loss(model)
                     if reg is not None:
@@ -244,6 +250,9 @@ class CommonTrainer:
                                     model, x_val, future_exo=future_exo, mode="eval"
                                 )
                                 loss = self._compute_loss(pred, y_val, is_val=True)
+                                if self.extra_loss_fn is not None:
+                                    loss += self.extra_loss_fn(x_val, pred, self.cfg)
+
                                 loss = float(loss.detach())
                         val_total += loss
                     else:
@@ -256,6 +265,8 @@ class CommonTrainer:
                                 model, x_val, future_exo=future_exo, mode="eval"
                             )
                             vloss = self._compute_loss(pred, y_val, is_val=True)
+                            if self.extra_loss_fn is not None:
+                                vloss += self.extra_loss_fn(x_val, pred, self.cfg)
                             val_total += float(vloss.detach())
 
                     if self.metrics_fn:

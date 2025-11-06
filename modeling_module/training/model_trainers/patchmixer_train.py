@@ -11,6 +11,7 @@ from torch.utils.data import DataLoader, WeightedRandomSampler
 from modeling_module.training.adapters import PatchMixerAdapter, DefaultAdapter
 from modeling_module.training.config import TrainingConfig, StageConfig, apply_stage
 from modeling_module.training.engine import CommonTrainer
+from modeling_module.training.losses import make_pspa_fn
 
 
 def _dump_cfg(cfg):
@@ -104,6 +105,7 @@ def train_patchmixer(
             metrics_fn=None,
             future_exo_cb=future_exo_cb,   # (B,H,E) 외생변수 콜백
             autocast_input=autocast_input,
+            extra_loss_fn=make_pspa_fn()
         )
         model = trainer.fit(model, tl_i, val_loader, tta_steps=0)
         best = {"model": model, "cfg": cfg_i}

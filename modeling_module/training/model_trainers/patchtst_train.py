@@ -8,6 +8,7 @@ import torch
 from modeling_module.training.adapters import DefaultAdapter
 from modeling_module.training.config import TrainingConfig, StageConfig
 from modeling_module.training.engine import CommonTrainer
+from modeling_module.training.losses import make_pspa_fn
 from modeling_module.utils.exogenous_utils import calendar_sin_cos
 
 
@@ -79,6 +80,7 @@ def train_patchtst(
             future_exo_cb=future_exo_cb or calendar_sin_cos,  # 주/월 sin-cos 자동 주입
             logger=print,
             autocast_input=autocast_input,
+            extra_loss_fn=make_pspa_fn()
         )
         model = trainer.fit(model, train_loader, val_loader, tta_steps=0)
         best = {"model": model, "cfg": cfg_i}

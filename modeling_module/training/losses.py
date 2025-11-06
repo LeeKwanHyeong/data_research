@@ -361,3 +361,86 @@ def spike_friendly_loss(yhat: torch.Tensor, y: torch.Tensor, cfg: TrainingConfig
     if sc.mix_with_baseline:
         loss = (1 - sc.gamma_baseline) * loss + sc.gamma_baseline * huber_loss(yhat, y, delta=cfg.huber_delta)
     return loss
+
+def make_pspa_fn(lambda_pattern: float = 0.20, lambda_scale: float = 0.10,
+                 target_channel: int = 0):
+    """
+    PSPA: Past Scale & Pattern Anchoring
+    """
+
+    import torch
+    import torch.nn.functional as F
+    eps = 1e-8
+
+    def _to_pred_tensor(out):
+        """
+        out: Tensor | {"y_pred": Tensor} | {"q": [B,Q,H] or [B,Q,H,C]}
+        반환: [B,H,1]  (항상 단일 채널로 정규화)
+        """
+        if isinstance(out, torch.Tensor):
+            y = out  # [B,H] or [B,H,C]
+        elif isinstance(out, dict):
+            if "y_pred" in out:
+                y = out["y_pred"]          # [B,H] or [B,H,C]
+            elif "q" in out:
+                q = out["q"]               # [B,Q,H] or [B,Q,H,C]
+                # 중앙(0.5) 선택
+                q_idx = q.shape[1] // 2
+                y = q[:, q_idx, ...]       # [B,H] or [B,H,C]
+            else:
+                raise ValueError("Unsupported pred dict keys.")
+        else:
+            raise ValueError("Unsupported pred type.")
+
+        # 차원 정리 -> [B,H,1]
+        if y.dim() == 2:                   # [B,H] -> [B,H,1]
+            y = y.unsqueeze(-1)
+        elif y.dim() == 3:                 # [B,H,C] -> [B,H,1] (target_channel만 쓰기)
+            C = y.size(-1)
+            ch = min(max(target_channel, 0), C - 1)
+            y = y[..., ch:ch+1]
+        else:
+            raise ValueError(f"Unsupported pred shape: {y.shape}")
+        return y
+
+    def _select_hist_channel(x):
+        # x: [B,L,C] -> [B,L,1]
+        if x.dim() != 3:
+            raise ValueError(f"x must be [B,L,C], got {x.shape}")
+        C = x.size(-1)
+        ch = min(max(target_channel, 0), C - 1)
+        return x[:, :, ch:ch+1]
+
+    def _pspa(x, out, cfg):
+        y = _to_pred_tensor(out)       # [B,H,1]
+        x_ch = _select_hist_channel(x) # [B,L,1]
+
+        # 차분
+        diff_hist = x_ch[:, 1:, :] - x_ch[:, :-1, :]   # [B,L-1,1]
+        diff_pred = y[:, 1:, :] - y[:, :-1, :]         # [B,H-1,1]
+
+        # 길이 정렬
+        T = min(diff_hist.size(1), diff_pred.size(1))
+        if T < 1:
+            return y.new_tensor(0.0)
+
+        dh = diff_hist[:, -T:, :]   # [B,T,1]
+        dp = diff_pred[:, :T, :]    # [B,T,1]
+
+        # 패턴 앵커(코사인 유사도)
+        v1 = dh.reshape(dh.size(0), -1)  # [B, T]
+        v2 = dp.reshape(dp.size(0), -1)  # [B, T]
+        cos = F.cosine_similarity(v1, v2, dim=1)  # [B]
+        L_pattern = (1.0 - cos).mean()
+
+        # 스케일 앵커
+        hist_seg = x_ch[:, -T:, :]     # [B,T,1]
+        pred_seg = y[:, :T, :]         # [B,T,1]
+        scale_hist = hist_seg.abs().mean(dim=(1, 2)) + eps
+        scale_pred = pred_seg.abs().mean(dim=(1, 2)) + eps
+        L_scale = ((scale_pred / scale_hist) - 1.0).abs().mean()
+
+        return lambda_pattern * L_pattern + lambda_scale * L_scale
+
+    return _pspa
+

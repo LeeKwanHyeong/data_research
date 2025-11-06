@@ -96,6 +96,13 @@ class TrainingConfig:
     # ------------Spike-friendly Loss-------------- #
     spike_loss: SpikeLossConfig = field(default_factory=SpikeLossConfig)
 
+    lambda_hist_scale: float = 0.1
+    lambda_hist_var: float = 0.03
+    hist_window: int = 12
+
+    anchor_last_k: int = 8  # 과거 K 스텝을 스케일/레벨 앵커로 사용
+    anchor_weight: float = 0.05  # 앵커 손실 가중치
+
     def copy_with(self, **kwargs) -> "TrainingConfig":
         """dataclasses.replace 래퍼: 지정한 필드만 바꾼 사본을 반환"""
         return replace(self, **kwargs)
