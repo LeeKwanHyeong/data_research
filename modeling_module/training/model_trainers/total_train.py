@@ -1,5 +1,6 @@
 from typing import Dict
 import numpy as np
+import torch
 
 from modeling_module.models.PatchMixer.common.configs import PatchMixerConfigMonthly, PatchMixerConfig, \
     PatchMixerConfigWeekly
@@ -32,7 +33,7 @@ def run_total_train_weekly(
         horizon,
 ):
     stg_warmup = StageConfig(
-        epochs=10,
+        epochs=1,
         spike_enabled=False,
         lr=3e-4,  # warm-up은 살짝 높여도 ok
         use_horizon_decay=False  # 초기는 스케일/시즌 맞추기에 집중
@@ -40,7 +41,7 @@ def run_total_train_weekly(
 
     # ② Spike-boost: spike ON, lr ↓, 30~50 epoch
     stg_spike = StageConfig(
-        epochs=50,
+        epochs=1,
         spike_enabled=True,
         lr=1e-4,
         use_horizon_decay=True,  # 필요 시 ON
@@ -313,7 +314,7 @@ def run_total_train_weekly(
 def run_total_train_monthly(
         train_loader,
         val_loader,
-        device='cuda',
+        device='cuda' if torch.cuda.is_available() else 'mps',
         *,
         lookback,
         horizon,

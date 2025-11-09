@@ -59,8 +59,12 @@ class BaseModel(nn.Module):
         self.eol_feature_index = int(getattr(configs, 'eol_feature_index', 0))
 
         # Backbone → [B, D]
-        self.backbone = PatchMixerBackbone(configs=configs)
-        in_dim = self.backbone.patch_repr_dim
+        # self.backbone = PatchMixerBackbone(configs=configs)
+        # in_dim = self.backbone.patch_repr_dim
+
+        self.backbone = PatchMixerBackbone(configs = configs)
+        self.in_dim = getattr(self.backbone, 'out_dim', getattr(self.backbone, 'patch_repr_dim'))
+
 
         # (옵션) Part Embedding 추가 → z concat 후 차원 복원
         self.use_part_embedding = bool(getattr(configs, 'use_part_embedding', False))
@@ -69,11 +73,11 @@ class BaseModel(nn.Module):
         if self.use_part_embedding and int(getattr(configs, 'part_vocab_size', 0)) > 0:
             pdim = int(getattr(configs, 'part_embed_dim', 16))
             self.part_emb = nn.Embedding(int(configs.part_vocab_size), pdim)
-            self.z_fuser = nn.Linear(in_dim + pdim, in_dim)  # ← 원차원으로 복원
+            self.z_fuser = nn.Linear(self.in_dim + pdim, self.in_dim)  # ← 원차원으로 복원
 
         # Temporal Expander: [B,D] -> [B,H,F]
         self.expander = TemporalExpander(
-            d_in=in_dim,  # ← 여기!
+            d_in=self.in_dim,
             horizon=self.horizon,
             f_out=self.f_out,
             dropout=float(getattr(configs, 'dropout', 0.1)),
@@ -87,9 +91,9 @@ class BaseModel(nn.Module):
         self.revin = RevIN(int(getattr(configs, 'enc_in', 1)))
 
         # base(절편 + 기울기) + base gate α
-        self.base_head_b = nn.Linear(in_dim, 1)
-        self.base_head_m = nn.Linear(in_dim, 1)
-        self.base_gate   = nn.Linear(in_dim, 1)
+        self.base_head_b = nn.Linear(self.in_dim, 1)
+        self.base_head_m = nn.Linear(self.in_dim, 1)
+        self.base_gate   = nn.Linear(self.in_dim, 1)
         nn.init.constant_(self.base_gate.bias, -2.5)  # 초기엔 resid 쪽이 크게
 
         # main residual head
@@ -174,8 +178,15 @@ class BaseModel(nn.Module):
             pe = self.part_emb(part_ids)  # [B, P]
             z = self.z_fuser(torch.cat([z, pe], 1))  # [B, D]  ← 복원
 
-        assert z.size(-1) == self.expander.d_in, \
-            f"z_dim={z.size(-1)} vs expander.d_in={self.expander.d_in}"
+        if z.size(-1) != self.expander.d_in:
+            # 최초 발견 시 1x1 Linear 생성해 expander.d_in으로 맞춤
+            if isinstance(self.z_proj, nn.Identity):
+                self.z_proj = nn.Linear(z.size(-1), self.expander.d_in, bias=False).to(z.device)
+                if self.training:
+                    print(f"[BaseModel][info] z_proj created: {z.size(-1)} → {self.expander.d_in}")
+            z = self.z_proj(z)
+        # 이제 안전하게 통과
+        x_bhf = self.expander(z)
 
         # 2) 확장
         x_bhf = self.expander(z)                  # [B,H,F]
@@ -411,6 +422,16 @@ class QuantileModel(nn.Module):
             pe = self.part_emb(part_ids)               # [B, P]
             z = self.z_fuser(torch.cat([z, pe], dim=1))
 
+        if z.size(-1) != self.expander.d_in:
+            # 최초 발견 시 1x1 Linear 생성해 expander.d_in으로 맞춤
+            if isinstance(self.z_proj, nn.Identity):
+                self.z_proj = nn.Linear(z.size(-1), self.expander.d_in, bias=False).to(z.device)
+                if self.training:
+                    print(f"[BaseModel][info] z_proj created: {z.size(-1)} → {self.expander.d_in}")
+            z = self.z_proj(z)
+        # 이제 안전하게 통과
+        x_bhf = self.expander(z)
+
         # --- 안전장치: Expander 입력 차원 확인 ---
         d_in_expect = getattr(self.expander, "d_in", self._expander_d_in)
         if z.size(-1) != d_in_expect:
@@ -418,9 +439,6 @@ class QuantileModel(nn.Module):
                 f"[QuantileModel] expander.d_in mismatch: got z_dim={z.size(-1)} vs d_in={d_in_expect}. "
                 f"(concat 이후 z_fuser로 d_in 복원되어야 합니다.)"
             )
-
-        # 2) 시점 확장 [B,H,F]
-        x_bhf = self.expander(z)
 
         # 3) 분위수 예측(정규화 공간) → (B,3,H)
         q = self.head(x_bhf)

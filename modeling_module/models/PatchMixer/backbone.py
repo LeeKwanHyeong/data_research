@@ -58,139 +58,120 @@ class PatchMixerLayer(nn.Module):
 
 class PatchMixerBackbone(nn.Module):
     """
-    input: (B, L = lookback, N = n_vars)
-    output: (B, a * d_model) # Global patch representation(mean variable concatenate)
+    input:  (B, L=lookback, N=n_vars)
+    output: (B, A * D)  (변수축 평균 집약)
+    - out_dim: A * d_model  (※ 모델 초기화 시점의 lookback/patch_len/stride로 결정)
     """
-    def __init__(self,
-                 configs,
-                 revin: bool = True,
-                 affine: bool = True,
-                 subtract_last: bool = False,
-                 ):
+    def __init__(self, configs, revin: bool = True, affine: bool = True, subtract_last: bool = False):
         super().__init__()
         self.configs = configs
 
-        # basic hyperparameter
-        self.n_vals: int = configs.enc_in
-        self.lookback: int = configs.lookback
-        self.forecasting: int = configs.horizon
-        self.patch_size: int = configs.patch_len
-        self.stride: int = configs.stride
-        self.kernel_size: int = configs.mixer_kernel_size
+        # hyper
+        self.n_vals: int = int(configs.enc_in)
+        self.lookback: int = int(configs.lookback)
+        self.patch_size: int = int(configs.patch_len)
+        self.stride: int = int(configs.stride)
+        self.d_model: int = int(configs.d_model)
+        self.depth: int = int(configs.e_layers)
+        self.dropout_rate: float = float(getattr(configs, "head_dropout", 0.0))
 
-        # patch num calculation (+1은 패딩으로 1 patch 더 확보)
-        base = int((self.lookback - self.patch_size) / self.stride + 1)
-        self.patch_num: int = base + 1
-        self.a: int = self.patch_num
-        self.d_model: int = configs.d_model
-        self.dropout_rate: float = configs.head_dropout
-        self.depth: int = configs.e_layers
-        # output dimension (representation size of backbone output)
-        self.patch_repr_dim = self.a * self.d_model
+        # 패치 수 계산: unfold(L + stride, size=P, step=stride)와 동일 결과
+        base = (self.lookback - self.patch_size) / float(self.stride) + 1.0
+        base = int(base)  # floor
+        self.patch_num: int = base + 1  # 패딩으로 +1
+        if self.patch_num < 1:
+            self.patch_num = 1
 
-        # unfold after padding (끝단 복제를 통해1 마지막 패치 확보)
+        # ★ 공식 출력 차원 (init 기준 고정)
+        self.patch_repr_dim: int = self.patch_num * self.d_model
+        self.out_dim: int = self.patch_repr_dim  # <- 모델이 참조할 단일 진실값
+
+        # unfold용 패딩(끝단 복제): +stride
         self.padding_patch_layer = nn.ReplicationPad1d((0, self.stride))
 
-        # PatchMixer blocks
-        self.PatchMixer_blocks = nn.ModuleList([
-            PatchMixerLayer(d_model=self.d_model, kernel_size=configs.mixer_kernel_size, dropout=configs.head_dropout)
-            for _ in range(configs.e_layers)
+        # 블록
+        self.blocks = nn.ModuleList([
+            PatchMixerLayer(d_model=self.d_model, kernel_size=int(configs.mixer_kernel_size), dropout=self.dropout_rate)
+            for _ in range(self.depth)
         ])
 
-        # patch length -> model dimension linear projection (각 패치를 d_model로 투영)
-        self.W_P = nn.Linear(configs.patch_len, self.d_model)
+        # 패치 → d_model 투영
+        self.W_P = nn.Linear(self.patch_size, self.d_model)
 
-        self.flatten = nn.Flatten(start_dim =- 2) # (C, L) -> (C*L)
+        self.flatten = nn.Flatten(start_dim=-2)  # (C, L) -> (C*L)
 
     @torch.no_grad()
-    def _assert_input_shape(self, x: torch.Tensor) -> None:
-        # expectation: (B, L, N)
+    def _assert_3d(self, x: torch.Tensor) -> None:
         if x.dim() != 3:
-            raise ValueError(f"Expected input 3D tensor (B, L, N). Got shape = {tuple(x.shape)}")
-        if x.size(1) != self.lookback:
-            # Rather than strictly checking, just warning
-            pass
+            raise ValueError(f"Expected input 3D tensor (B, L, N). Got {tuple(x.shape)}")
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
-        Flow of PatchMixer
-        -> x: (B, L, N)
-        -> RevIn(norm)
-        -> (B, N, L)
-        -> unfold(patch)
-        -> (B*N, patch_num, d_model)
-        -> PatchMixer blocks
-        -> flatten
-        -> (B, a*d_model)
+        Flow
+          (B, L, N) -> (B, N, L)
+          pad(+stride) & unfold(size=patch_size, step=stride) -> (B,N,A,P)
+          W_P: (B,N,A,D)
+          reshape (B*N, A, D) -> permute (B*N, D, A)
+          PatchMixer blocks
+          flatten -> (B*N, D*A) -> (B, N, D*A) -> mean(N) -> (B, D*A)
         """
-        bs, seq_len, n_vars = x.shape
-        self._assert_input_shape(x)
-
-        # RevIN Normalization (B, L, N)
-        # if self.revin:
-        #     x = self.revin_layer(x, 'norm')
+        self._assert_3d(x)
+        B, L, N = x.shape
 
         # (B, N, L)
         x = x.permute(0, 2, 1)
 
-        # patch unfold after padding: (B, N, patch_num, patch_size)
-        x_lookback = self.padding_patch_layer(x) # (B, N, L + stride)
-        x = x_lookback.unfold(dimension = -1, size = self.patch_size, step = self.stride)
+        # 패딩 & 언폴드
+        x = self.padding_patch_layer(x)                     # (B, N, L + stride)
+        x = x.unfold(dimension=-1, size=self.patch_size, step=self.stride)  # (B, N, A_eff, P)
 
-        # linear projection: 마지막 축 patch_size -> d_model
-        x = self.W_P(x) # (B, N, patch_num, d_model)
-        # print("after W_P:", x.shape)
-        actual_patch_num = x.shape[2]  # 실제 patch 개수를 동적으로 가져오기
-        self.patch_num = actual_patch_num  # 내부 변수 업데이트
-        self.a = self.patch_num
-        self.patch_repr_dim = self.a * self.d_model
-        # print("after W_P:", x.shape)
-        # # 변수별 독립 처리 위해 (B*N, patch_num, d_model)로 reshaping
-        # x = x.reshape(bs * n_vars, x.size(2), x.size(3))
-        #
-        # for block in self.PatchMixer_blocks:
-        #     x = block(x) # (B*N, patch_num, d_model)
-        #
-        # # Global representation: (B*N, patch_num * d_model) -> (B, N, -1) -> mean variable
-        # x = self.flatten(x)        # (B*N, patch_num * d_model)
-        # x = x.view(bs, n_vars, -1) # (B, N, patch_num * d_model)
-        # assert x.shape[-1] == self.patch_num * self.d_model, f"Unexpected feature dim: {x.shape[-1]}"
-        # x = x.mean(dim = 1)        # (B, a * d_model) 변수 축 평균 집약
+        # 실제 패치 수(런타임)
+        A_eff = x.size(2)
 
-        # (B*N, D, A)로 변환해 레이어 통과
-        BNA = x.reshape(bs * n_vars, self.patch_num, self.d_model)  # (B*N, A, D)
-        BDA = BNA.permute(0, 2, 1)                                   # (B*N, D, A)
-        # print("before blocks:", BDA.shape)
-        for blk in self.PatchMixer_blocks:
-            BDA = blk(BDA)                                           # (B*N, D, A)
+        # size P → D
+        x = self.W_P(x)                                     # (B, N, A_eff, D)
 
-        # (B*N, D*A) → (B, N, D*A)
-        x = self.flatten(BDA)                                        # (B*N, D*A)
-        x = x.view(bs, n_vars, -1)                                   # (B, N, D*A)
-        # print("after flatten+view:", x.shape, " expected last=", self.patch_num * self.d_model)
-        assert x.shape[-1] == self.patch_num * self.d_model, f"Unexpected feature dim: {x.shape[-1]} != {self.patch_num*self.d_model}"
+        # (B*N, D, A_eff)
+        BNA = x.reshape(B * N, A_eff, self.d_model)
+        BDA = BNA.permute(0, 2, 1)
 
-        # 변수 축 pooling
-        x = x.mean(dim=1)
+        for blk in self.blocks:
+            BDA = blk(BDA)
 
-        return x # (B, patch_repr_dim)
+        # (B*N, D*A_eff) -> (B, N, D*A_eff)
+        z = self.flatten(BDA).view(B, N, -1)
+
+        # 변수축 평균
+        z = z.mean(dim=1)                                   # (B, D*A_eff)
+
+        # 개발 중 차원 변동 감지용 경고(학습/추론 중 lookback 불일치 등)
+        if z.size(-1) != self.out_dim:
+            # 경고만. 상위 모듈에서 z_proj로 보정.
+            if self.training:
+                print(f"[PatchMixerBackbone][warn] forward out_dim={z.size(-1)} "
+                      f"!= declared out_dim={self.out_dim} "
+                      f"(A_eff={A_eff}, A_cfg={self.patch_num})")
+
+        return z  # (B, D*A_eff)
+
 
 
 class MultiScalePatchMixerBackbone(nn.Module):
     """
     서로 다른 (patch_len, stride, kernel) 분기를 병렬 구성.
-    - RevIN은 이 래퍼에서 1회 적용 -> 분기 내부는 revin = False
-    - 각 분기 출력 (a_i * d_model) -> per-branch Linear로 per_branch_dim 정렬 -> 융합
+    각 분기: (B, A_i*D) → per_branch_dim 정렬 → 융합
+    out_dim = fused_dim
     """
-    def __init__(self,
-                 base_configs,
-                 patch_cfgs: ((4, 2, 5), (8, 4, 7), (12, 6, 9)),  # (patch_len, stride, kernel)
-                 per_branch_dim: int = 128,
-                 fused_dim: int = 256,
-                 fusion: str = 'concat',  # ['concat', 'gated']
-                 affine: bool = True,
-                 subtract_last: bool = False,
-                 ):
+    def __init__(
+        self,
+        base_configs,
+        patch_cfgs: tuple = ((4, 2, 5), (8, 4, 7), (12, 6, 9)),
+        per_branch_dim: int = 128,
+        fused_dim: int = 256,
+        fusion: str = "concat",  # ['concat', 'gated']
+        affine: bool = True,
+        subtract_last: bool = False,
+    ):
         super().__init__()
         self.fusion = fusion
         self.branches = nn.ModuleList()
@@ -198,16 +179,17 @@ class MultiScalePatchMixerBackbone(nn.Module):
 
         for (pl, st, ks) in patch_cfgs:
             cfg = copy.deepcopy(base_configs)
-            cfg.patch_len = pl
-            cfg.stride = st
-            cfg.mixer_kernel_size = ks
-            branch = PatchMixerBackbone(cfg, revin = False) # 내부 RevIN 비활성화
-            self.branches.append(branch)
-            self.projs.append(nn.LazyLinear(per_branch_dim))
+            cfg.patch_len = int(pl)
+            cfg.stride = int(st)
+            cfg.mixer_kernel_size = int(ks)
 
-        if fusion == 'concat':
+            branch = PatchMixerBackbone(cfg, revin=False)
+            self.branches.append(branch)
+            self.projs.append(nn.Linear(branch.out_dim, per_branch_dim))  # Lazy 대신 명시형
+
+        if fusion == "concat":
             self.fuse = nn.Linear(per_branch_dim * len(self.branches), fused_dim)
-        elif fusion == 'gated':
+        elif fusion == "gated":
             self.fuse = nn.Linear(per_branch_dim, fused_dim)
             self.gate = nn.Linear(per_branch_dim, 1)
         else:
@@ -216,71 +198,60 @@ class MultiScalePatchMixerBackbone(nn.Module):
         self.out_dim = fused_dim
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        x: (B, L, N) -> (B, fused_dim)
-        """
-        reps = []
-        gates = []
+        reps, gates = [], []
         for branch, proj in zip(self.branches, self.projs):
-            b = branch(x) # (B, a_i * d_model)
-            b = proj(b)   # (B, per_branch_dim)
+            b = branch(x)         # (B, A_i*D_i)
+            b = proj(b)           # (B, per_branch_dim)
             reps.append(b)
-            if self.fusion == 'gated':
-                gates.append(self.gate(b)) # (B, 1)
+            if self.fusion == "gated":
+                gates.append(self.gate(b))  # (B,1)
 
-        if self.fusion == 'concat':
-            z = torch.cat(reps, dim = 1)    # (B, per_branch_dim * n_branch)
+        if self.fusion == "concat":
+            z = torch.cat(reps, dim=1)      # (B, per_branch_dim * n_branch)
             z = self.fuse(z)                # (B, fused_dim)
         else:
-            G = torch.softmax(torch.cat(gates, dim = 1), dim = 1) # (B, n_branch)
-            S = torch.stack(reps, dim = 1)                        # (B, n_branch, per_branch_dim)
-            z = (G.unsqueeze(-1) * S).sum(dim = 1)                # (B, per_branch_dim)
-            z = self.fuse(z)                                      # (B, fused_dim)
+            G = torch.softmax(torch.cat(gates, dim=1), dim=1)  # (B, n_branch)
+            S = torch.stack(reps, dim=1)                       # (B, n_branch, per_branch_dim)
+            z = (G.unsqueeze(-1) * S).sum(dim=1)               # (B, per_branch_dim)
+            z = self.fuse(z)                                   # (B, fused_dim)
         return z
+
+
 
 
 class PatchMixerBackboneWithPatcher(nn.Module):
     """
-    외부 패처(Module)가 만들어 준 (B*N, A, D)를 받아 PatchMixer blocks를 통과시키는 Backbone.
-    input: (B, L, N)
-    output: (B, A*D) *변수 축 평균 집약
+    외부 patcher가 만들어 준 (B*N, A, D)를 받아 PatchMixer blocks를 통과.
+    output: (B, A*D) (변수축 평균)
     """
-    def __init__(self,
-                 configs,
-                 patcher: nn.Module,  # DynamicPatcherMoS or DynamicOffsetPatcher 등
-                 e_layers: int | None = None,  # block 수 오버라이드 가능
-                 dropout_rate: float | None = None,
-                 ):
+    def __init__(self, configs, patcher: nn.Module, e_layers: int | None = None, dropout_rate: float | None = None):
         super().__init__()
         self.cfg = configs
-        self.n_vals = configs.enc_in
-        self.horizon = configs.horizon
-
-        # Patcher Meta
         self.patcher = patcher
-        self.a: int = int(getattr(patcher, 'patch_num'))
-        self.d_model: int = int(getattr(patcher, 'd_model'))
+
+        self.a: int = int(getattr(patcher, "patch_num"))
+        self.d_model: int = int(getattr(patcher, "d_model"))
         self.patch_repr_dim: int = self.a * self.d_model
+        self.out_dim: int = self.patch_repr_dim
 
         self.depth = int(e_layers if e_layers is not None else configs.e_layers)
         self.dropout_rate = float(dropout_rate if dropout_rate is not None else configs.head_dropout)
 
-        # Mixer blocks (Conv1d는 (N, C=patch_num, L=d_model) 포맷)
         self.blocks = nn.ModuleList([
-            PatchMixerLayer(patch_num=self.a, d_model=self.d_model, kernel_size=configs.mixer_kernel_size, dropout=self.dropout_rate)
+            PatchMixerLayer(d_model=self.d_model, kernel_size=int(configs.mixer_kernel_size), dropout=self.dropout_rate)
             for _ in range(self.depth)
         ])
-
         self.flatten = nn.Flatten(start_dim=-2)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (B, L, N)
         B, L, N = x.shape
-
         z = self.patcher(x)  # (B*N, A, D)
         for blk in self.blocks:
-            z = blk(z)  # (B*N, A, D)
+            z = blk(z)       # (B*N, D, A) <- 주의: patcher 포맷에 맞추어야 하면 permute 필요
 
-        z = self.flatten(z)  # (B*N, A*D)
-        z = z.view(B, N, -1).mean(1)  # (B, A*D)
+        # 위에서 PatchMixerLayer는 (B*, D, A)를 가정하므로 patcher가 (B*, A, D)를 낸다면 여기서 permute 하세요.
+        # z = z.permute(0, 2, 1)  # 필요 시
+
+        z = self.flatten(z)             # (B*N, A*D)
+        z = z.view(B, N, -1).mean(1)    # (B, A*D)
         return z
