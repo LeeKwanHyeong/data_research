@@ -1,3 +1,5 @@
+from typing import List, Tuple
+
 import torch
 import torch.nn as nn
 
@@ -9,6 +11,29 @@ from modeling_module.models.common_layers.heads.quantile_heads.decomposition_qua
 from modeling_module.utils.exogenous_utils import apply_exo_shift_linear
 from modeling_module.utils.temporal_expander import TemporalExpander
 
+def _nearest_odd(k: int) -> int:
+    return k if k % 2 == 1 else (k + 1)
+
+def make_patch_cfgs(lookback: int, n_branches: int = 3) -> List[Tuple[int, int, int]]:
+    """
+    출력 형태: [(patch_len, stride, mixer_kernel), ...]
+    규칙:
+      - patch_len ≈ {L/4, L/2, 3L/4} (경계 처리)
+      - stride = max(1, patch_len // 2)
+      - mixer_kernel: 작은 홀수(3,5,7) 중 선택
+    """
+    assert lookback >= 8, f"lookback={lookback}는 너무 작습니다(최소 8 권장)."
+    fracs = [1/4, 1/2, 3/4][:n_branches]
+    raw = [max(4, min(lookback, int(round(lookback * f)))) for f in fracs]
+    # 중복 제거 및 정렬
+    P = sorted(list(dict.fromkeys(raw)))
+    cfgs = []
+    for i, p in enumerate(P):
+        s = max(1, p // 2)
+        k = [3, 5, 7][min(i, 2)]
+        k = _nearest_odd(k)
+        cfgs.append((p, s, k))
+    return cfgs
 
 # -------------------------
 # PatchMixer -> Horizon regression (Point)
@@ -25,7 +50,7 @@ class BaseModel(nn.Module):
         self.configs = configs
 
         self.horizon = configs.horizon
-        self.f_out = int(getattr(configs, 'expander_f_out', 128))
+        self.f_out = int(getattr(configs, 'f_out', 128))
 
         # flags
         self.exo_is_normalized_default = bool(getattr(configs, 'exo_is_normalized_default', True))
@@ -44,11 +69,14 @@ class BaseModel(nn.Module):
         if self.use_part_embedding and int(getattr(configs, 'part_vocab_size', 0)) > 0:
             pdim = int(getattr(configs, 'part_embed_dim', 16))
             self.part_emb = nn.Embedding(int(configs.part_vocab_size), pdim)
-            self.z_fuser = nn.Linear(in_dim + pdim, in_dim)
+            self.z_fuser = nn.Linear(in_dim + pdim, in_dim)  # ← 원차원으로 복원
 
         # Temporal Expander: [B,D] -> [B,H,F]
         self.expander = TemporalExpander(
-            d_in=in_dim, horizon=self.horizon, f_out=self.f_out, dropout=float(getattr(configs, 'dropout', 0.1)),
+            d_in=in_dim,  # ← 여기!
+            horizon=self.horizon,
+            f_out=self.f_out,
+            dropout=float(getattr(configs, 'dropout', 0.1)),
             use_sinus=True,
             season_period=int(getattr(configs, 'expander_season_period', 52)),
             max_harmonics=int(getattr(configs, 'expander_max_harmonics', 16)),
@@ -143,8 +171,11 @@ class BaseModel(nn.Module):
 
         # (옵션) part embedding 결합
         if (self.part_emb is not None) and (part_ids is not None):
-            pe = self.part_emb(part_ids)          # [B,P]
-            z = self.z_fuser(torch.cat([z, pe], dim=1))
+            pe = self.part_emb(part_ids)  # [B, P]
+            z = self.z_fuser(torch.cat([z, pe], 1))  # [B, D]  ← 복원
+
+        assert z.size(-1) == self.expander.d_in, \
+            f"z_dim={z.size(-1)} vs expander.d_in={self.expander.d_in}"
 
         # 2) 확장
         x_bhf = self.expander(z)                  # [B,H,F]
@@ -226,32 +257,54 @@ class BaseModel(nn.Module):
 # -------------------------
 # PatchMixer + Decomposition Quantile Head (Q=3)
 # -------------------------
+
+
+def _nearest_odd(k: int) -> int:
+    return k if k % 2 == 1 else (k + 1)
+
+def make_patch_cfgs(lookback: int, n_branches: int = 3) -> List[Tuple[int, int, int]]:
+    assert lookback >= 8, f"lookback={lookback}는 너무 작습니다(최소 8 권장)."
+    fracs = [1/4, 1/2, 3/4][:n_branches]
+    raw = [max(4, min(lookback, int(round(lookback * f)))) for f in fracs]
+    P = sorted(list(dict.fromkeys(raw)))
+    cfgs = []
+    for i, p in enumerate(P):
+        s = max(1, p // 2)
+        k = [3, 5, 7][min(i, 2)]
+        k = _nearest_odd(k)
+        cfgs.append((p, s, k))
+    return cfgs
+
+
 class QuantileModel(nn.Module):
     """
-    Multi-Scale PatchMixer Backbone + DecompositionQuantileHead
-    output: {'q': (B, 3, H)}
-    + (옵션) part embedding, EOL prior, final_nonneg 등
+    Multi-Scale PatchMixer Backbone + TemporalExpander + DecompositionQuantileHead
+    출력: {"q": (B, 3, H)}  # RevIN denorm 후, 추론 시 음수 clamp(옵션) 적용
     """
     def __init__(self, configs: PatchMixerConfig):
         super().__init__()
         self.is_quantile = True
-        self.model_name = 'PatchMixer QuantileModel'
+        self.model_name = "PatchMixer QuantileModel"
         self.configs = configs
 
-        self.horizon = configs.horizon
-        self.exo_dim = int(getattr(configs, 'exo_dim', 0))
-        self.f_out = int(getattr(configs, 'expander_f_out', 128))
-        self.n_harmonics = int(getattr(configs, 'expander_n_harmonics', 8))
-        self.final_nonneg = bool(getattr(configs, 'final_nonneg', True))
-        self.use_eol_prior = bool(getattr(configs, 'use_eol_prior', False))
-        self.eol_feature_index = int(getattr(configs, 'eol_feature_index', 0))
-        self.exo_is_normalized_default = bool(getattr(configs, 'exo_is_normalized_default', True))
+        # ----- 기본 하이퍼 -----
+        self.horizon = int(configs.horizon)
+        self.f_out = int(getattr(configs, "f_out", 128))
+        self.n_harmonics = int(getattr(configs, "expander_n_harmonics", 8))
 
-        # 1) Backbone (멀티스케일)
-        self.patch_cfgs = getattr(configs, 'patch_cfgs', ())
-        self.per_branch_dim = int(getattr(configs, 'per_branch_dim', 64))
-        self.fused_dim = int(getattr(configs, 'fused_dim', 128))
-        self.fusion = getattr(configs, 'fusion', 'concat')
+        # 동작 플래그
+        self.final_nonneg = bool(getattr(configs, "final_nonneg", True))
+        self.use_eol_prior = bool(getattr(configs, "use_eol_prior", False))
+        self.eol_feature_index = int(getattr(configs, "eol_feature_index", 0))
+        self.exo_is_normalized_default = bool(getattr(configs, "exo_is_normalized_default", True))
+
+        # ----- 멀티스케일 백본 -----
+        self.patch_cfgs = getattr(configs, "patch_cfgs", ())
+        if not self.patch_cfgs:
+            self.patch_cfgs = tuple(make_patch_cfgs(configs.lookback, n_branches=3))
+        self.per_branch_dim = int(getattr(configs, "per_branch_dim", 64))
+        self.fused_dim = int(getattr(configs, "fused_dim", 128))
+        self.fusion = getattr(configs, "fusion", "concat")
 
         self.backbone = MultiScalePatchMixerBackbone(
             base_configs=configs,
@@ -260,106 +313,120 @@ class QuantileModel(nn.Module):
             fused_dim=self.fused_dim,
             fusion=self.fusion,
         )
-        d_in = self.backbone.out_dim
+        d_in = int(self.backbone.out_dim)  # 백본 출력 차원
 
-        # (옵션) Part embedding
-        self.use_part_embedding = bool(getattr(configs, 'use_part_embedding', False))
+        # ----- Part embedding (옵션) -----
+        self.use_part_embedding = bool(getattr(configs, "use_part_embedding", False))
         self.part_emb = None
         self.z_fuser = None
-        if self.use_part_embedding and int(getattr(configs, 'part_vocab_size', 0)) > 0:
-            pdim = int(getattr(configs, 'part_embed_dim', 16))
+        if self.use_part_embedding and int(getattr(configs, "part_vocab_size", 0)) > 0:
+            pdim = int(getattr(configs, "part_embed_dim", 16))
             self.part_emb = nn.Embedding(int(configs.part_vocab_size), pdim)
+            # concat 이후 다시 d_in으로 복원 (Expander 입력은 d_in 고정)
             self.z_fuser = nn.Linear(d_in + pdim, d_in)
 
-        # 2) Temporal Expander: [B,D] -> [B,H,F]
+        # ----- Temporal Expander: [B, d_in] -> [B, H, F] -----
         self.expander = TemporalExpander(
-            d_in=d_in, horizon=self.horizon, f_out=self.f_out, dropout=float(getattr(configs, 'dropout', 0.1)),
+            d_in=d_in,
+            horizon=self.horizon,
+            f_out=self.f_out,
+            dropout=float(getattr(configs, "dropout", 0.1)),
             use_sinus=True,
-            season_period=int(getattr(configs, "season_period", 52)),
-            max_harmonics=int(getattr(configs, "max_harmonics", 16)),
-            use_conv=True
+            season_period=int(getattr(configs, "expander_season_period", 52)),
+            max_harmonics=int(getattr(configs, "expander_max_harmonics", 16)),
+            use_conv=True,
         )
+        # 안전용(TemporalExpander에 d_in 속성이 없다면 내부에 기록)
+        self._expander_d_in = d_in
 
-        # 3) Quantile Head
-        head_hidden = int(getattr(configs, 'head_hidden', 128))
+        # ----- Quantile Head -----
+        head_hidden = int(getattr(configs, "head_hidden", 128))
+        head_dropout = float(getattr(configs, "head_dropout", 0.0) or 0.0)
         self.head = DecompositionQuantileHead(
             in_features=self.f_out,
             quantiles=[0.1, 0.5, 0.9],
             hidden=head_hidden,
-            dropout=float(getattr(configs, 'head_dropout', 0.0) or 0.0),
+            dropout=head_dropout,
             mid=0.5,
             use_trend=True,
             fourier_k=self.n_harmonics,
             agg="mean",
         )
 
-        # 외생
+        # ----- Exogenous -----
+        self.exo_dim = int(getattr(configs, "exo_dim", 0))
         self.exo_head = None
         if self.exo_dim > 0:
             self._build_exo_head(self.exo_dim)
 
-        self.revin = RevIN(int(getattr(configs, 'enc_in', 1)))
+        # ----- RevIN -----
+        self.revin = RevIN(int(getattr(configs, "enc_in", 1)))
 
     def _build_exo_head(self, E: int):
         self.exo_head = nn.Sequential(
             nn.Linear(E, 64),
             nn.GELU(),
-            nn.Linear(64, 1)
+            nn.Linear(64, 1),
         )
         self.exo_dim = int(E)
 
     @staticmethod
     def _ensure_bqh(q: torch.Tensor, horizon: int, qlen: int) -> torch.Tensor:
-        # 허용: (B,Q,H) 또는 (B,H,Q)
         if q.dim() != 3:
-            raise ValueError(f"pred must be 3D, got {q.shape}")
+            raise ValueError(f"pred must be 3D, got {tuple(q.shape)}")
         B, A, Bdim = q.shape
-        if A == qlen and Bdim == horizon:  # (B,Q,H)
+        if (A == qlen) and (Bdim == horizon):  # (B,Q,H)
             return q
-        if A == horizon and Bdim == qlen:  # (B,H,Q)
+        if (A == horizon) and (Bdim == qlen):  # (B,H,Q)
             return q.permute(0, 2, 1).contiguous()
-        raise ValueError(f"pred shape must be (B,{qlen},{horizon}) or (B,{horizon},{qlen}), got {q.shape}")
+        raise ValueError(f"pred shape must be (B,{qlen},{horizon}) or (B,{horizon},{qlen}), got {tuple(q.shape)}")
 
     @staticmethod
     def _apply_eol_prior(q: torch.Tensor, future_exo: torch.Tensor, idx: int, strength: float = 0.2) -> torch.Tensor:
         # q: [B,Q,H]
-        so = future_exo[:, :, idx].float()                     # [B,H]
+        so = future_exo[:, :, idx].float()  # [B,H]
         so_n = (so - so.mean(dim=1, keepdim=True)) / (so.std(dim=1, keepdim=True) + 1e-6)
-        return q - strength * so_n.unsqueeze(1)                # 모든 분위에 동일 적용
+        return q - strength * so_n.unsqueeze(1)
 
-    def forward(self,
-                x: torch.Tensor,
-                future_exo: torch.Tensor | None = None,
-                *,
-                part_ids: torch.Tensor | None = None,
-                exo_is_normalized: bool | None = None,
-                **kwargs):
-        """
-        x: (B, L, N), future_exo: (B, H, E), part_ids: (B,)
-        return: {"q": (B, 3, H)}   # RevIN denorm 완료, (추론 시) clamp_nonneg 옵션 적용
-        """
+    def forward(
+        self,
+        x: torch.Tensor,                         # (B,L,C)
+        future_exo: torch.Tensor | None = None,  # (B,H,E)
+        *,
+        part_ids: torch.Tensor | None = None,    # (B,)
+        exo_is_normalized: bool | None = None,
+        **kwargs,
+    ):
         if exo_is_normalized is None:
             exo_is_normalized = self.exo_is_normalized_default
 
         # 0) 입력 정규화
-        x_n = self.revin(x, 'norm')
+        x_n = self.revin(x, "norm")
 
-        # 1) 백본 → [B, D]
+        # 1) 백본 → [B, d_in]
         z = self.backbone(x_n)
 
-        # (옵션) part embedding 결합
+        # (옵션) Part embedding 결합 → 원차원(d_in)으로 복원
         if (self.part_emb is not None) and (part_ids is not None):
-            pe = self.part_emb(part_ids)          # [B,P]
+            pe = self.part_emb(part_ids)               # [B, P]
             z = self.z_fuser(torch.cat([z, pe], dim=1))
 
-        # 2) 시점 확장
-        x_bhf = self.expander(z)                  # (B, H, F)
+        # --- 안전장치: Expander 입력 차원 확인 ---
+        d_in_expect = getattr(self.expander, "d_in", self._expander_d_in)
+        if z.size(-1) != d_in_expect:
+            raise RuntimeError(
+                f"[QuantileModel] expander.d_in mismatch: got z_dim={z.size(-1)} vs d_in={d_in_expect}. "
+                f"(concat 이후 z_fuser로 d_in 복원되어야 합니다.)"
+            )
 
-        # 3) 분위수 예측(정규화 공간)
-        q = self.head(x_bhf)                      # (B, 3, H)
+        # 2) 시점 확장 [B,H,F]
+        x_bhf = self.expander(z)
+
+        # 3) 분위수 예측(정규화 공간) → (B,3,H)
+        q = self.head(x_bhf)
         q = self._ensure_bqh(q, self.horizon, qlen=3)
 
-        # 4) exogenous shift (정규화 공간/원단위 중 선택)
+        # 4) exogenous shift
         ex = None
         if future_exo is not None:
             if (self.exo_head is None) or (future_exo.size(-1) != self.exo_dim):
@@ -369,22 +436,26 @@ class QuantileModel(nn.Module):
                           f"(model={self.exo_dim}, batch={new_E}). Rebuilding exo_head.")
                 self._build_exo_head(new_E)
 
-            ex = apply_exo_shift_linear(self.exo_head, future_exo,
-                                        horizon=self.horizon,
-                                        out_dtype=q.dtype, out_device=q.device)
+            ex = apply_exo_shift_linear(
+                self.exo_head,
+                future_exo,
+                horizon=self.horizon,
+                out_dtype=q.dtype,
+                out_device=q.device,
+            )
             if exo_is_normalized:
                 q = q + ex.unsqueeze(1)
 
-        # 5) (옵션) EOL prior (정규화 공간에서 보정)
+        # 5) (옵션) EOL prior
         if self.use_eol_prior and (future_exo is not None) and (self.eol_feature_index < future_exo.size(-1)):
             q = self._apply_eol_prior(q, future_exo, self.eol_feature_index, strength=0.2)
 
-        # 6) RevIN 역정규화 (분위수별)
+        # 6) RevIN 역정규화(분위별)
         qs = []
         for i in range(q.size(1)):
-            qi = self.revin(q[:, i, :].unsqueeze(-1), 'denorm').squeeze(-1)  # [B,H]
-            qs.append(qi.unsqueeze(1))  # [B,1,H]
-        q_raw = torch.cat(qs, dim=1)    # [B,3,H]
+            qi = self.revin(q[:, i, :].unsqueeze(-1), "denorm").squeeze(-1)  # [B,H]
+            qs.append(qi.unsqueeze(1))
+        q_raw = torch.cat(qs, dim=1)  # [B,3,H]
 
         # 7) 원단위 exogenous 가산(정규화 공간에서 더하지 않았다면)
         if (ex is not None) and (not exo_is_normalized):
@@ -395,3 +466,4 @@ class QuantileModel(nn.Module):
             q_raw = torch.clamp_min(q_raw, 0.0)
 
         return {"q": q_raw}
+

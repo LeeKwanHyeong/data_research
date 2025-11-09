@@ -39,7 +39,7 @@ class PatchMixerConfig(TrainingConfig):
     mixer_kernel_size: int = 5
 
     # ---------- Expander ----------
-    expander_f_out: int = 128
+    f_out: int = 128
     expander_season_period: int = 52
     expander_n_harmonics: int = 8
     expander_max_harmonics: int = 16  # 호환용
