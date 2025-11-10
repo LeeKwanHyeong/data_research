@@ -6,7 +6,20 @@ import copy
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+class FeatureAlign(nn.Module):
+    def __init__(self, out_dim: int):
+        super().__init__()
+        self.out_dim = out_dim
+        self.fc: nn.Linear | None = None
+        self.in_dim: int | None = None
 
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        d = x.size(-1)
+        if (self.fc is None) or (self.in_dim != d):
+            # 입력 차원이 달라지면 in_dim을 갱신하며 선형층을 재생성
+            self.fc = nn.Linear(d, self.out_dim, bias=True).to(x.device)
+            self.in_dim = d
+        return self.fc(x)
 class PatchMixerLayer(nn.Module):
     """
     입력: (B*, D=d_model, A=patch_num)
@@ -21,18 +34,15 @@ class PatchMixerLayer(nn.Module):
 
         # Conv는 padding=0로 두고, forward에서 동적으로 pad
         self.token_mixer = nn.Sequential(
-            nn.Conv1d(
-                in_channels=d_model, out_channels=d_model,
-                kernel_size=self.ks, stride=1, padding=0,  # ★ 0
-                dilation=self.dilation, groups=d_model  # depthwise
-            ),
+            nn.Conv1d(d_model, d_model, kernel_size=self.ks, stride=1, padding=0,
+                      dilation=self.dilation, groups=d_model),  # depthwise
             nn.GELU(),
-            nn.BatchNorm1d(d_model),
+            nn.GroupNorm(num_groups=min(32, d_model), num_channels=d_model),  # ← 변경
         )
         self.channel_mixer = nn.Sequential(
             nn.Conv1d(d_model, d_model, kernel_size=1),
             nn.GELU(),
-            nn.BatchNorm1d(d_model),
+            nn.GroupNorm(num_groups=min(32, d_model), num_channels=d_model),  # ← 변경
         )
         self.dropout = nn.Dropout(dropout)
 
@@ -117,7 +127,17 @@ class PatchMixerBackbone(nn.Module):
         """
         self._assert_3d(x)
         B, L, N = x.shape
-
+        if L != self.lookback:
+            if L > self.lookback:
+                # 뒤에서 자르기 (최근 구간 사용)
+                x = x[:, -self.lookback:, :]
+            else:
+                # 왼쪽을 복제 패딩해서 길이를 맞춤
+                pad = self.lookback - L
+                # time 차원이 두번째(=dim=1)이니, transpose로 (B,N,L)로 바꿔 1D pad 후 복원
+                x = x.transpose(1, 2)  # (B, N, L)
+                x = F.pad(x, (pad, 0), mode="replicate")  # (B, N, lookback)
+                x = x.transpose(1, 2)  # (B, lookback, N)
         # (B, N, L)
         x = x.permute(0, 2, 1)
 

@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 from typing import Literal, Optional
 
-def calendar_sin_cos(t0: int, H: int, device="cpu", date_type: Literal['M','W','D']='W'):
+def calendar_sin_cos(t0: int, H: int, device='cuda' if torch.cuda.is_available() else 'mps', date_type: Literal['M','W','D']='W'):
     if date_type == 'M':
         period = 12
     elif date_type == 'W':
@@ -20,7 +20,7 @@ def compose_exo_calendar_cb(date_type: str = "W", *, sincos: bool = True):
     period = 52 if date_type.upper().startswith("W") else 12
     E = 2 if sincos else 1
 
-    def cb(start_idx: int, H: int, device="cpu"):
+    def cb(start_idx: int, H: int, device='cuda' if torch.cuda.is_available() else 'mps'):
         t = torch.arange(start_idx, start_idx + H, device=device, dtype=torch.float32)
         if sincos:
             exo = torch.stack([torch.sin(2*torch.pi*t/period),
@@ -32,27 +32,43 @@ def compose_exo_calendar_cb(date_type: str = "W", *, sincos: bool = True):
     return cb
 
 # ===== 공용 유틸 =====
+@torch.no_grad()
 def apply_exo_shift_linear(head: nn.Module,
-                            future_exo: torch.Tensor,
-                            horizon: int,
-                            out_dtype: torch.dtype,
-                            out_device: torch.device) -> torch.Tensor:
-    """
-    future_exo: (B, Hx, exo_dim) -> head -> (B, Hx, 1) -> (B, Hx)
-    Hx != horizon이면 pad/trim으로 자동 보정 후 (B,H) 반환
-    """
-    if future_exo is None:
-        return None
-    ex = future_exo.to(device=out_device, dtype=out_dtype, non_blocking=True)
-    B, Hx, _ = ex.shape
-    ex = head(ex).squeeze(-1)  # (B, Hx)
-    if Hx == horizon:
-        return ex
+                           future_exo: torch.Tensor,  # (B,H,E) or (H,E)
+                           *,
+                           horizon: int,
+                           out_dtype=None,
+                           out_device=None) -> torch.Tensor:  # -> (B,H)
+    # 1) head/device/dtype 결정
+    if out_device is None:
+        try:
+            out_device = next(head.parameters()).device
+        except StopIteration:
+            out_device = future_exo.device
+    if out_dtype is None:
+        out_dtype = future_exo.dtype
+
+    # 2) 배치 차원 보정
+    ex = future_exo
+    if ex.dim() == 2:  # (H,E) -> (1,H,E)
+        ex = ex.unsqueeze(0)
+
+    # 3) 디바이스/타입 정렬 + head 이동
+    ex = ex.to(device=out_device, dtype=out_dtype, non_blocking=True)
+    if isinstance(head, nn.Module):
+        head = head.to(out_device)
+
+    # 4) 선형 head 적용
+    ex = head(ex).squeeze(-1)  # (B,H)
+
+    # 5) H 길이 정합 (pad/trim)
+    B, Hx = ex.shape[0], ex.shape[1]
+    if Hx < horizon:
+        pad = torch.full((B, horizon - Hx), 0.0, device=ex.device, dtype=ex.dtype)
+        ex = torch.cat([ex, pad], dim=1)
     elif Hx > horizon:
-        return ex[:, :horizon]
-    else:
-        pad = torch.zeros(B, horizon - Hx, device=out_device, dtype=out_dtype)
-        return torch.cat([ex, pad], dim=1)
+        ex = ex[:, :horizon]
+    return ex
 
 
 
@@ -133,7 +149,7 @@ def compose_exo_calendar_age_warranty_cb(
         else:
             return age
 
-    def cb(start_idx: int, H: int, device: str = "cpu") -> torch.Tensor:
+    def cb(start_idx: int, H: int, device='cuda' if torch.cuda.is_available() else 'mps') -> torch.Tensor:
         # 절대 인덱스 t: [start_idx, ..., start_idx+H-1]
         t = torch.arange(start_idx, start_idx + H, device=device, dtype=torch.float32)
         feats = []

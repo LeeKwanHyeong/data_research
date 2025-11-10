@@ -102,4 +102,5 @@ class TemporalExpander(nn.Module):
             Yc = self.pw(Yc)
             Yc = self.conv_dropout(Yc)
             Y  = Y + Yc.transpose(1, 2)
+
         return Y

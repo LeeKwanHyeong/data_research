@@ -33,7 +33,7 @@ def run_total_train_weekly(
         horizon,
 ):
     stg_warmup = StageConfig(
-        epochs=1,
+        epochs=10,
         spike_enabled=False,
         lr=3e-4,  # warm-up은 살짝 높여도 ok
         use_horizon_decay=False  # 초기는 스케일/시즌 맞추기에 집중
@@ -41,7 +41,7 @@ def run_total_train_weekly(
 
     # ② Spike-boost: spike ON, lr ↓, 30~50 epoch
     stg_spike = StageConfig(
-        epochs=1,
+        epochs=50,
         spike_enabled=True,
         lr=1e-4,
         use_horizon_decay=True,  # 필요 시 ON
@@ -110,100 +110,100 @@ def run_total_train_weekly(
     results: Dict[str, Dict] = {}
 
     # ---------------- PatchMixer ----------------
-    weekly_exo_dim = 4  # compose_exo_calendar_cb('W')라면 보통 sin/cos 2개
-    use_eol = False  # weekly에서 sequence(EOL proxy)를 future_exo에 포함했다면 True로
+    # weekly_exo_dim = 4  # compose_exo_calendar_cb('W')라면 보통 sin/cos 2개
+    # use_eol = False  # weekly에서 sequence(EOL proxy)를 future_exo에 포함했다면 True로
+    #
+    # pm_base_config = PatchMixerConfigWeekly(
+    #     lookback=lookback,
+    #     horizon=horizon,
+    #     device=device,
+    #     loss_mode='point',
+    #     point_loss='huber',
+    #
+    #     # ---- LTB 권장 파라미터 ----
+    #     enc_in=1,
+    #     d_model=64, e_layers=3,
+    #     patch_len=12, stride=8,
+    #     f_out=128,
+    #     head_hidden=128,
+    #     head_dropout=0.05,
+    #
+    #     # 외생/파트 임베딩
+    #     exo_dim=weekly_exo_dim,  # 주간 캘린더(woY sin/cos)
+    #     use_part_embedding=True,
+    #     part_vocab_size=_get_part_vocab_size_from_loader(train_loader),
+    #     part_embed_dim=16,
+    #
+    #     # 출력 제약/EOL
+    #     final_nonneg=True,
+    #     use_eol_prior=use_eol,  # sequence를 exo에 포함했다면 True
+    #     eol_feature_index=0,  # future_exo[:, :, 0]이 sequence라면 0
+    #
+    #     # 정규화 후/원단위 가산 방식
+    #     exo_is_normalized_default=True,  # 주간은 정규화 공간에서 가산 권장
+    #
+    #     # 계절 파라미터
+    #     expander_season_period=52,
+    #     expander_n_harmonics=16,
+    # )
+    #
+    # pm_quantile_config = PatchMixerConfigWeekly(
+    #     lookback=lookback,
+    #     horizon=horizon,
+    #     device=device,
+    #     loss_mode='quantile',
+    #     quantiles=(0.1, 0.5, 0.9),
+    #
+    #     # ---- LTB 권장 파라미터(동일 용량) ----
+    #     enc_in=1,
+    #     d_model=64, e_layers=3,
+    #     patch_len=12, stride=8,
+    #     f_out=128,
+    #     head_hidden=128,
+    #     head_dropout=0.02,
+    #
+    #     exo_dim=weekly_exo_dim,
+    #     use_part_embedding=True,
+    #     part_vocab_size=_get_part_vocab_size_from_loader(train_loader),
+    #     part_embed_dim=16,
+    #
+    #     final_nonneg=True,
+    #     use_eol_prior=use_eol,
+    #     eol_feature_index=0,
+    #
+    #     exo_is_normalized_default=True,
+    #
+    #     expander_season_period=52,
+    #     expander_n_harmonics=8,
+    # )
+    #
+    # pm_base_model = build_patch_mixer_base(pm_base_config)
+    # pm_quantile_model = build_patch_mixer_quantile(pm_quantile_config)
+    #
+    # print('PatchMixer Base (Weekly)')
+    # best_pm_base = train_patchmixer(
+    #     pm_base_model,
+    #     train_loader, val_loader,
+    #     train_cfg=point_train_cfg,
+    #     stages=stages,
+    #     future_exo_cb=future_exo_cb,
+    #     # ▶ configs의 기본값을 그대로 사용
+    #     exo_is_normalized=pm_base_config.exo_is_normalized_default,
+    # )
+    # results['PatchMixer Base'] = best_pm_base
+    #
+    # print('PatchMixer Quantile (Weekly)')
+    # best_pm_quantile = train_patchmixer(
+    #     pm_quantile_model,
+    #     train_loader, val_loader,
+    #     train_cfg=quantile_train_cfg,
+    #     stages=stages,
+    #     future_exo_cb=future_exo_cb,
+    #     exo_is_normalized=pm_quantile_config.exo_is_normalized_default,
+    # )
+    # results['PatchMixer Quantile'] = best_pm_quantile
 
-    pm_base_config = PatchMixerConfigWeekly(
-        lookback=lookback,
-        horizon=horizon,
-        device=device,
-        loss_mode='point',
-        point_loss='huber',
-
-        # ---- LTB 권장 파라미터 ----
-        enc_in=1,
-        d_model=64, e_layers=3,
-        patch_len=12, stride=8,
-        f_out=128,
-        head_hidden=128,
-        head_dropout=0.05,
-
-        # 외생/파트 임베딩
-        exo_dim=weekly_exo_dim,  # 주간 캘린더(woY sin/cos)
-        use_part_embedding=True,
-        part_vocab_size=_get_part_vocab_size_from_loader(train_loader),
-        part_embed_dim=16,
-
-        # 출력 제약/EOL
-        final_nonneg=True,
-        use_eol_prior=use_eol,  # sequence를 exo에 포함했다면 True
-        eol_feature_index=0,  # future_exo[:, :, 0]이 sequence라면 0
-
-        # 정규화 후/원단위 가산 방식
-        exo_is_normalized_default=True,  # 주간은 정규화 공간에서 가산 권장
-
-        # 계절 파라미터
-        expander_season_period=52,
-        expander_n_harmonics=16,
-    )
-
-    pm_quantile_config = PatchMixerConfigWeekly(
-        lookback=lookback,
-        horizon=horizon,
-        device=device,
-        loss_mode='quantile',
-        quantiles=(0.1, 0.5, 0.9),
-
-        # ---- LTB 권장 파라미터(동일 용량) ----
-        enc_in=1,
-        d_model=64, e_layers=3,
-        patch_len=12, stride=8,
-        f_out=128,
-        head_hidden=128,
-        head_dropout=0.02,
-
-        exo_dim=weekly_exo_dim,
-        use_part_embedding=True,
-        part_vocab_size=_get_part_vocab_size_from_loader(train_loader),
-        part_embed_dim=16,
-
-        final_nonneg=True,
-        use_eol_prior=use_eol,
-        eol_feature_index=0,
-
-        exo_is_normalized_default=True,
-
-        expander_season_period=52,
-        expander_n_harmonics=8,
-    )
-
-    pm_base_model = build_patch_mixer_base(pm_base_config)
-    pm_quantile_model = build_patch_mixer_quantile(pm_quantile_config)
-
-    print('PatchMixer Base (Weekly)')
-    best_pm_base = train_patchmixer(
-        pm_base_model,
-        train_loader, val_loader,
-        train_cfg=point_train_cfg,
-        stages=stages,
-        future_exo_cb=future_exo_cb,
-        # ▶ configs의 기본값을 그대로 사용
-        exo_is_normalized=pm_base_config.exo_is_normalized_default,
-    )
-    results['PatchMixer Base'] = best_pm_base
-
-    print('PatchMixer Quantile (Weekly)')
-    best_pm_quantile = train_patchmixer(
-        pm_quantile_model,
-        train_loader, val_loader,
-        train_cfg=quantile_train_cfg,
-        stages=stages,
-        future_exo_cb=future_exo_cb,
-        exo_is_normalized=pm_quantile_config.exo_is_normalized_default,
-    )
-    results['PatchMixer Quantile'] = best_pm_quantile
-
-    # # ---------------- Titan (Quantile + TTA) ----------------
+    # # # ---------------- Titan (Quantile + TTA) ----------------
     ti_config = TitanConfig(
         lookback=lookback,
         horizon=horizon,
@@ -238,75 +238,75 @@ def run_total_train_weekly(
     )
     results['Titan Base'] = best_ti_base
 
-    print('Titan LMM')
-    best_ti_lmm = train_titan(
-        ti_lmm, train_loader, val_loader,
-        train_cfg=point_train_cfg,
-        stages=stages,
-        future_exo_cb=future_exo_cb,
-    )
-    results['Titan LMM'] = best_ti_lmm
-
-    print('Titan Seq2Seq')
-    best_ti_seq2seq = train_titan(
-        ti_seq2seq, train_loader, val_loader,
-        train_cfg=point_train_cfg,
-        stages=stages,
-        future_exo_cb=future_exo_cb,
-    )
-    results['Titan Seq2Seq'] = best_ti_seq2seq
-
-    # ---------------- PatchTST ----------------
-
-    print('PatchTST Base')
-    pt_point_config = PatchTSTConfig(
-        device=device,
-        lookback=lookback,
-        horizon=horizon,
-        loss_mode='point',
-        point_loss='huber',  # 권장
-        c_in=1,  # 입력 채널
-        d_model=256,
-        n_layers=3,
-        patch_len=16,
-        stride=8,
-    )
-    pt_base = build_patchTST_base(pt_point_config)
-
-    pt_quantile_config = PatchTSTConfig(
-        device=device,
-        lookback=lookback,
-        horizon=horizon,
-        loss_mode='quantile',
-        quantiles=(0.1, 0.5, 0.9),
-        c_in=1,
-        d_model=256,
-        n_layers=3,
-        patch_len=16,
-        stride=8,
-    )
-    pt_quantile = build_patchTST_quantile(pt_quantile_config)
-
-    print('PatchTST Base (Weekly)')
-    best_pt_base = train_patchtst(
-        pt_base,
-        train_loader, val_loader,
-        train_cfg=point_train_cfg,
-        stages=stages,
-        future_exo_cb=future_exo_cb,
-    )
-    results['PatchTST Base'] = best_pt_base
-
-    print('PatchTST Quantile (Weekly)')
-    best_pt_quantile = train_patchtst(
-        pt_quantile,
-        train_loader, val_loader,
-        train_cfg=quantile_train_cfg,
-        stages=stages,
-        future_exo_cb=future_exo_cb,
-        exo_is_normalized=True
-    )
-    results['PatchTST Quantile'] = best_pt_quantile
+    # print('Titan LMM')
+    # best_ti_lmm = train_titan(
+    #     ti_lmm, train_loader, val_loader,
+    #     train_cfg=point_train_cfg,
+    #     stages=stages,
+    #     future_exo_cb=future_exo_cb,
+    # )
+    # results['Titan LMM'] = best_ti_lmm
+    #
+    # print('Titan Seq2Seq')
+    # best_ti_seq2seq = train_titan(
+    #     ti_seq2seq, train_loader, val_loader,
+    #     train_cfg=point_train_cfg,
+    #     stages=stages,
+    #     future_exo_cb=future_exo_cb,
+    # )
+    # results['Titan Seq2Seq'] = best_ti_seq2seq
+    #
+    # # ---------------- PatchTST ----------------
+    #
+    # print('PatchTST Base')
+    # pt_point_config = PatchTSTConfig(
+    #     device=device,
+    #     lookback=lookback,
+    #     horizon=horizon,
+    #     loss_mode='point',
+    #     point_loss='huber',  # 권장
+    #     c_in=1,  # 입력 채널
+    #     d_model=256,
+    #     n_layers=3,
+    #     patch_len=16,
+    #     stride=8,
+    # )
+    # pt_base = build_patchTST_base(pt_point_config)
+    #
+    # pt_quantile_config = PatchTSTConfig(
+    #     device=device,
+    #     lookback=lookback,
+    #     horizon=horizon,
+    #     loss_mode='quantile',
+    #     quantiles=(0.1, 0.5, 0.9),
+    #     c_in=1,
+    #     d_model=256,
+    #     n_layers=3,
+    #     patch_len=16,
+    #     stride=8,
+    # )
+    # pt_quantile = build_patchTST_quantile(pt_quantile_config)
+    #
+    # print('PatchTST Base (Weekly)')
+    # best_pt_base = train_patchtst(
+    #     pt_base,
+    #     train_loader, val_loader,
+    #     train_cfg=point_train_cfg,
+    #     stages=stages,
+    #     future_exo_cb=future_exo_cb,
+    # )
+    # results['PatchTST Base'] = best_pt_base
+    #
+    # print('PatchTST Quantile (Weekly)')
+    # best_pt_quantile = train_patchtst(
+    #     pt_quantile,
+    #     train_loader, val_loader,
+    #     train_cfg=quantile_train_cfg,
+    #     stages=stages,
+    #     future_exo_cb=future_exo_cb,
+    #     exo_is_normalized=True
+    # )
+    # results['PatchTST Quantile'] = best_pt_quantile
 
 
     return results
@@ -321,13 +321,13 @@ def run_total_train_monthly(
 ):
     # ---------------- 2-Stage 스케줄 (월간도 주간과 동일) ----------------
     stg_warmup = StageConfig(
-        epochs=1,
+        epochs=20,
         spike_enabled=False,
         lr=3e-4,                 # warm-up은 약간 높게
         use_horizon_decay=False
     )
     stg_spike = StageConfig(
-        epochs=1,
+        epochs=50,
         spike_enabled=True,      # 스파이크 강화 단계
         lr=1e-4,
         use_horizon_decay=True,
@@ -405,140 +405,140 @@ def run_total_train_monthly(
     monthly_exo_dim = 2  # compose_exo_calendar_cb('M') → month sin/cos
     use_eol = False  # 월간에도 sequence를 exo에 넣었다면 True로 전환
 
-    pm_base_config = PatchMixerConfigMonthly(
-        lookback=lookback,
-        horizon=horizon,
-        device=device,
-        loss_mode='point',
-        point_loss='mae',  # 월간은 scale 변동이 커서 MAE가 안정적인 편
+    # pm_base_config = PatchMixerConfigMonthly(
+    #     lookback=lookback,
+    #     horizon=horizon,
+    #     device=device,
+    #     loss_mode='point',
+    #     point_loss='mae',  # 월간은 scale 변동이 커서 MAE가 안정적인 편
+    #
+    #     # ---- LTB 권장 파라미터 ----
+    #     enc_in=1,
+    #     d_model=64, e_layers=3,
+    #     patch_len=6, stride=3,  # 월단위 patch 권장(6~8 / 3~4)
+    #     f_out=128,
+    #     head_hidden=128,
+    #     head_dropout=0.02,
+    #
+    #     exo_dim=monthly_exo_dim,  # month sin/cos
+    #     use_part_embedding=True,
+    #     part_vocab_size=_get_part_vocab_size_from_loader(train_loader),
+    #     part_embed_dim=16,
+    #
+    #     final_nonneg=True,
+    #     use_eol_prior=use_eol,
+    #     eol_feature_index=0,
+    #
+    #     exo_is_normalized_default=False,  # 월간은 역정규화 후 가산 권장
+    #
+    #     expander_season_period=12,
+    #     expander_n_harmonics=6,
+    # )
+    #
+    # pm_quantile_config = PatchMixerConfigMonthly(
+    #     lookback=lookback,
+    #     horizon=horizon,
+    #     device=device,
+    #     loss_mode='quantile',
+    #     quantiles=(0.1, 0.5, 0.9),
+    #
+    #     # ---- LTB 권장 파라미터(동일 용량) ----
+    #     enc_in=1,
+    #     d_model=64, e_layers=3,
+    #     patch_len=6, stride=3,
+    #     f_out=128,
+    #     head_hidden=128,
+    #     head_dropout=0.02,
+    #
+    #     exo_dim=monthly_exo_dim,
+    #     use_part_embedding=True,
+    #     part_vocab_size=_get_part_vocab_size_from_loader(train_loader),
+    #     part_embed_dim=16,
+    #
+    #     final_nonneg=True,
+    #     use_eol_prior=use_eol,
+    #     eol_feature_index=0,
+    #
+    #     exo_is_normalized_default=False,
+    #
+    #     expander_season_period=12,
+    #     expander_n_harmonics=6,
+    # )
 
-        # ---- LTB 권장 파라미터 ----
-        enc_in=1,
-        d_model=64, e_layers=3,
-        patch_len=6, stride=3,  # 월단위 patch 권장(6~8 / 3~4)
-        f_out=128,
-        head_hidden=128,
-        head_dropout=0.02,
-
-        exo_dim=monthly_exo_dim,  # month sin/cos
-        use_part_embedding=True,
-        part_vocab_size=_get_part_vocab_size_from_loader(train_loader),
-        part_embed_dim=16,
-
-        final_nonneg=True,
-        use_eol_prior=use_eol,
-        eol_feature_index=0,
-
-        exo_is_normalized_default=False,  # 월간은 역정규화 후 가산 권장
-
-        expander_season_period=12,
-        expander_n_harmonics=6,
-    )
-
-    pm_quantile_config = PatchMixerConfigMonthly(
-        lookback=lookback,
-        horizon=horizon,
-        device=device,
-        loss_mode='quantile',
-        quantiles=(0.1, 0.5, 0.9),
-
-        # ---- LTB 권장 파라미터(동일 용량) ----
-        enc_in=1,
-        d_model=64, e_layers=3,
-        patch_len=6, stride=3,
-        f_out=128,
-        head_hidden=128,
-        head_dropout=0.02,
-
-        exo_dim=monthly_exo_dim,
-        use_part_embedding=True,
-        part_vocab_size=_get_part_vocab_size_from_loader(train_loader),
-        part_embed_dim=16,
-
-        final_nonneg=True,
-        use_eol_prior=use_eol,
-        eol_feature_index=0,
-
-        exo_is_normalized_default=False,
-
-        expander_season_period=12,
-        expander_n_harmonics=6,
-    )
-
-    pm_base_model = build_patch_mixer_base(pm_base_config)
-    pm_quantile_model = build_patch_mixer_quantile(pm_quantile_config)
-
-    print('PatchMixer Base (Monthly)')
-    best_pm_base = train_patchmixer(
-        pm_base_model,
-        train_loader, val_loader,
-        train_cfg=point_train_cfg,
-        stages=stages,
-        future_exo_cb=future_exo_cb,
-        exo_is_normalized=pm_base_config.exo_is_normalized_default,
-    )
-    results['PatchMixer Base'] = best_pm_base
-
-    print('PatchMixer Quantile (Monthly)')
-    best_pm_quantile = train_patchmixer(
-        pm_quantile_model,
-        train_loader, val_loader,
-        train_cfg=quantile_train_cfg,
-        stages=stages,
-        future_exo_cb=future_exo_cb,
-        exo_is_normalized=pm_quantile_config.exo_is_normalized_default,
-    )
-    results['PatchMixer Quantile'] = best_pm_quantile
+    # pm_base_model = build_patch_mixer_base(pm_base_config)
+    # pm_quantile_model = build_patch_mixer_quantile(pm_quantile_config)
+    #
+    # print('PatchMixer Base (Monthly)')
+    # best_pm_base = train_patchmixer(
+    #     pm_base_model,
+    #     train_loader, val_loader,
+    #     train_cfg=point_train_cfg,
+    #     stages=stages,
+    #     future_exo_cb=future_exo_cb,
+    #     exo_is_normalized=pm_base_config.exo_is_normalized_default,
+    # )
+    # results['PatchMixer Base'] = best_pm_base
+    #
+    # print('PatchMixer Quantile (Monthly)')
+    # best_pm_quantile = train_patchmixer(
+    #     pm_quantile_model,
+    #     train_loader, val_loader,
+    #     train_cfg=quantile_train_cfg,
+    #     stages=stages,
+    #     future_exo_cb=future_exo_cb,
+    #     exo_is_normalized=pm_quantile_config.exo_is_normalized_default,
+    # )
+    # results['PatchMixer Quantile'] = best_pm_quantile
 
     # # ==================== Titan ====================
     # # 월간은 장기 트렌드/메모리 효과가 중요 → 모델 용량을 주간 대비 소폭 상향
-    # ti_config = TitanConfig(
-    #     lookback=lookback,
-    #     horizon=horizon,
-    #     input_dim=1,
-    #     d_model=256,
-    #     n_layers=3,
-    #     n_heads=4,
-    #     d_ff=512,
-    #     dropout=0.1,
-    #     contextual_mem_size=256,
-    #     persistent_mem_size=64,
-    #     use_exogenous=True, exo_dim=2,     # month sin/cos
-    #     final_clamp_nonneg=True,
-    # )
-    # ti_base = build_titan_base(ti_config)
-    # ti_lmm  = build_titan_lmm(ti_config)
-    # ti_seq2seq = build_titan_seq2seq(ti_config)
-    #
-    # print('Titan Base (Monthly)')
-    # best_ti_base = train_titan(
-    #     ti_base, train_loader, val_loader,
-    #     train_cfg=point_train_cfg,
-    #     stages=stages,
-    #     future_exo_cb=future_exo_cb,
-    # )
-    # results['Titan Base'] = best_ti_base
-    #
-    # print('Titan LMM (Monthly)')
-    # best_ti_lmm = train_titan(
-    #     ti_lmm, train_loader, val_loader,
-    #     train_cfg=point_train_cfg,
-    #     stages=stages,
-    #     future_exo_cb=future_exo_cb,
-    # )
-    # results['Titan LMM'] = best_ti_lmm
-    #
-    # print('Titan Seq2Seq (Monthly)')
-    # best_ti_seq2seq = train_titan(
-    #     ti_seq2seq, train_loader, val_loader,
-    #     train_cfg=point_train_cfg,
-    #     stages=stages,
-    #     future_exo_cb=future_exo_cb,
-    # )
-    # results['Titan Seq2Seq'] = best_ti_seq2seq
-    #
-    # # ==================== PatchTST ====================
-    # # 월간 패치 길이는 8~16 권장(월별 데이터가 적으므로 지나친 분절은 피함)
+    ti_config = TitanConfig(
+        lookback=lookback,
+        horizon=horizon,
+        input_dim=1,
+        d_model=256,
+        n_layers=3,
+        n_heads=4,
+        d_ff=512,
+        dropout=0.1,
+        contextual_mem_size=256,
+        persistent_mem_size=64,
+        use_exogenous=True, exo_dim=2,     # month sin/cos
+        final_clamp_nonneg=True,
+    )
+    ti_base = build_titan_base(ti_config)
+    ti_lmm  = build_titan_lmm(ti_config)
+    ti_seq2seq = build_titan_seq2seq(ti_config)
+
+    print('Titan Base (Monthly)')
+    best_ti_base = train_titan(
+        ti_base, train_loader, val_loader,
+        train_cfg=point_train_cfg,
+        stages=stages,
+        future_exo_cb=future_exo_cb,
+    )
+    results['Titan Base'] = best_ti_base
+
+    print('Titan LMM (Monthly)')
+    best_ti_lmm = train_titan(
+        ti_lmm, train_loader, val_loader,
+        train_cfg=point_train_cfg,
+        stages=stages,
+        future_exo_cb=future_exo_cb,
+    )
+    results['Titan LMM'] = best_ti_lmm
+
+    print('Titan Seq2Seq (Monthly)')
+    best_ti_seq2seq = train_titan(
+        ti_seq2seq, train_loader, val_loader,
+        train_cfg=point_train_cfg,
+        stages=stages,
+        future_exo_cb=future_exo_cb,
+    )
+    results['Titan Seq2Seq'] = best_ti_seq2seq
+
+    # ==================== PatchTST ====================
+    # 월간 패치 길이는 8~16 권장(월별 데이터가 적으므로 지나친 분절은 피함)
     # pt_point_config = PatchTSTConfig(
     #     device=device,
     #     lookback=lookback,

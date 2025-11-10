@@ -76,7 +76,7 @@ def _infer_horizon(model, default=120):
 
 
 @torch.no_grad()
-def _probe_output(model, x1, device="cpu", future_exo_cb=None):
+def _probe_output(model, x1, device='cuda' if torch.cuda.is_available() else 'mps', future_exo_cb=None):
     """
     모델을 한 번 호출해 '형태 파악용' 출력을 가져온다.
     - 반환은 Tensor 또는 dict( {'point': Tensor, 'q': Tensor|dict} )일 수 있다.
@@ -118,6 +118,7 @@ def _probe_output(model, x1, device="cpu", future_exo_cb=None):
                 break
     return out  # Tensor or dict
 
+
 # ==============================
 # Quantile rolling (IMS)
 # ==============================
@@ -127,7 +128,7 @@ def _roll_quantile_ims(
     x_init,
     horizon: int,
     *,
-    device: str = "cpu",
+    device='cuda' if torch.cuda.is_available() else 'mps',
     future_exo_cb=None,
     target_channel: int = 0,
     fill_mode: str = "copy_last",
@@ -203,6 +204,7 @@ def _roll_quantile_ims(
     q90 = torch.cat(q90_seq, dim=1)
     return q10, q50, q90
 
+
 def _align_len(yhat: np.ndarray, H: int):
     yhat = np.asarray(yhat).reshape(-1)
     if yhat.size == H:
@@ -212,195 +214,178 @@ def _align_len(yhat: np.ndarray, H: int):
     if yhat.size > H:
         return yhat[:H], "[cut]"
     pad = np.full(H - yhat.size, np.nan)
-    return np.concatenate([yhat, pad], axis = 0), "[pad]"
+    return np.concatenate([yhat, pad], axis=0), "[pad]"
+
 
 # ==============================
-# Common predictor for any model
+# Common predictor for any model (DICT 출력 우선 처리 포함)
 # ==============================
-def _predict_any(
-    model,
-    x1,
-    horizon: int,
-    device: str,
-    future_exo_cb=None,
-    is_q_flag: bool = False,
-):
-    """
-    통으로 교체해서 사용하세요.
-    - 포인트(2D [B,H]) 출력: Direct 결과를 그대로 사용 (Forecaster 경로로 가지 않음)
-    - 분위수(3D [B,H,Q] 또는 [B,Q,H]) 출력: q10/q50/q90를 추출하여 반환
-    - 그 외: DMSForecaster로 롤링(IMS) 수행
-    """
-    # =========================================================
-    # 0) future exogenous 준비 (있으면)
-    # =========================================================
-    def _build_future_exo(Hm: int):
-        if future_exo_cb is None:
-            return None
-        ex = future_exo_cb(0, Hm, device=device)  # (H, E) 또는 np.ndarray
-        if torch.is_tensor(ex):
-            ex = ex.to(device)
-        else:
-            ex = torch.tensor(ex, device=device, dtype=x1.dtype)
-        # (B,H,E)로 확장
-        return ex.unsqueeze(0).expand(x1.size(0), -1, -1)
-
-    # 안전한 horizon 추정 (혹시 모델 내부에 horizon 속성이 있다면)
-    def _infer_h(model_obj, default_h):
-        try:
-            h = int(getattr(model_obj, "horizon", default_h))
-            return h if h > 0 else default_h
-        except Exception:
-            return default_h
-
-    H = _infer_h(model, horizon)
-    future_exo = _build_future_exo(H)
-
-    # =========================================================
-    # 1) 1차 추론(프로브): 모델 시그니처 차이를 감안하여 시도/재시도
-    # =========================================================
-    x1_dev = x1.to(device)
-    out = None
-    # 우선 future_exo 포함 호출
-    if future_exo is not None:
-        try:
-            with torch.no_grad():
-                out = model(x1_dev, future_exo=future_exo)
-        except TypeError:
-            out = None
-        except Exception:
-            out = None
-    # 실패 시 future_exo 없이 호출
-    if out is None:
-        try:
-            with torch.no_grad():
-                out = model(x1_dev)
-        except Exception as e:
-            # 마지막 방어: 에러 그대로 올림
-            raise RuntimeError(f"_predict_any: 모델 추론 실패 - {repr(e)}")
-
-    # =========================================================
-    # 2) 3D 텐서(분위수) 처리: [B,H,Q] 또는 [B,Q,H]
-    # =========================================================
-    if torch.is_tensor(out) and out.dim() == 3:
-        B, D1, D2 = out.shape
-        # 어느 축이 horizon, 어느 축이 quantiles인지 추정
-        # 흔한 Q 크기 후보
-        quant_candidates = {3, 5, 9}
-        axis_q = None
-        axis_h = None
-
-        if D1 in quant_candidates:
-            axis_q, axis_h = 1, 2
-        elif D2 in quant_candidates:
-            axis_q, axis_h = 2, 1
-
-        # 분위수 모델로 간주할 수 없는 모양이면, 중앙값 축으로 포인트화
-        if axis_q is None or axis_h is None:
-            # 중앙값 축 선택: H를 horizon에 가깝다고 보고 다른 축(=Q축 가정)의 중앙을 집계
-            # 여기서는 안전하게 마지막 축을 "시간"으로 가정하고 중앙 축 평균
-            point = out.mean(dim=1).squeeze(0).detach().cpu().numpy()
-            point = point[:horizon] if point.size >= horizon else np.pad(point, (0, horizon - point.size), constant_values=np.nan)
-            return {"point": point}
-
-        # 축 정렬: 원하는 형태 [B, H, Q]
-        if axis_h == 1 and axis_q == 2:
-            out_hq = out  # [B,H,Q]
-        elif axis_h == 2 and axis_q == 1:
-            out_hq = out.transpose(1, 2).contiguous()  # [B,H,Q]
-        else:
-            # 예외: 모양이 애매하면 중앙값으로 포인트화
-            point = out.mean(dim=1).squeeze(0).detach().cpu().numpy()
-            point = point[:horizon] if point.size >= horizon else np.pad(point, (0, horizon - point.size), constant_values=np.nan)
-            return {"point": point}
-
-        Q = out_hq.size(-1)
-        # 인덱스 맵: 길이에 따라 10/50/90% 위치를 추정
-        def _pick_q_indices(q_len):
-            if q_len == 3:
-                return 0, 1, 2
-            if q_len == 5:
-                return 1, 2, 3  # 대략 10/50/90에 대응
-            if q_len == 9:
-                return 1, 4, 7  # 대략 10/50/90에 대응
-            # 기타 길이는 중앙값만 포인트로 사용
-            return None
-
-        idxs = _pick_q_indices(Q)
-        if idxs is not None and (is_q_flag or True):
-            i10, i50, i90 = idxs
-            q10 = out_hq[:, :, i10].squeeze(0).detach().cpu().numpy()
-            q50 = out_hq[:, :, i50].squeeze(0).detach().cpu().numpy()
-            q90 = out_hq[:, :, i90].squeeze(0).detach().cpu().numpy()
-
-            # 길이 정렬
-            def _trim_pad(v):
-                return v[:horizon] if v.size >= horizon else np.pad(v, (0, horizon - v.size), constant_values=np.nan)
-
-            return {
-                "point": _trim_pad(q50),
-                "q": {
-                    "q10": _trim_pad(q10),
-                    "q50": _trim_pad(q50),
-                    "q90": _trim_pad(q90),
-                },
-            }
-        else:
-            # 분위수 축을 모르겠으면 중앙값으로 포인트화
-            q50 = out_hq.median(dim=-1).values  # [B,H]
-            point = q50.squeeze(0).detach().cpu().numpy()
-            point = point[:horizon] if point.size >= horizon else np.pad(point, (0, horizon - point.size), constant_values=np.nan)
-            return {"point": point}
-
-    # =========================================================
-    # 2.5) 2D 텐서(포인트 Direct) 처리: [B, H]
-    # =========================================================
-    if torch.is_tensor(out) and out.dim() == 2:
-        # 필요 시 future_exo 반영하여 '정식' 호출(일부 모델은 exo가 있어야 올바른 값이 나옴)
-        exo = _build_future_exo(H)
-        try:
-            with torch.no_grad():
-                out2 = model(x1_dev, future_exo=exo) if exo is not None else model(x1_dev)
-            point = out2.squeeze(0).detach().cpu().numpy().reshape(-1)
-        except Exception:
-            # 정식 호출 실패 시 probe 결과 사용
-            point = out.squeeze(0).detach().cpu().numpy().reshape(-1)
-
-        if point.size > horizon:
-            point = point[:horizon]
-        elif point.size < horizon:
-            pad = np.full(horizon - point.size, np.nan)
-            point = np.concatenate([point, pad], axis=0)
-        return {"point": point}
-
-    # =========================================================
-    # 3) 그 외: DMSForecaster로 롤링(IMS)
-    # =========================================================
+def _predict_any(model, x1, horizon: int, device: str, future_exo_cb=None, is_q_flag: bool = False):
+    was_training = model.training
+    model.eval()  # ★ 추론은 항상 eval
     try:
-        from modeling_module.training.forecaster import DMSForecaster
-    except Exception:
-        # 로컬 경로 등 다른 네임스페이스일 경우를 대비한 방어
-        from modeling_module.training import forecaster as _fo
-        DMSForecaster = _fo.DMSForecaster
+        def _build_future_exo(Hm: int):
+            if future_exo_cb is None:
+                return None
+            ex = future_exo_cb(0, Hm, device=device)
+            ex = ex.to(device) if torch.is_tensor(ex) else torch.tensor(ex, device=device, dtype=x1.dtype)
+            return ex.unsqueeze(0).expand(x1.size(0), -1, -1)
 
-    f = DMSForecaster(
-        model,
-        target_channel=0,
-        fill_mode="copy_last",
-        lmm_mode="eval",
-        predict_fn=None,
-        ttm=None,
-        future_exo_cb=future_exo_cb,
-    )
-    with torch.no_grad():
-        y_hat = f.forecast_DMS_to_IMS(
-            x_init=x1_dev,
-            horizon=horizon,
-            device=device,
-            extend="ims",
-            context_policy="once",
-        )
-    return {"point": y_hat.squeeze(0).detach().cpu().numpy()}
+        Hm = int(getattr(model, "horizon", horizon)) or horizon
+        future_exo = _build_future_exo(Hm)
+        x1_dev = x1.to(device)
+
+        def _model_device(m):
+            for p in m.parameters(recurse=True):
+                return p.device
+            for b in m.buffers(recurse=True):
+                return b.device
+            return None
+
+        target = torch.device(device)
+        mdev = _model_device(model)
+        if (mdev is not None) and (mdev != target):
+            model.to(target)
+
+        # 1) 1차 호출
+        with torch.no_grad():
+            out = model(x1_dev, future_exo=future_exo) if future_exo is not None else model(x1_dev)
+
+        # 1.5) dict 출력 우선 처리 (Quantile/Point 혼합도 안전 처리)
+        if isinstance(out, dict):
+            # (a) 'q'가 있으면 분위수 처리
+            if "q" in out and torch.is_tensor(out["q"]):
+                q = out["q"]  # (B,Q,H) or (B,H,Q)
+                if q.dim() != 3:
+                    raise RuntimeError(f"expect 3D tensor in out['q'], got {tuple(q.shape)}")
+
+                B, a, b = q.shape
+                if b in (3, 5, 9):             # (B,H,Q)
+                    out_hq = q.transpose(1, 2)  # → [B,H,Q]
+                elif a in (3, 5, 9):           # (B,Q,H)
+                    out_hq = q.transpose(1, 2)  # → [B,H,Q]
+                else:
+                    # 축을 못 찾으면 중앙값만 포인트화
+                    q50 = q.mean(dim=1).squeeze(0).detach().cpu().numpy()
+                    q50 = q50[:horizon] if q50.size >= horizon else np.pad(np.asarray(q50, dtype=float), (0, horizon - q50.size), mode="constant", constant_values=np.nan)
+
+                    return {"point": q50}
+
+                if out_hq.shape[1] != Hm:
+                    out_hq = out_hq[:, :Hm, :]
+
+                # 10/50/90 인덱스
+                LQ = out_hq.size(-1)
+                if LQ == 3:
+                    i10, i50, i90 = (0, 1, 2)
+                elif LQ == 5:
+                    i10, i50, i90 = (1, 2, 3)
+                elif LQ == 9:
+                    i10, i50, i90 = (1, 4, 7)
+                else:
+                    i10 = i50 = i90 = None
+
+                if i50 is not None:
+                    q10 = out_hq[0, :, i10].detach().cpu().numpy()
+                    q50 = out_hq[0, :, i50].detach().cpu().numpy()
+                    q90 = out_hq[0, :, i90].detach().cpu().numpy()
+
+                    def _tp(v):
+                        v = np.asarray(v, dtype=float)
+                        return v[:horizon] if v.size >= horizon else np.pad(v, (0, horizon - v.size), mode="constant",
+                                                                            constant_values=np.nan)
+                    return {"point": _tp(q50), "q": {"q10": _tp(q10), "q50": _tp(q50), "q90": _tp(q90)}}
+                else:
+                    q50 = out_hq[0].median(dim=-1).values.detach().cpu().numpy()
+                    q50 = q50[:horizon] if q50.size >= horizon else np.pad(np.asarray(q50, dtype=float), (0, horizon - q50.size), mode="constant", constant_values=np.nan)
+
+                    return {"point": q50}
+
+            # (b) 'point'만 있는 dict
+            if "point" in out and torch.is_tensor(out["point"]):
+                point = out["point"].squeeze(0).detach().cpu().numpy().reshape(-1)
+                if point.size >= horizon:
+                    return {"point": point[:horizon]}
+                # 부족하면 IMS로 연장
+                f = DMSForecaster(model, target_channel=0, fill_mode="copy_last",
+                                  lmm_mode="eval", predict_fn=None, ttm=None, future_exo_cb= future_exo_cb)
+                with torch.no_grad():
+                    y_hat = f.forecast_DMS_to_IMS(
+                        x_init=x1_dev, horizon=horizon, device=device,
+                        extend="ims", context_policy="once"
+                    )
+                return {"point": y_hat.squeeze(0).detach().cpu().numpy()}
+
+        # 2) 3D(분위수) — Tensor 직접 반환 케이스
+        if torch.is_tensor(out) and out.dim() == 3:
+            B, a, b = out.shape
+            if b in (3, 5, 9):
+                out_hq = out.transpose(1, 2)       # [B,H,Q]
+            elif a in (3, 5, 9):
+                out_hq = out.transpose(1, 2)       # [B,H,Q]
+            else:
+                q50 = out.mean(dim=1).squeeze(0).detach().cpu().numpy()
+                q50 = q50[:horizon] if q50.size >= horizon else np.pad(np.asarray(q50, dtype=float), (0, horizon - q50.size), mode="constant", constant_values=np.nan)
+
+                return {"point": q50}
+
+            if out_hq.shape[1] != Hm:
+                out_hq = out_hq[:, :Hm, :]
+
+            LQ = out_hq.size(-1)
+            if LQ == 3:
+                i10, i50, i90 = (0, 1, 2)
+            elif LQ == 5:
+                i10, i50, i90 = (1, 2, 3)
+            elif LQ == 9:
+                i10, i50, i90 = (1, 4, 7)
+            else:
+                i10 = i50 = i90 = None
+
+            if i50 is not None:
+                q10 = out_hq[0, :, i10].detach().cpu().numpy()
+                q50 = out_hq[0, :, i50].detach().cpu().numpy()
+                q90 = out_hq[0, :, i90].detach().cpu().numpy()
+
+                def _tp(v):
+                    v = np.asarray(v, dtype=float)
+                    return v[:horizon] if v.size >= horizon else np.pad(v, (0, horizon - v.size), mode="constant",
+                                                                        constant_values=np.nan)
+                return {"point": _tp(q50), "q": {"q10": _tp(q10), "q50": _tp(q50), "q90": _tp(q90)}}
+            else:
+                q50 = out_hq[0].median(dim=-1).values.detach().cpu().numpy()
+                q50 = q50[:horizon] if q50.size >= horizon else np.pad(np.asarray(q50, dtype=float), (0, horizon - q50.size), mode="constant", constant_values=np.nan)
+
+                return {"point": q50}
+
+        # 3) 2D(Direct 포인트)
+        if torch.is_tensor(out) and out.dim() == 2:
+            point = out.squeeze(0).detach().cpu().numpy()
+            if point.size >= horizon:
+                return {"point": point[:horizon]}
+            # IMS로 연장 (DMSForecaster)
+            f = DMSForecaster(model, target_channel=0, fill_mode="copy_last",
+                              lmm_mode="eval", predict_fn=None, ttm=None, future_exo_cb=future_exo_cb)
+            with torch.no_grad():
+                y_hat = f.forecast_DMS_to_IMS(
+                    x_init=x1_dev, horizon=horizon, device=device,
+                    extend="ims", context_policy="once"
+                )
+            return {"point": y_hat.squeeze(0).detach().cpu().numpy()}
+
+        # 4) 기타 출력 → IMS 경로
+        f = DMSForecaster(model, target_channel=0, fill_mode="copy_last",
+                          lmm_mode="eval", predict_fn=None, ttm=None, future_exo_cb=future_exo_cb)
+        with torch.no_grad():
+            y_hat = f.forecast_DMS_to_IMS(
+                x_init=x1_dev, horizon=horizon, device=device,
+                extend="ims", context_policy="once"
+            )
+        return {"point": y_hat.squeeze(0).detach().cpu().numpy()}
+
+    finally:
+        if was_training:
+            model.train()
 
 
 # ==============================
@@ -474,6 +459,7 @@ def _plot_single_series(
             plt.fill_between(t_fut, q10, q90, alpha=0.15, label=f"{nm} P10–P90")
             plt.plot(t_fut, q50, linewidth=1.8, alpha=0.95, label=f"{nm} P50")
 
+    print(preds_point.items())
     # point-only models
     for nm, yhat in preds_point.items():
         if nm in preds_q50:  # 중앙선 중복 회피
@@ -680,7 +666,7 @@ def plot_120m(
     models: Dict[str, torch.nn.Module],
     loader,
     *,
-    device: str = "cpu",
+    device: str = 'cuda' if torch.cuda.is_available() else 'cpu',
     mode: str = "val",                # 'val' | 'infer'
     plan_yyyymm: Optional[int] = None,
     max_plots: int = 100,
@@ -711,16 +697,3 @@ def plot_120m(
         zoom_future=False,   # 월 120은 전체 보기 기본
         zoom_len=None,
     )
-
-
-# ==============================
-# Optional: simple calendar exo
-# ==============================
-def make_calendar_exo(start_idx: int, H: int, *, period: int = 52, device: str | torch.device = "cpu") -> torch.Tensor:
-    """
-    단순 주기성(sin/cos) 외생변수 생성: (H, 2)
-    """
-    t = torch.arange(start_idx, start_idx + H, device=device, dtype=torch.float32)
-    exo = torch.stack([torch.sin(2 * torch.pi * t / period),
-                       torch.cos(2 * torch.pi * t / period)], dim=-1)  # (H, 2)
-    return exo

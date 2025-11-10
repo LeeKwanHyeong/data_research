@@ -73,7 +73,7 @@ class _TitanBase(nn.Module):
         self.use_calendar_exo: bool = bool(params.get("use_calendar_exo", False))
 
         # Output constraint
-        self.final_clamp_nonneg: bool = bool(params.get("final_clamp_nonneg", False))
+        self.final_clamp_nonneg: bool = bool(params.get("final_clamp_nonneg", True))
 
         # Seq2Seq decoder 전용 파라미터(필요 시 사용)
         self.dec_layers: int = int(params.get("dec_layers", 2))
@@ -154,6 +154,9 @@ class TitanBaseModel(_TitanBase):
             exo_dim=(self.exo_dim if self.use_exogenous else 0),
         )
         self.proj = nn.Linear(self.d_model, 1)
+        print("revin_use_std:", self.revin_use_std)
+        print('revin_subtract_last', self.revin_subtract_last)
+        print('final_clamp_nonneg', self.final_clamp_nonneg)
 
     def forward(self, x: torch.Tensor, *, future_exo: torch.Tensor | None = None) -> torch.Tensor:
         # 1) RevIN norm (입력 전처리) ---------------------
@@ -164,10 +167,37 @@ class TitanBaseModel(_TitanBase):
         dec = self.decoder(memory, future_exo)  # [B,H,D]
         y = self.proj(dec).squeeze(-1)  # [B,H]
 
+        # 폭주 로그 확인용
+        # y_before = y.detach().clone()
+
+
         # 3) RevIN denorm (출력 복원) ---------------------
         y = self._maybe_revin_denorm(y)  # [B,H]
 
+
+        # 폭주 로그 확인용
+        # if (self.revin is not None) and (y.dim() == 2):
+        #     with torch.no_grad():
+        #         b0 = 0
+        #         print(f"[TitanDBG] model={getattr(self, 'model_name', self.__class__.__name__)}")
+        #         print(f"  y_before[0,:5]={y_before[b0, :5].tolist()}")
+        #         print(f"  y_after [0,:5]={y[b0, :5].tolist()}")
+        #         # RevIN 내부 통계가 public이라면 찍기 (구현에 맞게 조정)
+        #         if hasattr(self.revin, 'mean'):
+        #             m = getattr(self.revin, 'mean', None)
+        #             s = getattr(self.revin, 'std', None)
+        #             last = getattr(self.revin, 'last', None)
+        #             if m is not None:
+        #                 print(
+        #                     f"  revin.mean[0, :5, 0]={m[b0, :5, 0].detach().cpu().numpy() if m.dim() == 3 else m[b0, :5].detach().cpu().numpy()}")
+        #             if s is not None:
+        #                 print(
+        #                     f"  revin.std [0, :5, 0]={s[b0, :5, 0].detach().cpu().numpy() if s.dim() == 3 else s[b0, :5].detach().cpu().numpy()}")
+        #             if last is not None:
+        #                 print(f"  revin.last[0,0,0]={float(last[b0, 0, 0])}")
+
         # 4) 최종 제약(비음수 등) -------------------------
+
         return self._clamp(y)
 
 
