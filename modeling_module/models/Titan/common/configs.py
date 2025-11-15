@@ -21,8 +21,8 @@ class TitanConfig:
 
     # RevIN
     use_revin: bool = True
-    revin_use_std: bool = True
-    revin_subtract_last: bool = False
+    revin_use_std: bool = False
+    revin_subtract_last: bool = True
     revin_affine: bool = True
 
     # Expander 옵션(계절/저주파 강화)
@@ -37,7 +37,7 @@ class TitanConfig:
     exo_dim: int = 2
 
     # 출력 제약
-    final_clamp_nonneg: bool = False
+    final_clamp_nonneg: bool = True
 
 
     # Head 유형: 'expander' | 'linear' | 'seq2seq'

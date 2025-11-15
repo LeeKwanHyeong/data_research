@@ -41,9 +41,9 @@ def _merge_cfg_kwargs(cfg_obj, **kwargs):
 class _TitanBase(nn.Module):
     """
     공통 베이스: config 보관 + Encoder/Decoder 조립
-    - RevIN, past exo 주입, final clamp 등 공통 옵션 관리
+    - 외생변수/비음수 클램프 등 공통 옵션은 여기서 통일
     """
-    def __init__(self, *, config: Optional["TitanConfig"] = None, **kwargs):
+    def __init__(self, *, config: Optional["TitanConfig"]=None, **kwargs):
         super().__init__()
         params = _merge_cfg_kwargs(config, **kwargs)
 
@@ -67,27 +67,10 @@ class _TitanBase(nn.Module):
         self.contextual_mem_size: int = int(params.get("contextual_mem_size", 256))
         self.persistent_mem_size: int = int(params.get("persistent_mem_size", 64))
 
-        # Exogenous (future)
+        # Exogenous
         self.use_exogenous: bool = bool(params.get("use_exogenous", False))
         self.exo_dim: int = int(params.get("exo_dim", 0))
         self.use_calendar_exo: bool = bool(params.get("use_calendar_exo", False))
-
-        # Past exogenous 주입 모드 (PatchMixer와 동일 인터페이스)
-        #   - 'z_gate': encoder output memory에서 summary z에 gate로 주입
-        #   - 'fuse_input': 입력단에서 concat 후 Linear → [B,L,input_dim]
-        #   - 'none': 사용 안 함
-        self.past_exo_mode: str = str(params.get("past_exo_mode", "none")).lower()
-        self.use_past_exo: bool = self.past_exo_mode != "none"
-
-        # 입력단 & 카테고리 exo 유틸 (PatchMixer 스타일)
-        self._in_fuser: Optional[nn.Linear] = None      # [C_total] -> [input_dim]
-        self._cat_embs: Optional[nn.ModuleList] = None
-        self._cat_table_sizes: Optional[list[int]] = None
-        self._cat_embed_dims: Optional[list[int]] = None
-
-        # z-level 주입을 위한 proj/gate
-        self._z_exo_proj: Optional[nn.Linear] = None    # [E_sum] -> [D]
-        self._z_gate: Optional[nn.Linear] = None        # [D] -> [D]
 
         # Output constraint
         self.final_clamp_nonneg: bool = bool(params.get("final_clamp_nonneg", True))
@@ -101,13 +84,12 @@ class _TitanBase(nn.Module):
         # 원본 config 보관(트레이너가 참조 가능)
         self.config = config
 
-        # RevIN: 타깃 채널만 정규화/복원
         self.target_channel = int(params.get("target_channel", 0))
         self.revin = RevIN(
             num_features=1,  # 단일 타깃 채널 기준
             affine=self.revin_affine,
             subtract_last=self.revin_subtract_last,
-            use_std=self.revin_use_std,
+            use_std=self.revin_use_std
         ) if self.use_revin else None
 
         # Encoder
@@ -122,25 +104,22 @@ class _TitanBase(nn.Module):
             self.dropout,
         )
 
-    # ------------------------------------------------------------------
-    # Small helpers
-    # ------------------------------------------------------------------
     @classmethod
     def from_config(cls, config: "TitanConfig"):
         return cls(config=config)
 
     def _clamp(self, y: torch.Tensor) -> torch.Tensor:
-        """최종 출력 비음수 제약(옵션)."""
         return y.clamp_min(0) if self.final_clamp_nonneg else y
 
-    # ----------------- RevIN -----------------
     # 입력 x: [B, L, C] -> RevIN(norm) -> [B, L, C]
     def _maybe_revin_norm(self, x: torch.Tensor) -> torch.Tensor:
         if (self.revin is None) or (x.size(-1) == 0):
+            print('revin is None So cannot normalize')
             return x
+        # 타깃 채널만 정규화/복원(멀티채널 안전)
         tc = self.target_channel
         x_t = x[:, :, tc:tc+1]
-        x_t = self.revin(x_t, mode="norm")   # [B,L,1]
+        x_t = self.revin(x_t, mode='norm')   # [B,L,1]
         x = x.clone()
         x[:, :, tc:tc+1] = x_t
         return x
@@ -148,140 +127,22 @@ class _TitanBase(nn.Module):
     # 출력 y: [B, H] -> RevIN(denorm) -> [B, H]
     def _maybe_revin_denorm(self, y: torch.Tensor) -> torch.Tensor:
         if (self.revin is None) or (y.dim() != 2):
+            print('revin is None so cannot denormalize')
             return y
-        y_in = y.unsqueeze(-1)                 # [B, H, 1]
-        y_out = self.revin(y_in, mode="denorm")
-        return y_out.squeeze(-1)              # [B, H]
+        # RevIN은 [B,L,C] 형태를 기대하므로 H축을 L로 보고, C=1로 맞춰 복원
+        y_in = y.unsqueeze(-1)       # [B, H, 1]
+        y_out = self.revin(y_in, mode='denorm')  # [B, H, 1]
+        return y_out.squeeze(-1)
 
-    # ----------------- past exo: 카테고리 임베딩 -----------------
-    def _maybe_build_cat_embeds(self, K: int, *, device):
-        if self._cat_embs is None:
-            # 각 카테고리 feature 마다 16차원 embedding, 초기 테이블 크기 256
-            self._cat_embs = nn.ModuleList(
-                [nn.Embedding(256, 16) for _ in range(K)]
-            ).to(device)
-            self._cat_table_sizes = [256] * K
-            self._cat_embed_dims = [16] * K
-
-    def _ensure_cat_capacity(self, j: int, max_id: int, device):
-        assert self._cat_embs is not None and self._cat_table_sizes is not None
-        if max_id < self._cat_table_sizes[j]:
-            return
-        old = self._cat_embs[j]
-        old_num, dim = old.num_embeddings, old.embedding_dim
-        new_num = max(max_id + 1, old_num * 2)
-        new = nn.Embedding(new_num, dim).to(device)
-        with torch.no_grad():
-            new.weight[:old_num].copy_(old.weight)
-        self._cat_embs[j] = new
-        self._cat_table_sizes[j] = new_num
-
-    # ----------------- past exo: 입력단 결합 (fuse_input 모드) -----------------
-    def _fuse_inputs_input_level(
-        self,
-        x: torch.Tensor,                          # [B,L,C]
-        pe_cont: Optional[torch.Tensor],          # [B,L,E_c]
-        pe_cat: Optional[torch.Tensor],           # [B,L,E_k] (long)
-    ) -> torch.Tensor:
-        """
-        PatchMixer의 fuse_input 모드와 동일한 형태:
-          - x, past_exo_cont, past_exo_cat(임베딩) concat → Linear → [B,L,input_dim]
-        """
-        B, L, C = x.shape
-        feats = [x]
-
-        if pe_cont is not None and pe_cont.numel() > 0:
-            feats.append(pe_cont.float())         # [B,L,E_c]
-
-        if pe_cat is not None and pe_cat.numel() > 0:
-            E_k = pe_cat.size(-1)
-            self._maybe_build_cat_embeds(E_k, device=x.device)
-            embs = []
-            for j in range(E_k):
-                ids = pe_cat[..., j].clamp_min(0).long()
-                self._ensure_cat_capacity(j, int(ids.max().item()), device=x.device)
-                embs.append(self._cat_embs[j](ids))   # [B,L,d_j]
-            feats.append(torch.cat(embs, dim=-1))     # [B,L,sum d_j]
-
-        fused = torch.cat(feats, dim=-1)              # [B,L,C_total]
-
-        # input_dim으로 projection (Titan encoder input)
-        if (self._in_fuser is None
-                or self._in_fuser.in_features != fused.size(-1)
-                or self._in_fuser.out_features != self.input_dim):
-            self._in_fuser = nn.Linear(fused.size(-1), self.input_dim, bias=True).to(x.device)
-
-        return self._in_fuser(fused)                  # [B,L,input_dim]
-
-    # ----------------- past exo: z-level 결합 (z_gate 모드) -----------------
-    def _inject_exo_to_memory(
-        self,
-        memory: torch.Tensor,                         # [B,L,D]
-        pe_cont: Optional[torch.Tensor],              # [B,L,E_c]
-        pe_cat: Optional[torch.Tensor],               # [B,L,E_k]
-    ) -> torch.Tensor:
-        """
-        PatchMixer의 z_gate 모드를 Titan에 맞게 변형:
-          - memory를 시계열 축으로 평균 → z: [B,D]
-          - past exo를 평균 pool → exo_vec: [B,E_sum]
-          - exo_vec -> proj -> [B,D], z -> gate -> [B,D]
-          - mem_exo = z + gate * exo_z
-          - memory 전체 토큰에 같은 보정 벡터를 더함: memory + mem_exo.unsqueeze(1)
-        """
-        if ((pe_cont is None) or pe_cont.numel() == 0) and ((pe_cat is None) or pe_cat.numel() == 0):
-            return memory
-
-        B, L, D = memory.shape
-        feats = []
-
-        if pe_cont is not None and pe_cont.numel() > 0:
-            # [B,L,E_c] → mean → [B,E_c]
-            feats.append(pe_cont.float().mean(dim=1))
-
-        if pe_cat is not None and pe_cat.numel() > 0:
-            E_k = pe_cat.size(-1)
-            self._maybe_build_cat_embeds(E_k, device=memory.device)
-            embs = []
-            for j in range(E_k):
-                ids = pe_cat[..., j].clamp_min(0).long()
-                self._ensure_cat_capacity(j, int(ids.max().item()), device=memory.device)
-                emb_j = self._cat_embs[j](ids)        # [B,L,d]
-                embs.append(emb_j.mean(dim=1))        # [B,d]
-            feats.append(torch.cat(embs, dim=-1))     # [B,sum d]
-
-        if not feats:
-            return memory
-
-        exo_vec = torch.cat(feats, dim=-1)            # [B,E_sum]
-
-        # proj/gate 준비
-        if (self._z_exo_proj is None
-                or self._z_exo_proj.in_features != exo_vec.size(-1)
-                or self._z_exo_proj.out_features != D):
-            self._z_exo_proj = nn.Linear(exo_vec.size(-1), D, bias=True).to(memory.device)
-
-        if (self._z_gate is None
-                or self._z_gate.in_features != D
-                or self._z_gate.out_features != D):
-            self._z_gate = nn.Linear(D, D, bias=True).to(memory.device)
-
-        # memory summary z: [B,D]
-        z = memory.mean(dim=1)                        # [B,D]
-        exo_z = self._z_exo_proj(exo_vec)             # [B,D]
-        gate = torch.sigmoid(self._z_gate(z))         # [B,D]
-
-        mem_exo = z + gate * exo_z                    # [B,D]
-        memory = memory + mem_exo.unsqueeze(1)        # [B,L,D]
-        return memory
+    def _clamp(self, y: torch.Tensor) -> torch.Tensor:
+        return y.clamp_min(0) if self.final_clamp_nonneg else y
 
 
 class TitanBaseModel(_TitanBase):
     """
     Encoder-only: TitanDecoder를 수평(H) 차원 투영기로 사용하고 Linear로 1채널 예측.
-    - future_exo: [B,H,E] → TitanDecoder로 전달
-    - past_exo_cont/past_exo_cat: PatchMixer 스타일로 입력단 또는 memory 단에 주입
     """
-    def __init__(self, *, config: Optional["TitanConfig"] = None, **kwargs):
+    def __init__(self, *, config: Optional["TitanConfig"]=None, **kwargs):
         super().__init__(config=config, **kwargs)
         self.decoder = TitanDecoder(
             d_model=self.d_model,
@@ -293,60 +154,58 @@ class TitanBaseModel(_TitanBase):
             exo_dim=(self.exo_dim if self.use_exogenous else 0),
         )
         self.proj = nn.Linear(self.d_model, 1)
+        print("revin_use_std:", self.revin_use_std)
+        print('revin_subtract_last', self.revin_subtract_last)
+        print('final_clamp_nonneg', self.final_clamp_nonneg)
 
-        # 디버깅용 옵션 출력
-        print(f"[TitanBaseModel] revin_use_std={self.revin_use_std}, "
-              f"revin_subtract_last={self.revin_subtract_last}, "
-              f"final_clamp_nonneg={self.final_clamp_nonneg}, "
-              f"past_exo_mode={self.past_exo_mode}")
+    def forward(self, x: torch.Tensor, *, future_exo: torch.Tensor | None = None) -> torch.Tensor:
+        # 1) RevIN norm (입력 전처리) ---------------------
+        x = self._maybe_revin_norm(x)  # [B,L,C]
 
-    def forward(
-        self,
-        x: torch.Tensor,                              # [B,L,C]
-        *,
-        future_exo: Optional[torch.Tensor] = None,    # [B,H,E]
-        past_exo_cont: Optional[torch.Tensor] = None, # [B,L,E_c]
-        past_exo_cat: Optional[torch.Tensor] = None,  # [B,L,E_k]
-        part_ids: Optional[torch.Tensor] = None,      # [B] (현재 버전은 사용 안 함)
-        **kwargs,
-    ) -> torch.Tensor:
-        # 0) past exo fuse_input 모드: 입력단에서 concat 후 linear
-        if self.use_past_exo and self.past_exo_mode == "fuse_input" and (
-            (past_exo_cont is not None) or (past_exo_cat is not None)
-        ):
-            x_in = self._fuse_inputs_input_level(x, past_exo_cont, past_exo_cat)
-        else:
-            x_in = x
+        # 2) Encoder-Decoder-Head -------------------------
+        memory = self.encoder(x)  # [B,L,D]
+        dec = self.decoder(memory, future_exo)  # [B,H,D]
+        y = self.proj(dec).squeeze(-1)  # [B,H]
 
-        # 1) RevIN norm (입력 전처리)
-        x_n = self._maybe_revin_norm(x_in)           # [B,L,C] (C=input_dim)
+        # 폭주 로그 확인용
+        # y_before = y.detach().clone()
 
-        # 2) Encoder
-        memory = self.encoder(x_n)                   # [B,L,D]
 
-        # 2.5) past exo z_gate 모드: memory에 summary exo 주입
-        if self.use_past_exo and self.past_exo_mode == "z_gate" and (
-            (past_exo_cont is not None) or (past_exo_cat is not None)
-        ):
-            memory = self._inject_exo_to_memory(memory, past_exo_cont, past_exo_cat)
+        # 3) RevIN denorm (출력 복원) ---------------------
+        y = self._maybe_revin_denorm(y)  # [B,H]
 
-        # 3) Decoder
-        dec = self.decoder(memory, future_exo)       # [B,H,D]
-        y = self.proj(dec).squeeze(-1)               # [B,H]
 
-        # 4) RevIN denorm (출력 복원)
-        y = self._maybe_revin_denorm(y)              # [B,H]
+        # 폭주 로그 확인용
+        # if (self.revin is not None) and (y.dim() == 2):
+        #     with torch.no_grad():
+        #         b0 = 0
+        #         print(f"[TitanDBG] model={getattr(self, 'model_name', self.__class__.__name__)}")
+        #         print(f"  y_before[0,:5]={y_before[b0, :5].tolist()}")
+        #         print(f"  y_after [0,:5]={y[b0, :5].tolist()}")
+        #         # RevIN 내부 통계가 public이라면 찍기 (구현에 맞게 조정)
+        #         if hasattr(self.revin, 'mean'):
+        #             m = getattr(self.revin, 'mean', None)
+        #             s = getattr(self.revin, 'std', None)
+        #             last = getattr(self.revin, 'last', None)
+        #             if m is not None:
+        #                 print(
+        #                     f"  revin.mean[0, :5, 0]={m[b0, :5, 0].detach().cpu().numpy() if m.dim() == 3 else m[b0, :5].detach().cpu().numpy()}")
+        #             if s is not None:
+        #                 print(
+        #                     f"  revin.std [0, :5, 0]={s[b0, :5, 0].detach().cpu().numpy() if s.dim() == 3 else s[b0, :5].detach().cpu().numpy()}")
+        #             if last is not None:
+        #                 print(f"  revin.last[0,0,0]={float(last[b0, 0, 0])}")
 
-        # 5) 최종 제약(비음수 등)
+        # 4) 최종 제약(비음수 등) -------------------------
+
         return self._clamp(y)
 
 
 class TitanLMMModel(_TitanBase):
     """
     LMM 특화 디코딩이 필요하면 TitanDecoder 내부에서 분기하도록 구성(여기선 공용 Decoder 사용).
-    - past/future exo 주입 패턴은 TitanBaseModel과 동일.
     """
-    def __init__(self, *, config: Optional["TitanConfig"] = None, **kwargs):
+    def __init__(self, *, config: Optional["TitanConfig"]=None, **kwargs):
         super().__init__(config=config, **kwargs)
         self.decoder = TitanDecoder(
             d_model=self.d_model,
@@ -359,43 +218,22 @@ class TitanLMMModel(_TitanBase):
         )
         self.proj = nn.Linear(self.d_model, 1)
 
-    def forward(
-        self,
-        x: torch.Tensor,                              # [B,L,C]
-        *,
-        future_exo: Optional[torch.Tensor] = None,    # [B,H,E]
-        past_exo_cont: Optional[torch.Tensor] = None, # [B,L,E_c]
-        past_exo_cat: Optional[torch.Tensor] = None,  # [B,L,E_k]
-        part_ids: Optional[torch.Tensor] = None,      # [B]
-        **kwargs,
-    ) -> torch.Tensor:
-        if self.use_past_exo and self.past_exo_mode == "fuse_input" and (
-            (past_exo_cont is not None) or (past_exo_cat is not None)
-        ):
-            x_in = self._fuse_inputs_input_level(x, past_exo_cont, past_exo_cat)
-        else:
-            x_in = x
-
-        x_n = self._maybe_revin_norm(x_in)
-        memory = self.encoder(x_n)
-
-        if self.use_past_exo and self.past_exo_mode == "z_gate" and (
-            (past_exo_cont is not None) or (past_exo_cat is not None)
-        ):
-            memory = self._inject_exo_to_memory(memory, past_exo_cont, past_exo_cat)
-
+    def forward(self, x: torch.Tensor, *, future_exo: torch.Tensor | None = None) -> torch.Tensor:
+        # 1) RevIN norm (입력 전처리) ---------------------
+        x = self._maybe_revin_norm(x)  # [B,L,C]
+        memory = self.encoder(x)
         dec = self.decoder(memory, future_exo)
         y = self.proj(dec).squeeze(-1)
-        y = self._maybe_revin_denorm(y)
+        # 3) RevIN denorm (출력 복원) ---------------------
+        y = self._maybe_revin_denorm(y)  # [B,H]
         return self._clamp(y)
 
 
 class TitanSeq2SeqModel(_TitanBase):
     """
     Seq2Seq: 다층 디코더를 이용하여 미래 H 단계의 컨텍스트를 생성 후 1채널 예측.
-    - past/future exo 주입 패턴 동일.
     """
-    def __init__(self, *, config: Optional["TitanConfig"] = None, **kwargs):
+    def __init__(self, *, config: Optional["TitanConfig"]=None, **kwargs):
         super().__init__(config=config, **kwargs)
         self.decoder = TitanDecoder(
             d_model=self.d_model,
@@ -408,32 +246,12 @@ class TitanSeq2SeqModel(_TitanBase):
         )
         self.proj = nn.Linear(self.d_model, 1)
 
-    def forward(
-        self,
-        x: torch.Tensor,                              # [B,L,C]
-        *,
-        future_exo: Optional[torch.Tensor] = None,    # [B,H,E]
-        past_exo_cont: Optional[torch.Tensor] = None, # [B,L,E_c]
-        past_exo_cat: Optional[torch.Tensor] = None,  # [B,L,E_k]
-        part_ids: Optional[torch.Tensor] = None,      # [B]
-        **kwargs,
-    ) -> torch.Tensor:
-        if self.use_past_exo and self.past_exo_mode == "fuse_input" and (
-            (past_exo_cont is not None) or (past_exo_cat is not None)
-        ):
-            x_in = self._fuse_inputs_input_level(x, past_exo_cont, past_exo_cat)
-        else:
-            x_in = x
-
-        x_n = self._maybe_revin_norm(x_in)
-        memory = self.encoder(x_n)
-
-        if self.use_past_exo and self.past_exo_mode == "z_gate" and (
-            (past_exo_cont is not None) or (past_exo_cat is not None)
-        ):
-            memory = self._inject_exo_to_memory(memory, past_exo_cont, past_exo_cat)
-
-        dec = self.decoder(memory, future_exo)
-        y = self.proj(dec).squeeze(-1)
-        y = self._maybe_revin_denorm(y)
+    def forward(self, x: torch.Tensor, *, future_exo: torch.Tensor | None = None) -> torch.Tensor:
+        # 1) RevIN norm (입력 전처리) ---------------------
+        x = self._maybe_revin_norm(x)  # [B,L,C]
+        memory = self.encoder(x)               # [B, L, D]
+        dec = self.decoder(memory, future_exo) # [B, H, D]
+        y = self.proj(dec).squeeze(-1)         # [B, H]
+        # 3) RevIN denorm (출력 복원) ---------------------
+        y = self._maybe_revin_denorm(y)  # [B,H]
         return self._clamp(y)
