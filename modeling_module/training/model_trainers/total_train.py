@@ -169,13 +169,12 @@ def _build_common_train_configs(
 
     return point_train_cfg, quantile_train_cfg, spike_cfg, stages
 
-
 # ===================== WEEKLY =====================
 
 def run_total_train_weekly(
         train_loader,
         val_loader,
-        device: str = 'cuda',
+        device: str = 'cuda' if torch.cuda.is_available() else 'mps',
         *,
         lookback: int,
         horizon: int,
@@ -192,6 +191,7 @@ def run_total_train_weekly(
         device=device, lookback=lookback, horizon=horizon
     )
 
+    # 주간 캘린더 exogenous (W)
     future_exo_cb = compose_exo_calendar_cb(date_type='W')
 
     results: Dict[str, Dict] = {}
@@ -444,7 +444,7 @@ def run_total_train_monthly(
         save_dir: Optional[str] = None,
 ) -> Dict[str, Dict]:
     """
-    월간 전체 모델(PatchMixer 중심)을 학습시키고 결과 반환.
+    월간 전체 모델(PatchMixer, Titan, PatchTST)을 학습시키고 결과 반환.
     save_dir가 주어지면 ckpt 저장.
     """
     save_root = Path(save_dir) if save_dir is not None else None
@@ -454,7 +454,7 @@ def run_total_train_monthly(
         device=device, lookback=lookback, horizon=horizon
     )
 
-    # 월간 외생(달 주기) 콜백
+    # 월간 캘린더 exogenous (M)
     future_exo_cb = compose_exo_calendar_cb(date_type='M')
 
     results: Dict[str, Dict] = {}
@@ -562,10 +562,138 @@ def run_total_train_monthly(
         best_pm_quantile["ckpt_path"] = str(ckpt_path)
     results['PatchMixer Quantile'] = best_pm_quantile
 
-    # 아래 Titan / PatchTST (Monthly)는 필요 시 주석 해제 후
-    # 위 weekly와 동일한 패턴으로 save_model 호출만 추가하면 됨.
+    # --------------------------------------------------
+    # Titan (Monthly)
+    # --------------------------------------------------
+    ti_m_config = TitanConfig(
+        lookback=lookback,
+        horizon=horizon,
+        input_dim=1,
+        d_model=256,
+        n_layers=3,
+        n_heads=4,
+        d_ff=512,
+        dropout=0.1,
+        contextual_mem_size=256,
+        persistent_mem_size=64,
+        use_exogenous=True,
+        exo_dim=2,  # 월간 calendar sin/cos
+        final_clamp_nonneg=True,
+    )
+
+    ti_base_m = build_titan_base(ti_m_config)
+    ti_lmm_m = build_titan_lmm(ti_m_config)
+    ti_seq2seq_m = build_titan_seq2seq(ti_m_config)
+
+    print('Titan Base (Monthly)')
+    best_ti_base_m = train_titan(
+        ti_base_m,
+        train_loader,
+        val_loader,
+        train_cfg=point_train_cfg,
+        stages=list(stages),
+        future_exo_cb=future_exo_cb,
+    )
+    if save_root is not None:
+        ckpt_path = _make_ckpt_path(save_root, "monthly", "TitanBase", lookback, horizon)
+        save_model(ti_base_m, ti_m_config, ckpt_path)
+        best_ti_base_m["ckpt_path"] = str(ckpt_path)
+    results['Titan Base'] = best_ti_base_m
+
+    print('Titan LMM (Monthly)')
+    best_ti_lmm_m = train_titan(
+        ti_lmm_m,
+        train_loader,
+        val_loader,
+        train_cfg=point_train_cfg,
+        stages=list(stages),
+        future_exo_cb=future_exo_cb,
+    )
+    if save_root is not None:
+        ckpt_path = _make_ckpt_path(save_root, "monthly", "TitanLMM", lookback, horizon)
+        save_model(ti_lmm_m, ti_m_config, ckpt_path)
+        best_ti_lmm_m["ckpt_path"] = str(ckpt_path)
+    results['Titan LMM'] = best_ti_lmm_m
+
+    print('Titan Seq2Seq (Monthly)')
+    best_ti_seq2seq_m = train_titan(
+        ti_seq2seq_m,
+        train_loader,
+        val_loader,
+        train_cfg=point_train_cfg,
+        stages=list(stages),
+        future_exo_cb=future_exo_cb,
+    )
+    if save_root is not None:
+        ckpt_path = _make_ckpt_path(save_root, "monthly", "TitanSeq2Seq", lookback, horizon)
+        save_model(ti_seq2seq_m, ti_m_config, ckpt_path)
+        best_ti_seq2seq_m["ckpt_path"] = str(ckpt_path)
+    results['Titan Seq2Seq'] = best_ti_seq2seq_m
+
+    # --------------------------------------------------
+    # PatchTST (Monthly)
+    # --------------------------------------------------
+    print('PatchTST Base (Monthly)')
+    pt_point_config_m = PatchTSTConfig(
+        device=device,
+        lookback=lookback,
+        horizon=horizon,
+        loss_mode='point',
+        point_loss='huber',
+        c_in=1,
+        d_model=256,
+        n_layers=3,
+        patch_len=6,
+        stride=3,
+    )
+    pt_base_m = build_patchTST_base(pt_point_config_m)
+
+    pt_quantile_config_m = PatchTSTConfig(
+        device=device,
+        lookback=lookback,
+        horizon=horizon,
+        loss_mode='quantile',
+        quantiles=(0.1, 0.5, 0.9),
+        c_in=1,
+        d_model=256,
+        n_layers=3,
+        patch_len=6,
+        stride=3,
+    )
+    pt_quantile_m = build_patchTST_quantile(pt_quantile_config_m)
+
+    best_pt_base_m = train_patchtst(
+        pt_base_m,
+        train_loader,
+        val_loader,
+        train_cfg=point_train_cfg,
+        stages=list(stages),
+        future_exo_cb=future_exo_cb,
+    )
+    if save_root is not None:
+        ckpt_path = _make_ckpt_path(save_root, "monthly", "PatchTSTBase", lookback, horizon)
+        save_model(pt_base_m, pt_point_config_m, ckpt_path)
+        best_pt_base_m["ckpt_path"] = str(ckpt_path)
+    results['PatchTST Base'] = best_pt_base_m
+
+    print('PatchTST Quantile (Monthly)')
+    best_pt_quantile_m = train_patchtst(
+        pt_quantile_m,
+        train_loader,
+        val_loader,
+        train_cfg=quantile_train_cfg,
+        stages=list(stages),
+        future_exo_cb=future_exo_cb,
+        exo_is_normalized=True,
+    )
+    if save_root is not None:
+        ckpt_path = _make_ckpt_path(save_root, "monthly", "PatchTSTQuantile", lookback, horizon)
+        save_model(pt_quantile_m, pt_quantile_config_m, ckpt_path)
+        best_pt_quantile_m["ckpt_path"] = str(ckpt_path)
+    results['PatchTST Quantile'] = best_pt_quantile_m
 
     return results
+
 
 
 # ===================== METRIC SUMMARY =====================

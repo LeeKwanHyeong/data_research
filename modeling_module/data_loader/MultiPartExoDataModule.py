@@ -595,7 +595,7 @@ class MultiPartExoDataModule:
         is_running: bool,  # True: 주(YYYYWW), False: 월(YYYYMM)
         batch_size: int = 64,
         val_ratio: float = 0.2,
-        shuffle: bool = True,
+        shuffle: bool = False,
         seed: int = 42,
         part_col: str = "oper_part_no",
         date_col: str = "demand_dt",

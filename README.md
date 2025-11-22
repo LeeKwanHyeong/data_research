@@ -1,8 +1,8 @@
 # [Transformer]
-![img.png](img.png)
+![img.png](img/img.png)
 
 # [TITAN]
-![img_1.png](titan_model_MAC.png)
+![img_1.png](img/titan_model_MAC.png)
 
 ## MAC(Memory as Context)
 Titan의 핵심은 '과거로부터 요약된 문맥 메모리'를 현재 입력과 함께 쓰는 것. 컨텍스트 메모리를 동적으로 업데이트하면, 
@@ -17,7 +17,7 @@ Titan의 핵심은 '과거로부터 요약된 문맥 메모리'를 현재 입력
 시계열처럼 시간에 따라 분포가 변하는 문제에 효과적이지만, 데이터 누수 방지와 안정성이 중요.
 
 # [PatchMixer]
-![img_4.png](patch_mixer_model.png)
+![img_4.png](img/patch_mixer_model.png)
 긴 시계열을 효율적으로 예측하기 위해, 시계열을 일정 길이의 
 “패치(patch)”로 쪼개고 패치 간·채널 간 정보를 가볍게 섞어 학습하는 모델.
 목적: 긴 시계열을 효율적으로 예측하기 위해, 시계열을 일정 길이의 “패치(patch)”로 쪼개고 패치 간·채널 간 정보를 가볍게 섞어 학습하는 모델입니다.
@@ -52,10 +52,10 @@ CNN/TCN 대비 패치·채널 분해를 통해 전역 정보 집약을 더 직�
 ### Ref: [https://www.signalpop.com/2023/11/06/understanding-the-patchtst-model-for-time-series-prediction/]
 긴 시계열을 패치 단위로 분할해 Transformer의 자기어텐션으로 전역 의존성을 학습, 장기 예측 성능과 안정성을 동시에 확보.
 ## [Original]
-![img_3.png](img_3.png)
+![img_3.png](img/img_3.png)
 
 ## [Decomposition Mode]
-![img_2.png](img_2.png)
+![img_2.png](img/img_2.png)
 
 ### 핵심 아이디어
 입력 시계열을 patch_len 기준으로 패치화(비중첩/슬라이딩 가능) →

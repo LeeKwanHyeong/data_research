@@ -24,7 +24,7 @@
 ---
 
 ## 2) Titan 아키텍처 개요
-![titan_model_MAC.png](../../../titan_model_MAC.png)
+![titan_model_MAC.png](../../../img/titan_model_MAC.png)
 **전처리 → 인코딩(메모리 결합) → 보강(LMM) → 디코딩/헤드 → 보정(Trend) → 역정규화**
 ```python
 x : [B, L, C]

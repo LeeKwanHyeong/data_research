@@ -47,7 +47,7 @@ $$
 ---
 
 ## 3. PatchMixer 아키텍처 개요
-![patch_mixer_model.png](../../../patch_mixer_model.png)
+![patch_mixer_model.png](../../../img/patch_mixer_model.png)
 ### (1) 입력 구조
 | 단계 | 텐서 형상 | 설명 |
 |------|------------|------|
