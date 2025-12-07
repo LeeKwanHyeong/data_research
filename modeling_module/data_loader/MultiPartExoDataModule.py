@@ -3,8 +3,13 @@ import torch
 from torch.utils.data import Dataset, DataLoader, random_split
 import numpy as np
 from typing import Callable, Optional, Sequence, Dict, Any
+from datetime import datetime, timedelta
 
-from modeling_module.utils.date_util import DateUtil
+# 기존 DateUtil이 있다면 사용하고, 없으면 내부 로직 사용을 위해 import는 유지
+try:
+    from modeling_module.utils.date_util import DateUtil
+except ImportError:
+    DateUtil = None
 
 
 # -----------------------------
@@ -16,18 +21,73 @@ def _to_numpy(x):
     return np.asarray(x)
 
 
+# 날짜 계산 헬퍼 함수 (Daily/Hourly 지원)
+def _add_time(dt_int: int, amount: int, freq: str) -> int:
+    """정수형 날짜(YYYYMM, YYYYWW, YYYYMMDD, YYYYMMDDHH)에 시간을 더하거나 뺌"""
+    s = str(dt_int)
+
+    if freq == 'hourly':
+        # YYYYMMDDHH
+        fmt = "%Y%m%d%H"
+        dt_obj = datetime.strptime(s, fmt)
+        new_dt = dt_obj + timedelta(hours=amount)
+        return int(new_dt.strftime(fmt))
+
+    elif freq == 'daily':
+        # YYYYMMDD
+        fmt = "%Y%m%d"
+        dt_obj = datetime.strptime(s, fmt)
+        new_dt = dt_obj + timedelta(days=amount)
+        return int(new_dt.strftime(fmt))
+
+    elif freq == 'weekly':
+        # YYYYWW (기존 DateUtil 사용 권장, 없으면 datetime으로 근사 처리 불가하므로 DateUtil 필수)
+        if DateUtil:
+            return DateUtil.add_weeks_yyyyww(dt_int, amount)
+        else:
+            raise ImportError("Weekly logic requires DateUtil module.")
+
+    elif freq == 'monthly':
+        # YYYYMM
+        if DateUtil:
+            return DateUtil.add_months_yyyymm(dt_int, amount)
+        else:
+            # DateUtil 없을 경우 간단 구현
+            y = dt_int // 100
+            m = dt_int % 100
+            m += amount
+            while m < 1:
+                m += 12
+                y -= 1
+            while m > 12:
+                m -= 12
+                y += 1
+            return y * 100 + m
+    return dt_int
+
+
+def _generate_time_seq(plan_dt: int, length: int, freq: str) -> np.ndarray:
+    """plan_dt 직전의 length 길이만큼의 과거 시퀀스 생성"""
+    seq = []
+    # plan_dt 바로 전 시점부터 역산
+    current = _add_time(plan_dt, -1, freq)
+    for _ in range(length):
+        seq.append(current)
+        current = _add_time(current, -1, freq)
+    return np.array(seq[::-1], dtype=np.int64)
+
+
 class CategoryIndexer:
     """
     문자열/임의 카테고리를 일관된 정수 ID로 변환하는 헬퍼.
-    - UNK(미등록) 토큰은 0으로 예약
-    - known values는 1..K 순번
     """
+
     def __init__(self, mapping: Optional[Dict[Any, int]] = None):
         self.unk_id = 0
         self.mapping: Dict[Any, int] = mapping or {}
 
     @staticmethod
-    def build_from_series(series: pl.Series, sort: bool = True, add_unk: bool = True) -> "CategoryIndexer":
+    def build_from_series(series: pl.Series, sort: bool = True) -> "CategoryIndexer":
         vals = series.drop_nulls().unique().to_list()
         if sort:
             try:
@@ -40,11 +100,7 @@ class CategoryIndexer:
             if v not in mapping:
                 mapping[v] = next_id
                 next_id += 1
-        idx = CategoryIndexer(mapping)
-        if add_unk:
-            # 0 reserved for unknown
-            pass
-        return idx
+        return CategoryIndexer(mapping)
 
     def id_of(self, value: Any) -> int:
         return self.mapping.get(value, self.unk_id)
@@ -52,92 +108,52 @@ class CategoryIndexer:
     def map_series(self, s: pl.Series) -> np.ndarray:
         return np.asarray([self.id_of(v) for v in s.to_list()], dtype=np.int64)
 
-    def state_dict(self) -> Dict[str, Any]:
-        return {"mapping": self.mapping, "unk_id": self.unk_id}
-
-    @staticmethod
-    def from_state(state: Dict[str, Any]) -> "CategoryIndexer":
-        ci = CategoryIndexer(mapping=state["mapping"])
-        ci.unk_id = state.get("unk_id", 0)
-        return ci
-
-
-'''모델 forward 예시:
-
-for x, y, part_ids, future_exo_cont, past_exo_cont, past_exo_cat in train_loader:
-    out = model(
-        x,
-        future_exo=future_exo_cont,     # [B,H,E_fut] (float32)
-        past_exo_cont=past_exo_cont,    # [B,L,E_cont] (float32)
-        past_exo_cat=past_exo_cat,      # [B,L,E_cat]  (long, 정수ID)
-        part_ids=part_ids               # list[str]
-    )
-'''
-
 
 # ============================================================
 # 1) Training Dataset
 # ============================================================
 class MultiPartExoTrainingDataset(Dataset):
     """
-    외생변수(연속/범주)를 함께 제공하는 슬라이딩 윈도우 학습 Dataset.
-
-    입력 df 스키마(필수 열):
-      - part_no | demand_dt(int: YYYYWW or YYYYMM) | demand_qty(float)
-
-    추천 exo:
-      - 연속형: sequence, age_w, in_warranty, weeks_to_warranty_end, cumsum_qty ...
-      - 범주형: site_id(정수), corp_id(정수) 등  ← *원핫으로 저장하지 마세요*
-
-    반환:
-      - x: [L, 1] float32
-      - y: [H]    float32
-      - future_exo_cont: [H, E_fut] float32
-      - past_exo_cont:   [L, E_cont] float32
-      - past_exo_cat:    [L, E_cat]  long (정수 ID)
-      - part_id: str
+    슬라이딩 윈도우 학습 Dataset. (Daily/Hourly 등 모든 빈도 공용)
     """
+
     def __init__(
-        self,
-        df: pl.DataFrame,
-        lookback: int,
-        horizon: int,
-        *,
-        part_col: str = "part_no",
-        date_col: str = "demand_dt",
-        qty_col: str = "demand_qty",
-        past_exo_cont_cols: Optional[Sequence[str]] = ("sequence", "age_w", "in_warranty", "weeks_to_warranty_end", "cumsum_qty"),
-        past_exo_cat_cols: Optional[Sequence[str]]  = ("site_id",),   # 정수 ID여야 함
-        future_exo_cb: Optional[Callable[[int, int, str], np.ndarray | torch.Tensor]] = None,
-        date_indexer: Optional[Callable[[int], int]] = None,
-        cat_indexers: Optional[Dict[str, CategoryIndexer]] = None,  # (선택) cat 컬럼별 indexer 주입
+            self,
+            df: pl.DataFrame,
+            lookback: int,
+            horizon: int,
+            *,
+            part_col: str = "part_no",
+            date_col: str = "demand_dt",
+            qty_col: str = "demand_qty",
+            past_exo_cont_cols: Optional[Sequence[str]] = None,
+            past_exo_cat_cols: Optional[Sequence[str]] = None,
+            future_exo_cb: Optional[Callable[[int, int, str], np.ndarray | torch.Tensor]] = None,
+            date_indexer: Optional[Callable[[int], int]] = None,
+            cat_indexers: Optional[Dict[str, CategoryIndexer]] = None,
     ):
-        assert lookback and horizon
         self.lookback = int(lookback)
-        self.horizon  = int(horizon)
+        self.horizon = int(horizon)
         self.part_col = part_col
         self.date_col = date_col
-        self.qty_col  = qty_col
+        self.qty_col = qty_col
 
-        # None/빈 리스트도 허용
         self.past_exo_cont_cols = list(past_exo_cont_cols) if past_exo_cont_cols else []
-        self.past_exo_cat_cols  = list(past_exo_cat_cols) if past_exo_cat_cols else []
+        self.past_exo_cat_cols = list(past_exo_cat_cols) if past_exo_cat_cols else []
 
         self.future_exo_cb = future_exo_cb
-        self.date_indexer  = date_indexer or (lambda x: x)
-
-        # 카테고리 indexer (옵션): 전달되면 사용, 없으면 df의 값이 이미 정수라고 가정
+        self.date_indexer = date_indexer or (lambda x: x)
         self.cat_indexers = cat_indexers or {}
 
-        self.samples = []  # list[dict]
+        self.samples = []
 
         grouped = df.partition_by(part_col)
         for g in grouped:
             g = g.sort(date_col)
             part = g[part_col][0]
 
-            y_all = _to_numpy(g[qty_col]).astype(float)           # [T]
-            d_all = _to_numpy(g[date_col]).astype(np.int64)        # [T]
+            y_all = _to_numpy(g[qty_col]).astype(float)
+            d_all = _to_numpy(g[date_col]).astype(np.int64)
             T = len(y_all)
             if T < self.lookback + self.horizon:
                 continue
@@ -147,69 +163,50 @@ class MultiPartExoTrainingDataset(Dataset):
                 cont_list = []
                 for col in self.past_exo_cont_cols:
                     if col not in g.columns:
-                        print(f"[TrainingDataset] missing past_exo_cont col: {col} -> skip")
                         continue
                     cont_list.append(_to_numpy(g[col]).astype(float))
-
-                if cont_list:
-                    exo_cont_mat = np.stack(cont_list, axis=-1)  # [T, E_cont]
-                else:
-                    exo_cont_mat = np.zeros((T, 0), dtype=float)
+                exo_cont_mat = np.stack(cont_list, axis=-1) if cont_list else np.zeros((T, 0), dtype=float)
             else:
                 exo_cont_mat = np.zeros((T, 0), dtype=float)
 
-            # ----- 범주형 past exo (정수 ID) -----
+            # ----- 범주형 past exo -----
             if self.past_exo_cat_cols:
                 cat_list = []
                 for col in self.past_exo_cat_cols:
                     if col not in g.columns:
-                        print(f"[TrainingDataset] missing past_exo_cat col: {col} -> skip")
                         continue
                     s = g[col]
-                    if s.dtype in (pl.Int8, pl.Int16, pl.Int32, pl.Int64,
-                                   pl.UInt8, pl.UInt16, pl.UInt32, pl.UInt64):
+                    # 이미 정수형이면 그대로, 아니면 매핑
+                    if s.dtype in (pl.Int8, pl.Int16, pl.Int32, pl.Int64, pl.UInt8, pl.UInt16, pl.UInt32, pl.UInt64):
                         cat_list.append(_to_numpy(s).astype(np.int64))
                     else:
                         if col not in self.cat_indexers:
-                            raise TypeError(
-                                f"[TrainingDataset] categorical '{col}' must be integer IDs "
-                                f"or provide cat_indexers[{col}]"
-                            )
+                            # 매퍼가 없으면 0 처리 혹은 에러. 여기선 에러
+                            raise TypeError(f"Categorical '{col}' needs a CategoryIndexer or integer IDs.")
                         cat_list.append(self.cat_indexers[col].map_series(s))
-
-                if cat_list:
-                    exo_cat_mat = np.stack(cat_list, axis=-1)  # [T, E_cat]
-                else:
-                    exo_cat_mat = np.zeros((T, 0), dtype=np.int64)
+                exo_cat_mat = np.stack(cat_list, axis=-1) if cat_list else np.zeros((T, 0), dtype=np.int64)
             else:
                 exo_cat_mat = np.zeros((T, 0), dtype=np.int64)
 
             # ----- 윈도우 생성 -----
+            # (데이터가 정렬되어 있고 빈 시간이 없다고 가정)
             for i in range(T - self.lookback - self.horizon + 1):
-                x_win = y_all[i:i+self.lookback]
-                y_win = y_all[i+self.lookback:i+self.lookback+self.horizon]
+                x_win = y_all[i:i + self.lookback]
+                y_win = y_all[i + self.lookback:i + self.lookback + self.horizon]
 
-                # past exo (연속형)
-                if exo_cont_mat.size:
-                    p_cont = exo_cont_mat[i:i+self.lookback, :]
-                else:
-                    p_cont = np.zeros((self.lookback, 0), dtype=float)
+                p_cont = exo_cont_mat[i:i + self.lookback, :] if exo_cont_mat.size else np.zeros((self.lookback, 0),
+                                                                                                 dtype=float)
+                p_cat = exo_cat_mat[i:i + self.lookback, :] if exo_cat_mat.size else np.zeros((self.lookback, 0),
+                                                                                              dtype=np.int64)
 
-                # past exo (범주형)
-                if exo_cat_mat.size:
-                    p_cat = exo_cat_mat[i:i+self.lookback, :]
-                else:
-                    p_cat = np.zeros((self.lookback, 0), dtype=np.int64)
-
-                # future exo (연속형)
-                last_dt   = int(d_all[i+self.lookback-1])
+                # Future Exo
+                last_dt = int(d_all[i + self.lookback - 1])
                 start_idx = int(self.date_indexer(last_dt)) + 1
+
+                fe = np.zeros((self.horizon, 0), dtype=float)
                 if self.future_exo_cb is not None:
-                    fe = self.future_exo_cb(start_idx, self.horizon, device="cpu")
-                    fe = fe.detach().cpu().numpy() if isinstance(fe, torch.Tensor) else np.asarray(fe, dtype=float)
-                    assert fe.shape[0] == self.horizon, f"future_exo_cb must return (H, E), got {fe.shape}"
-                else:
-                    fe = np.zeros((self.horizon, 0), dtype=float)
+                    res = self.future_exo_cb(start_idx, self.horizon, device="cpu")
+                    fe = res.detach().cpu().numpy() if isinstance(res, torch.Tensor) else np.asarray(res, dtype=float)
 
                 self.samples.append(dict(
                     x=x_win, y=y_win,
@@ -218,58 +215,61 @@ class MultiPartExoTrainingDataset(Dataset):
                     part_id=part
                 ))
 
-    def __len__(self): return len(self.samples)
+    def __len__(self):
+        return len(self.samples)
 
     def __getitem__(self, idx):
         s = self.samples[idx]
-        x  = torch.tensor(s["x"], dtype=torch.float32).unsqueeze(-1)          # [L,1]
-        y  = torch.tensor(s["y"], dtype=torch.float32)                        # [H]
-        pe_cont = torch.tensor(s["past_exo_cont"], dtype=torch.float32)       # [L,E_cont] (E_cont=0 가능)
-        pe_cat  = torch.tensor(s["past_exo_cat"],  dtype=torch.long)          # [L,E_cat]  (E_cat=0 가능)
-        fe_cont = torch.tensor(s["future_exo_cont"], dtype=torch.float32)     # [H,E_fut]  (E_fut=0 가능)
+        x = torch.tensor(s["x"], dtype=torch.float32).unsqueeze(-1)
+        y = torch.tensor(s["y"], dtype=torch.float32)
+        pe_cont = torch.tensor(s["past_exo_cont"], dtype=torch.float32)
+        pe_cat = torch.tensor(s["past_exo_cat"], dtype=torch.long)
+        fe_cont = torch.tensor(s["future_exo_cont"], dtype=torch.float32)
         return x, y, s["part_id"], fe_cont, pe_cont, pe_cat
 
 
 # ============================================================
-# 2) Anchored Inference Datasets
+# 2) Inference Dataset (Unified for Monthly/Weekly/Daily/Hourly)
 # ============================================================
-class MultiPartExoAnchoredInferenceByYYYYWW(Dataset):
+class MultiPartExoAnchoredInferenceDataset(Dataset):
     """
-    주(YYYYWW) 앵커 추론 Dataset (+ 연속/범주 exo)
-    반환:
-      - x: [L,1], part_id: str, future_exo_cont: [H,E_fut], past_exo_cont: [L,E_cont], past_exo_cat: [L,E_cat]
+    특정 시점(plan_dt)을 기준으로 과거 데이터를 조회하여 추론 입력을 만드는 Dataset.
+    freq에 따라 날짜 계산 로직을 분기합니다.
     """
+
     def __init__(
-        self,
-        df: pl.DataFrame,
-        lookback: int,
-        horizon: int,
-        plan_yyyyww: int,
-        *,
-        part_col: str = "part_no",
-        date_col: str = "demand_dt",
-        qty_col: str = "demand_qty",
-        past_exo_cont_cols: Optional[Sequence[str]] = ("sequence","age_w","in_warranty","weeks_to_warranty_end","cumsum_qty"),
-        past_exo_cat_cols: Optional[Sequence[str]]  = ("site_id",),
-        fill_missing: str = "ffill",
-        target_back_weeks: int = 104,
-        future_exo_cb: Optional[Callable[[int, int, str], np.ndarray | torch.Tensor]] = None,
-        date_indexer: Optional[Callable[[int], int]] = None,
-        cat_indexers: Optional[Dict[str, CategoryIndexer]] = None,  # 미지 값 → UNK(0)
+            self,
+            df: pl.DataFrame,
+            lookback: int,
+            horizon: int,
+            plan_dt: int,
+            freq: str,  # 'monthly', 'weekly', 'daily', 'hourly'
+            *,
+            part_col: str = "part_no",
+            date_col: str = "demand_dt",
+            qty_col: str = "demand_qty",
+            past_exo_cont_cols: Optional[Sequence[str]] = None,
+            past_exo_cat_cols: Optional[Sequence[str]] = None,
+            fill_missing: str = "ffill",
+            target_back_steps: int = 100,  # 결측치 채울 때 얼마나 뒤를 볼지
+            future_exo_cb: Optional[Callable[[int, int, str], np.ndarray | torch.Tensor]] = None,
+            date_indexer: Optional[Callable[[int], int]] = None,
+            cat_indexers: Optional[Dict[str, CategoryIndexer]] = None,
     ):
-        assert fill_missing in ("ffill","zero","nan")
         self.lookback = int(lookback)
-        self.horizon  = int(horizon)
-        self.plan_yyyyww = int(plan_yyyyww)
+        self.horizon = int(horizon)
+        self.plan_dt = int(plan_dt)
+        self.freq = freq.lower()
+
         self.part_col = part_col
         self.date_col = date_col
-        self.qty_col  = qty_col
+        self.qty_col = qty_col
 
         self.past_exo_cont_cols = list(past_exo_cont_cols) if past_exo_cont_cols else []
-        self.past_exo_cat_cols  = list(past_exo_cat_cols) if past_exo_cat_cols else []
+        self.past_exo_cat_cols = list(past_exo_cat_cols) if past_exo_cat_cols else []
 
         self.fill_missing = fill_missing
-        self.target_back_weeks = int(target_back_weeks)
+        self.target_back_steps = int(target_back_steps)
         self.future_exo_cb = future_exo_cb
         self.date_indexer = date_indexer or (lambda x: x)
         self.cat_indexers = cat_indexers or {}
@@ -278,287 +278,127 @@ class MultiPartExoAnchoredInferenceByYYYYWW(Dataset):
         self.past_exo_conts, self.past_exo_cats = [], []
         self.future_exo_conts = []
 
+        # freq에 맞는 과거 시점 리스트 생성 (Ex: 과거 27주, 과거 24시간 등)
+        win_dates = _generate_time_seq(self.plan_dt, self.lookback, self.freq)
+
         grouped = df.partition_by(part_col)
         for g in grouped:
-            g = g.sort(date_col)
             part = g[part_col][0]
 
-            weeks = _to_numpy(g[date_col]).astype(np.int64)
-            vals  = _to_numpy(g[qty_col]).astype(float)
-            if len(weeks) == 0:
-                continue
+            # 파티션 데이터를 맵으로 변환 (검색 속도 향상)
+            dts = _to_numpy(g[date_col]).astype(np.int64)
+            vals = _to_numpy(g[qty_col]).astype(float)
 
-            # 과거 L주 캘린더
-            win_weeks = DateUtil.week_seq_ending_before(self.plan_yyyyww, self.lookback)  # [L]
-            qty_map = {int(w): float(v) for w, v in zip(weeks, vals)}
-            earliest = int(weeks.min())
+            if len(dts) == 0: continue
 
-            # 수요 x 채우기
+            qty_map = {int(d): float(v) for d, v in zip(dts, vals)}
+            earliest = int(dts.min())
+
+            # 1. Main Input (x) 채우기
             x = np.empty(self.lookback, dtype=float)
-            for i, ww in enumerate(win_weeks):
-                if ww in qty_map:
-                    x[i] = qty_map[ww]
+            for i, curr_dt in enumerate(win_dates):
+                if curr_dt in qty_map:
+                    x[i] = qty_map[curr_dt]
                 else:
+                    # 결측 처리
                     if self.fill_missing == "zero":
                         x[i] = 0.0
                     elif self.fill_missing == "nan":
                         x[i] = np.nan
-                    else:
-                        prev, found = ww, False
-                        for _ in range(self.target_back_weeks):
-                            prev = DateUtil.add_weeks_yyyyww(prev, -1)
+                    else:  # ffill
+                        prev, found = curr_dt, False
+                        for _ in range(self.target_back_steps):
+                            prev = _add_time(prev, -1, self.freq)
                             if prev < earliest: break
                             if prev in qty_map:
-                                x[i] = qty_map[prev]; found = True; break
-                        if not found: x[i] = 0.0
+                                x[i] = qty_map[prev];
+                                found = True;
+                                break
+                        if not found: x[i] = 0.0  # 못 찾으면 0
+
+            # nan fill일 때 전체가 nan이면 스킵
             if self.fill_missing == "nan" and not np.any(np.isfinite(x)):
                 continue
 
-            # ----- 연속형 past exo -----
-            pe_cont = []
+            # 2. Continuous Past Exo
+            pe_cont_list = []
             for col in self.past_exo_cont_cols:
-                if col not in g.columns:
-                    print(f"[AnchoredYYYYWW] missing past_exo_cont col: {col} -> skip")
-                    continue
-                mp = {int(w): float(v) for w, v in zip(weeks, _to_numpy(g[col]).astype(float))}
+                if col not in g.columns: continue
+                val_map = {int(d): float(v) for d, v in zip(dts, _to_numpy(g[col]).astype(float))}
+
                 e = np.empty(self.lookback, dtype=float)
-                for i, ww in enumerate(win_weeks):
-                    if ww in mp:
-                        e[i] = mp[ww]
+                for i, curr_dt in enumerate(win_dates):
+                    if curr_dt in val_map:
+                        e[i] = val_map[curr_dt]
                     else:
+                        # 결측 처리 (위와 동일 로직)
                         if self.fill_missing == "zero":
                             e[i] = 0.0
                         elif self.fill_missing == "nan":
                             e[i] = np.nan
                         else:
-                            prev, found = ww, False
-                            for _ in range(self.target_back_weeks):
-                                prev = DateUtil.add_weeks_yyyyww(prev, -1)
+                            prev, found = curr_dt, False
+                            for _ in range(self.target_back_steps):
+                                prev = _add_time(prev, -1, self.freq)
                                 if prev < earliest: break
-                                if prev in mp:
-                                    e[i] = mp[prev]; found = True; break
+                                if prev in val_map:
+                                    e[i] = val_map[prev];
+                                    found = True;
+                                    break
                             if not found: e[i] = 0.0
-                pe_cont.append(e)
-            pe_cont_mat = np.stack(pe_cont, axis=-1) if pe_cont else np.zeros((self.lookback, 0), dtype=float)
+                pe_cont_list.append(e)
 
-            # ----- 범주형 past exo (정수 ID/UNK0) -----
-            pe_cat = []
+            pe_cont_mat = np.stack(pe_cont_list, axis=-1) if pe_cont_list else np.zeros((self.lookback, 0), dtype=float)
+
+            # 3. Categorical Past Exo
+            pe_cat_list = []
             for col in self.past_exo_cat_cols:
-                if col not in g.columns:
-                    print(f"[AnchoredYYYYWW] missing past_exo_cat col: {col} -> skip")
-                    continue
+                if col not in g.columns: continue
                 s = g[col]
-                if s.dtype in (pl.Int8, pl.Int16, pl.Int32, pl.Int64,
-                               pl.UInt8, pl.UInt16, pl.UInt32, pl.UInt64):
-                    mp = {int(w): int(v) for w, v in zip(weeks, _to_numpy(s).astype(np.int64))}
+                # Indexing
+                if s.dtype in (pl.Int8, pl.Int16, pl.Int32, pl.Int64, pl.UInt8, pl.UInt16, pl.UInt32, pl.UInt64):
+                    vals_int = _to_numpy(s).astype(np.int64)
                     unk = 0
                 else:
                     if col not in self.cat_indexers:
-                        raise TypeError(
-                            f"[AnchoredYYYYWW] categorical '{col}' must be integer IDs "
-                            f"or provide cat_indexers[{col}]"
-                        )
-                    idxr = self.cat_indexers[col]
-                    mp = {int(w): int(idxr.id_of(v)) for w, v in zip(weeks, s.to_list())}
-                    unk = idxr.unk_id
+                        # inference 시점에는 에러 대신 0(UNK) 처리하거나 strict하게 갈 수 있음
+                        unk = 0
+                        vals_int = np.zeros(len(s), dtype=np.int64)
+                    else:
+                        idxr = self.cat_indexers[col]
+                        vals_int = np.array([idxr.id_of(v) for v in s.to_list()], dtype=np.int64)
+                        unk = idxr.unk_id
+
+                val_map = {int(d): int(v) for d, v in zip(dts, vals_int)}
+
                 e = np.empty(self.lookback, dtype=np.int64)
-                for i, ww in enumerate(win_weeks):
-                    if ww in mp:
-                        e[i] = mp[ww]
-                    else:
-                        if self.fill_missing in ("zero", "nan"):
-                            e[i] = unk  # UNK=0
-                        else:
-                            prev, found = ww, False
-                            cur = ww
-                            for _ in range(self.target_back_weeks):
-                                cur = DateUtil.add_weeks_yyyyww(cur, -1)
-                                if cur < earliest: break
-                                if cur in mp:
-                                    e[i] = mp[cur]; found = True; break
-                            if not found: e[i] = unk
-                pe_cat.append(e)
-            pe_cat_mat = np.stack(pe_cat, axis=-1) if pe_cat else np.zeros((self.lookback, 0), dtype=np.int64)
-
-            # future exo (연속형)
-            last_hist = int(win_weeks[-1])
-            start_idx = int(self.date_indexer(last_hist)) + 1
-            if self.future_exo_cb is not None:
-                fe = self.future_exo_cb(start_idx, self.horizon, device="cpu")
-                fe = fe.detach().cpu().numpy() if isinstance(fe, torch.Tensor) else np.asarray(fe, dtype=float)
-                assert fe.shape[0] == self.horizon
-            else:
-                fe = np.zeros((self.horizon, 0), dtype=float)
-
-            self.inputs.append(x)
-            self.past_exo_conts.append(pe_cont_mat)
-            self.past_exo_cats.append(pe_cat_mat)
-            self.future_exo_conts.append(fe)
-            self.part_ids.append(part)
-
-    def __len__(self): return len(self.inputs)
-
-    def __getitem__(self, idx):
-        x   = torch.tensor(self.inputs[idx], dtype=torch.float32).unsqueeze(-1)
-        peC = torch.tensor(self.past_exo_conts[idx], dtype=torch.float32)
-        peK = torch.tensor(self.past_exo_cats[idx], dtype=torch.long)
-        feC = torch.tensor(self.future_exo_conts[idx], dtype=torch.float32)
-        return x, self.part_ids[idx], feC, peC, peK
-
-
-class MultiPartExoAnchoredInferenceByYYYYMM(Dataset):
-    """
-    월(YYYYMM) 앵커 추론 Dataset (+ 연속/범주 exo)
-    """
-    def __init__(
-        self,
-        df: pl.DataFrame,
-        lookback: int,
-        horizon: int,
-        plan_yyyymm: int,
-        *,
-        part_col: str = "part_no",
-        date_col: str = "demand_dt",
-        qty_col: str = "demand_qty",
-        past_exo_cont_cols: Optional[Sequence[str]] = ("sequence","age_w","in_warranty","weeks_to_warranty_end","cumsum_qty"),
-        past_exo_cat_cols: Optional[Sequence[str]]  = ("site_id",),
-        fill_missing: str = "ffill",
-        target_back_months: int = 120,
-        future_exo_cb: Optional[Callable[[int, int, str], np.ndarray | torch.Tensor]] = None,
-        date_indexer: Optional[Callable[[int], int]] = None,
-        cat_indexers: Optional[Dict[str, CategoryIndexer]] = None,
-    ):
-        assert fill_missing in ("ffill","zero","nan")
-        self.lookback = int(lookback)
-        self.horizon  = int(horizon)
-        self.plan_yyyymm = int(plan_yyyymm)
-        self.part_col = part_col
-        self.date_col = date_col
-        self.qty_col  = qty_col
-
-        self.past_exo_cont_cols = list(past_exo_cont_cols) if past_exo_cont_cols else []
-        self.past_exo_cat_cols  = list(past_exo_cat_cols) if past_exo_cat_cols else []
-
-        self.fill_missing = fill_missing
-        self.target_back_months = int(target_back_months)
-        self.future_exo_cb = future_exo_cb
-        self.date_indexer = date_indexer or (lambda x: x)
-        self.cat_indexers = cat_indexers or {}
-
-        self.inputs, self.part_ids = [], []
-        self.past_exo_conts, self.past_exo_cats = [], []
-        self.future_exo_conts = []
-
-        grouped = df.partition_by(part_col)
-        for g in grouped:
-            g = g.sort(date_col)
-            part = g[part_col][0]
-
-            months = _to_numpy(g[date_col]).astype(np.int64)
-            vals   = _to_numpy(g[qty_col]).astype(float)
-            if len(months) == 0:
-                continue
-
-            win_months = DateUtil.month_seq_ending_before(self.plan_yyyymm, self.lookback)
-            mp = {int(m): float(v) for m, v in zip(months, vals)}
-            earliest = int(months.min())
-
-            # x
-            x = np.empty(self.lookback, dtype=float)
-            for i, mm in enumerate(win_months):
-                if mm in mp:
-                    x[i] = mp[mm]
-                else:
-                    if self.fill_missing == "zero":
-                        x[i] = 0.0
-                    elif self.fill_missing == "nan":
-                        x[i] = np.nan
-                    else:
-                        prev, found = mm, False
-                        for _ in range(self.target_back_months):
-                            prev = DateUtil.add_months_yyyymm(prev, -1)
-                            if prev < earliest: break
-                            if prev in mp:
-                                x[i] = mp[prev]; found = True; break
-                        if not found: x[i] = 0.0
-            if self.fill_missing == "nan" and not np.any(np.isfinite(x)):
-                continue
-
-            # 연속형 exo
-            pe_cont = []
-            for col in self.past_exo_cont_cols:
-                if col not in g.columns:
-                    print(f"[AnchoredYYYYMM] missing past_exo_cont col: {col} -> skip")
-                    continue
-                vp = {int(m): float(v) for m, v in zip(months, _to_numpy(g[col]).astype(float))}
-                e = np.empty(self.lookback, dtype=float)
-                for i, mm in enumerate(win_months):
-                    if mm in vp:
-                        e[i] = vp[mm]
-                    else:
-                        if self.fill_missing == "zero":
-                            e[i] = 0.0
-                        elif self.fill_missing == "nan":
-                            e[i] = np.nan
-                        else:
-                            prev, found = mm, False
-                            for _ in range(self.target_back_months):
-                                prev = DateUtil.add_months_yyyymm(prev, -1)
-                                if prev < earliest: break
-                                if prev in vp:
-                                    e[i] = vp[prev]; found = True; break
-                            if not found: e[i] = 0.0
-                pe_cont.append(e)
-            pe_cont_mat = np.stack(pe_cont, axis=-1) if pe_cont else np.zeros((self.lookback, 0), dtype=float)
-
-            # 범주형 exo
-            pe_cat = []
-            for col in self.past_exo_cat_cols:
-                if col not in g.columns:
-                    print(f"[AnchoredYYYYMM] missing past_exo_cat col: {col} -> skip")
-                    continue
-                s = g[col]
-                if s.dtype in (pl.Int8, pl.Int16, pl.Int32, pl.Int64,
-                               pl.UInt8, pl.UInt16, pl.UInt32, pl.UInt64):
-                    vp = {int(m): int(v) for m, v in zip(months, _to_numpy(s).astype(np.int64))}
-                    unk = 0
-                else:
-                    if col not in self.cat_indexers:
-                        raise TypeError(
-                            f"[AnchoredYYYYMM] categorical '{col}' must be integer IDs "
-                            f"or provide cat_indexers[{col}]"
-                        )
-                    idxr = self.cat_indexers[col]
-                    vp = {int(m): int(idxr.id_of(v)) for m, v in zip(months, s.to_list())}
-                    unk = idxr.unk_id
-                e = np.empty(self.lookback, dtype=np.int64)
-                for i, mm in enumerate(win_months):
-                    if mm in vp:
-                        e[i] = vp[mm]
+                for i, curr_dt in enumerate(win_dates):
+                    if curr_dt in val_map:
+                        e[i] = val_map[curr_dt]
                     else:
                         if self.fill_missing in ("zero", "nan"):
                             e[i] = unk
                         else:
-                            prev, found = mm, False
-                            cur = mm
-                            for _ in range(self.target_back_months):
-                                cur = DateUtil.add_months_yyyymm(cur, -1)
-                                if cur < earliest: break
-                                if cur in vp:
-                                    e[i] = vp[cur]; found = True; break
+                            prev, found = curr_dt, False
+                            for _ in range(self.target_back_steps):
+                                prev = _add_time(prev, -1, self.freq)
+                                if prev < earliest: break
+                                if prev in val_map:
+                                    e[i] = val_map[prev];
+                                    found = True;
+                                    break
                             if not found: e[i] = unk
-                pe_cat.append(e)
-            pe_cat_mat = np.stack(pe_cat, axis=-1) if pe_cat else np.zeros((self.lookback, 0), dtype=np.int64)
+                pe_cat_list.append(e)
 
-            # future exo
-            last_hist = int(win_months[-1])
+            pe_cat_mat = np.stack(pe_cat_list, axis=-1) if pe_cat_list else np.zeros((self.lookback, 0), dtype=np.int64)
+
+            # 4. Future Exo
+            last_hist = int(win_dates[-1])
             start_idx = int(self.date_indexer(last_hist)) + 1
+            fe = np.zeros((self.horizon, 0), dtype=float)
             if self.future_exo_cb is not None:
-                fe = self.future_exo_cb(start_idx, self.horizon, device="cpu")
-                fe = fe.detach().cpu().numpy() if isinstance(fe, torch.Tensor) else np.asarray(fe, dtype=float)
-                assert fe.shape[0] == self.horizon
-            else:
-                fe = np.zeros((self.horizon, 0), dtype=float)
+                res = self.future_exo_cb(start_idx, self.horizon, device="cpu")
+                fe = res.detach().cpu().numpy() if isinstance(res, torch.Tensor) else np.asarray(res, dtype=float)
 
             self.inputs.append(x)
             self.past_exo_conts.append(pe_cont_mat)
@@ -566,10 +406,11 @@ class MultiPartExoAnchoredInferenceByYYYYMM(Dataset):
             self.future_exo_conts.append(fe)
             self.part_ids.append(part)
 
-    def __len__(self): return len(self.inputs)
+    def __len__(self):
+        return len(self.inputs)
 
     def __getitem__(self, idx):
-        x   = torch.tensor(self.inputs[idx], dtype=torch.float32).unsqueeze(-1)
+        x = torch.tensor(self.inputs[idx], dtype=torch.float32).unsqueeze(-1)
         peC = torch.tensor(self.past_exo_conts[idx], dtype=torch.float32)
         peK = torch.tensor(self.past_exo_cats[idx], dtype=torch.long)
         feC = torch.tensor(self.future_exo_conts[idx], dtype=torch.float32)
@@ -577,44 +418,50 @@ class MultiPartExoAnchoredInferenceByYYYYMM(Dataset):
 
 
 # ============================================================
-# 3) DataModule
+# 3) Main DataModule
 # ============================================================
 class MultiPartExoDataModule:
     """
-    외생변수를 포함한 멀티파트 시계열 학습/추론 DataModule.
-    - 범주형 exo는 정수 ID로만 전달(UNK=0). one-hot 저장 금지.
-    - 모델에서 nn.Embedding으로 처리 권장.
-    - past_exo_cont_cols / past_exo_cat_cols / future_exo_cb 가 없어도 (None/빈 리스트) 동작.
+    - freq: 'monthly', 'weekly', 'daily', 'hourly' 중 하나 선택
+    - date_col 형식:
+       monthly -> YYYYMM (202401)
+       weekly  -> YYYYWW (202401)
+       daily   -> YYYYMMDD (20240101)
+       hourly  -> YYYYMMDDHH (2024010112)
     """
+
     def __init__(
-        self,
-        df: pl.DataFrame,
-        lookback: int,
-        horizon: int,
-        *,
-        is_running: bool,  # True: 주(YYYYWW), False: 월(YYYYMM)
-        batch_size: int = 32,
-        val_ratio: float = 0.2,
-        shuffle: bool = False,
-        seed: int = 42,
-        part_col: str = "oper_part_no",
-        date_col: str = "demand_dt",
-        qty_col: str = "demand_qty",
-        past_exo_cont_cols: Optional[Sequence[str]] = ("sequence","age_w","in_warranty","weeks_to_warranty_end","cumsum_qty"),
-        past_exo_cat_cols: Optional[Sequence[str]]  = ("site_id",),  # 정수ID 컬럼명
-        fill_missing: str = "ffill",
-        target_back_weeks: int = 104,
-        target_back_months: int = 120,
-        future_exo_cb: Optional[Callable[[int, int, str], np.ndarray | torch.Tensor]] = None,
-        date_indexer: Optional[Callable[[int], int]] = None,
-        # (선택) 특정 cat 컬럼이 문자열이라면, 여기서 ID 매핑을 생성해 하위 Dataset에 주입
-        build_cat_indexer_from: Optional[Sequence[str]] = ("site_cd",),  # 예: raw 문자열 컬럼명
-        cat_indexer_target_col: Optional[str] = "site_id",               # ex) site_cd → site_id
+            self,
+            df: pl.DataFrame,
+            lookback: int,
+            horizon: int,
+            *,
+            freq: str = 'weekly',  # 변경됨: is_running -> freq
+            batch_size: int = 32,
+            val_ratio: float = 0.2,
+            shuffle: bool = False,
+            seed: int = 42,
+            part_col: str = "unique_id",
+            date_col: str = "date",
+            qty_col: str = "HUFL",
+            past_exo_cont_cols: Optional[Sequence[str]] = None,
+            past_exo_cat_cols: Optional[Sequence[str]] = None,
+            fill_missing: str = "ffill",
+            future_exo_cb: Optional[Callable[[int, int, str], np.ndarray | torch.Tensor]] = None,
+            date_indexer: Optional[Callable[[int], int]] = None,
+            build_cat_indexer_from: Optional[Sequence[str]] = None,
+            cat_indexer_target_col: Optional[str] = None,
     ):
         self.df = df
         self.lookback = int(lookback)
-        self.horizon  = int(horizon)
-        self.is_running = bool(is_running)
+        self.horizon = int(horizon)
+
+        # Frequency 설정
+        valid_freqs = ('monthly', 'weekly', 'daily', 'hourly')
+        if freq not in valid_freqs:
+            raise ValueError(f"freq must be one of {valid_freqs}, got '{freq}'")
+        self.freq = freq
+
         self.batch_size = int(batch_size)
         self.val_ratio = float(val_ratio)
         self.shuffle = bool(shuffle)
@@ -622,33 +469,26 @@ class MultiPartExoDataModule:
 
         self.part_col = part_col
         self.date_col = date_col
-        self.qty_col  = qty_col
+        self.qty_col = qty_col
 
-        # None/빈 리스트도 허용
         self.past_exo_cont_cols = list(past_exo_cont_cols) if past_exo_cont_cols else []
-        self.past_exo_cat_cols  = list(past_exo_cat_cols) if past_exo_cat_cols else []
+        self.past_exo_cat_cols = list(past_exo_cat_cols) if past_exo_cat_cols else []
 
         self.fill_missing = fill_missing
-        self.target_back_weeks = int(target_back_weeks)
-        self.target_back_months = int(target_back_months)
-
         self.future_exo_cb = future_exo_cb
-        self.date_indexer  = date_indexer or (lambda x: x)
+        self.date_indexer = date_indexer or (lambda x: x)
 
         self.cat_indexers: Dict[str, CategoryIndexer] = {}
 
-        # ----- (옵션) 문자열 cat → 정수ID 매핑 생성 & df에 부착 -----
+        # 문자열 카테고리 -> 정수 ID 매핑
         if build_cat_indexer_from:
             for raw_col in build_cat_indexer_from:
                 if raw_col in self.df.columns:
-                    # 문자열 기준으로 indexer 생성
                     idxr = CategoryIndexer.build_from_series(self.df[raw_col])
                     self.cat_indexers[raw_col] = idxr
 
-                    # 타깃 ID 컬럼명 결정 (site_cd -> site_id)
                     target_col = cat_indexer_target_col if cat_indexer_target_col else f"{raw_col}_id"
 
-                    # 정수 ID 컬럼 생성
                     self.df = self.df.with_columns(
                         pl.Series(
                             name=target_col,
@@ -656,15 +496,16 @@ class MultiPartExoDataModule:
                         ).cast(pl.Int32)
                     )
 
-                    # cat exo 목록에 없으면 자동 추가
                     if target_col not in self.past_exo_cat_cols:
                         self.past_exo_cat_cols.append(target_col)
 
         self.train_dataset = None
-        self.val_dataset   = None
+        self.val_dataset = None
 
     def setup(self):
-        # 학습 Dataset
+        # 학습 Dataset 생성
+        # TrainingDataset은 시계열 빈도(freq)와 무관하게
+        # (Lookback+Horizon) 길이의 연속된 윈도우만 있으면 되므로 공용 클래스 사용
         full_dataset = MultiPartExoTrainingDataset(
             self.df, self.lookback, self.horizon,
             part_col=self.part_col,
@@ -674,7 +515,7 @@ class MultiPartExoDataModule:
             past_exo_cat_cols=self.past_exo_cat_cols,
             future_exo_cb=self.future_exo_cb,
             date_indexer=self.date_indexer,
-            cat_indexers=self.cat_indexers,   # 문자열 cat 처리용
+            cat_indexers=self.cat_indexers,
         )
         total_len = len(full_dataset)
         val_len = int(total_len * self.val_ratio)
@@ -702,47 +543,24 @@ class MultiPartExoDataModule:
             drop_last=False
         )
 
-    def get_inference_loader_at_plan(self, plan_dt: int, parts_filter=None):
+    def get_inference_loader_at_plan(self, plan_dt: int):
         """
-        plan_dt: YYYYWW (주모드) 또는 YYYYMM (월모드)
+        plan_dt: 추론 시점 (YYYYMM, YYYYWW, YYYYMMDD, YYYYMMDDHH)
         """
-        if self.is_running:
-            ds = MultiPartExoAnchoredInferenceByYYYYWW(
-                df=self.df,
-                lookback=self.lookback,
-                horizon=self.horizon,
-                plan_yyyyww=int(plan_dt),
-                part_col=self.part_col,
-                date_col=self.date_col,
-                qty_col=self.qty_col,
-                past_exo_cont_cols=self.past_exo_cont_cols,
-                past_exo_cat_cols=self.past_exo_cat_cols,
-                fill_missing=self.fill_missing,
-                target_back_weeks=self.target_back_weeks,
-                future_exo_cb=self.future_exo_cb,
-                date_indexer=self.date_indexer,
-                cat_indexers=self.cat_indexers,
-            )
-        else:
-            ds = MultiPartExoAnchoredInferenceByYYYYMM(
-                df=self.df,
-                lookback=self.lookback,
-                horizon=self.horizon,
-                plan_yyyymm=int(plan_dt),
-                part_col=self.part_col,
-                date_col=self.date_col,
-                qty_col=self.qty_col,
-                past_exo_cont_cols=self.past_exo_cont_cols,
-                past_exo_cat_cols=self.past_exo_cat_cols,
-                fill_missing=self.fill_missing,
-                target_back_months=self.target_back_months,
-                future_exo_cb=self.future_exo_cb,
-                date_indexer=self.date_indexer,
-                cat_indexers=self.cat_indexers,
-            )
-
-        if parts_filter is not None:
-            # 필요시 df를 미리 필터링해서 DataModule을 다시 생성하는 방식을 권장합니다.
-            pass
-
+        ds = MultiPartExoAnchoredInferenceDataset(
+            df=self.df,
+            lookback=self.lookback,
+            horizon=self.horizon,
+            plan_dt=int(plan_dt),
+            freq=self.freq,  # 'monthly', 'weekly', 'daily', 'hourly'
+            part_col=self.part_col,
+            date_col=self.date_col,
+            qty_col=self.qty_col,
+            past_exo_cont_cols=self.past_exo_cont_cols,
+            past_exo_cat_cols=self.past_exo_cat_cols,
+            fill_missing=self.fill_missing,
+            future_exo_cb=self.future_exo_cb,
+            date_indexer=self.date_indexer,
+            cat_indexers=self.cat_indexers,
+        )
         return DataLoader(ds, batch_size=self.batch_size, shuffle=False)

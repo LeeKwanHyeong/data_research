@@ -237,3 +237,52 @@ class DateUtil:
         arr = np.asarray(arr_like, dtype=np.int64)
         s = pd.Series(arr.astype(str)) + "01"  # YYYYMM01
         return pd.to_datetime(s, format="%Y%m%d")
+# ---------- 문자열 날짜 파싱 ----------
+    @staticmethod
+    def parse_to_yyyymmdd(date_str: str) -> int:
+        """
+        '2016-07-01 00:00:00' 또는 '2016-07-01' 같은 문자열을
+        int형 YYYYMMDD (20160701)로 변환
+        """
+        # 공백이나 시간 부분 제거 후 날짜 부분만 추출
+        s = str(date_str).strip().split(' ')[0]  # '2016-07-01'
+        # 구분자 제거
+        for sep in ['-', '.', '/']:
+            s = s.replace(sep, '')
+        return int(s)
+
+    @staticmethod
+    def parse_to_yyyymmddhh(date_str: str) -> int:
+        """
+        '2016-07-01 12:30:00' -> int YYYYMMDDHH (2016070112)
+        """
+        # datetime 객체로 파싱 시도 (다양한 포맷 대응)
+        try:
+            # 일반적인 포맷 시도
+            dt = pd.to_datetime(date_str)
+            return int(dt.strftime('%Y%m%d%H'))
+        except Exception:
+            # 수동 파싱 (fallback)
+            s = str(date_str).strip()
+            # 숫자만 남김
+            for sep in ['-', '.', '/', ':', ' ']:
+                s = s.replace(sep, '')
+            # YYYYMMDDHH (10자리) 까지만 자름
+            return int(s[:10])
+
+    # ---------- 일간/시간 연산 ----------
+    @staticmethod
+    def add_days_yyyymmdd(yyyymmdd: int, days: int) -> int:
+        """YYYYMMDD 정수에 일수 더하기/빼기"""
+        s = str(yyyymmdd)
+        dt = datetime.strptime(s, "%Y%m%d")
+        new_dt = dt + timedelta(days=days)
+        return int(new_dt.strftime("%Y%m%d"))
+
+    @staticmethod
+    def add_hours_yyyymmddhh(yyyymmddhh: int, hours: int) -> int:
+        """YYYYMMDDHH 정수에 시간 더하기/빼기"""
+        s = str(yyyymmddhh)
+        dt = datetime.strptime(s, "%Y%m%d%H")
+        new_dt = dt + timedelta(hours=hours)
+        return int(new_dt.strftime("%Y%m%d%H"))

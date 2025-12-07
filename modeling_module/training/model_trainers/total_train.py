@@ -1,6 +1,6 @@
 from typing import Dict, Tuple, Optional
 from pathlib import Path
-from dataclasses import asdict, is_dataclass
+from dataclasses import asdict, is_dataclass, replace
 
 import numpy as np
 import torch
@@ -10,6 +10,8 @@ from modeling_module.models.PatchMixer.common.configs import (
     PatchMixerConfig,
     PatchMixerConfigWeekly,
 )
+# PatchMixerConfigDaily, Hourly는 별도 클래스 없이 PatchMixerConfig + kwargs로 처리
+
 from modeling_module.models.PatchTST.common.configs import PatchTSTConfig
 from modeling_module.models.Titan.common.configs import TitanConfig
 from modeling_module.models.model_builder import (
@@ -40,23 +42,15 @@ def _get_part_vocab_size_from_loader(loader) -> int:
 
 
 def save_model(model: torch.nn.Module, cfg, path: str) -> None:
-    """
-    통합 ckpt 저장 헬퍼.
-    - model.state_dict()
-    - config(dataclass면 asdict, 아니면 __dict__)
-    - model class name
-    """
     path = str(path)
     state = {
         "model_state": model.state_dict(),
         "model_class": model.__class__.__name__,
     }
-    # config 직렬화
     if cfg is not None:
         if is_dataclass(cfg):
             state["config"] = asdict(cfg)
         else:
-            # dataclass가 아니면, 최대한 안전하게 뽑기
             cfg_dict = getattr(cfg, "__dict__", None)
             if cfg_dict is not None:
                 state["config"] = dict(cfg_dict)
@@ -66,81 +60,77 @@ def save_model(model: torch.nn.Module, cfg, path: str) -> None:
 
 
 def _make_ckpt_path(
-    save_dir: Path,
-    freq: str,          # 'weekly' or 'monthly'
-    model_name: str,    # 'PatchMixerBase', 'TitanLMM', ...
-    lookback: int,
-    horizon: int,
+        save_dir: Path,
+        freq: str,
+        model_name: str,
+        lookback: int,
+        horizon: int,
 ) -> Path:
-    """
-    모델별 ckpt 파일명 생성 헬퍼.
-    예:  <save_dir>/weekly_PatchMixerBase_L72_H36.pt
-    """
     save_dir.mkdir(parents=True, exist_ok=True)
     fname = f"{freq}_{model_name}_L{lookback}_H{horizon}.pt"
     return save_dir / fname
 
 
-from typing import Tuple
-from modeling_module.training.config import (
-    TrainingConfig,
-    StageConfig,
-    SpikeLossConfig,
-)
-
 def _build_common_train_configs(
-    *,
-    device: str,
-    lookback: int,
-    horizon: int,
+        *,
+        device: str,
+        lookback: int,
+        horizon: int,
+        freq: str = 'weekly'
 ) -> Tuple[TrainingConfig, TrainingConfig, SpikeLossConfig, Tuple[StageConfig, StageConfig]]:
-    """
-    주간/월간 공통으로 쓰는 Stage, SpikeLoss, TrainingConfig 생성 헬퍼.
-    필요하면 freq별로 override만 추가해서 사용.
-    """
+    # 주기별 학습률/에폭 튜닝
+    if freq == 'hourly':
+        base_lr = 1e-4
+        warmup_epochs = 20
+        spike_epochs = 50
+    elif freq == 'daily':
+        base_lr = 2e-4
+        warmup_epochs = 30
+        spike_epochs = 70
+    else:  # weekly, monthly
+        base_lr = 3e-4
+        warmup_epochs = 50
+        spike_epochs = 100
 
-    # 1) 2-stage 학습 스케줄 -------------------------
-    # warm-up: spike off, 상대적으로 러닝레이트 높게
+    # 1) 2-stage 학습 스케줄
     stg_warmup = StageConfig(
-        epochs=50,
+        epochs=warmup_epochs,
         spike_enabled=False,
-        lr=3e-4,
+        lr=base_lr,
         use_horizon_decay=False,
     )
 
-    # spike stage: spike loss on, lr 살짝 낮추고 horizon decay 사용
     stg_spike = StageConfig(
-        epochs=100,
+        epochs=spike_epochs,
         spike_enabled=True,
-        lr=1e-4,
+        lr=base_lr / 3,
         use_horizon_decay=True,
         tau_h=0.85,
     )
     stages = (stg_warmup, stg_spike)
 
-    # 2) Spike loss 공통 설정 ------------------------
+    # 2) Spike loss 공통 설정
     spike_cfg = SpikeLossConfig(
         enabled=True,
-        strategy='mix',          # huber + asym을 섞는 방식
+        strategy='mix',
         huber_delta=0.6,
         asym_up_weight=1.0,
-        asym_down_weight=8.0,    # 언더예측 페널티 강화
+        asym_down_weight=8.0,
         mad_k=1.5,
-        w_spike=32.0,            # spike 구간 가중치
-        w_norm=1.0,              # 정상 구간 가중치
+        w_spike=32.0,
+        w_norm=1.0,
         alpha_huber=0.6,
         beta_asym=0.4,
         mix_with_baseline=False,
         gamma_baseline=0.0,
-        # w_cap=12.0,            # 필요 시 cap
     )
 
-    # 3) Point용 공통 TrainingConfig -----------------
+    # 3) Point용 공통 TrainingConfig
     point_train_cfg = TrainingConfig(
         device=device,
         lookback=lookback,
         horizon=horizon,
-        lr=3e-4,
+        lr=base_lr,
         weight_decay=1e-3,
         t_max=40,
         patience=100,
@@ -158,15 +148,15 @@ def _build_common_train_configs(
         max_grad_norm=30.0,
     )
 
-    # 4) Quantile용 공통 TrainingConfig --------------
+    # 4) Quantile용 공통 TrainingConfig
     quantile_train_cfg = TrainingConfig(
         device=device,
         lookback=lookback,
         horizon=horizon,
-        lr=3e-4,
+        lr=base_lr,
         weight_decay=1e-4,
         t_max=40,
-        patience=10,
+        patience=20,
         loss_mode='quantile',
         quantiles=(0.1, 0.5, 0.9),
         use_intermittent=True,
@@ -182,138 +172,117 @@ def _build_common_train_configs(
 
     return point_train_cfg, quantile_train_cfg, spike_cfg, stages
 
-# ===================== WEEKLY =====================
 
-def run_total_train_weekly(
+# ===================== GENERIC RUNNER (통합) =====================
+
+def _run_total_train_generic(
         train_loader,
         val_loader,
-        device: str = 'cuda' if torch.cuda.is_available() else 'mps',
-        *,
+        device: str,
         lookback: int,
         horizon: int,
-        save_dir: Optional[str] = None,   # ← ckpt 저장 루트 디렉토리
+        freq: str,  # 'monthly', 'weekly', 'daily', 'hourly'
+        save_dir: Optional[str]
 ) -> Dict[str, Dict]:
-    """
-    주간 전체 모델(PatchMixer, Titan, PatchTST)을 학습시키고
-    각 결과를 반환. save_dir가 주어지면 ckpt도 함께 저장.
-    """
     save_root = Path(save_dir) if save_dir is not None else None
 
-    # 공통 학습 설정
+    # 1. Config & Exo Callback 설정
     point_train_cfg, quantile_train_cfg, spike_cfg, stages = _build_common_train_configs(
-        device=device, lookback=lookback, horizon=horizon
+        device=device, lookback=lookback, horizon=horizon, freq=freq
     )
 
-    # 주간 캘린더 exogenous (W)
-    future_exo_cb = compose_exo_calendar_cb(date_type='W')
+    # date_type 매핑
+    date_type_map = {'weekly': 'W', 'monthly': 'M', 'daily': 'D', 'hourly': 'H'}
+    dt_char = date_type_map.get(freq, 'W')
+    future_exo_cb = compose_exo_calendar_cb(date_type=dt_char)
+
+    # 2. Exo Dimension 결정 (Sin/Cos 인코딩 기준)
+    # Monthly/Weekly: period=1 (sin, cos) -> 2
+    # Daily: period=2 (dow, doy) -> 4
+    # Hourly: period=2 (hour, hour_of_week) -> 4
+    if freq in ('daily', 'hourly'):
+        exo_dim = 4
+    else:
+        exo_dim = 2
 
     results: Dict[str, Dict] = {}
 
     # --------------------------------------------------
-    # PatchMixer (Weekly)
+    # 1) PatchMixer
     # --------------------------------------------------
-    weekly_exo_dim = 4
-    use_eol = False
+    # 주기별 Patch Len / Stride 추천값
+    if freq == 'hourly':
+        patch_len, stride = 24, 12
+        season_period = 24
+    elif freq == 'daily':
+        patch_len, stride = 14, 7
+        season_period = 7
+    elif freq == 'weekly':
+        patch_len, stride = 12, 8
+        season_period = 52
+    else:  # monthly
+        patch_len, stride = 6, 3
+        season_period = 12
 
-    pm_base_config = PatchMixerConfigWeekly(
+    # Config kwargs 구성
+    pm_kwargs = dict(
         lookback=lookback,
         horizon=horizon,
         device=device,
-        loss_mode='point',
-        point_loss='huber',
-
         enc_in=1,
         d_model=64,
         e_layers=3,
-        patch_len=12,
-        stride=8,
+        patch_len=patch_len,
+        stride=stride,
         f_out=128,
         head_hidden=128,
-        head_dropout=0.05,
-
-        exo_dim=weekly_exo_dim,
+        exo_dim=exo_dim,
         use_part_embedding=True,
         part_vocab_size=_get_part_vocab_size_from_loader(train_loader),
         part_embed_dim=16,
-
         final_nonneg=True,
-        use_eol_prior=use_eol,
-        eol_feature_index=0,
-
-        exo_is_normalized_default=True,
-
-        expander_season_period=52,
-        expander_n_harmonics=16,
+        use_eol_prior=False,
+        exo_is_normalized_default=(freq != 'monthly'),  # 월간만 False 권장
+        expander_season_period=season_period,
+        expander_n_harmonics=min(season_period // 2, 16),
     )
 
-    pm_quantile_config = PatchMixerConfigWeekly(
-        lookback=lookback,
-        horizon=horizon,
-        device=device,
-        loss_mode='quantile',
-        quantiles=(0.1, 0.5, 0.9),
+    # Base
+    pm_base_cfg = PatchMixerConfig(**pm_kwargs, loss_mode='point', point_loss='huber', head_dropout=0.05)
+    pm_base_model = build_patch_mixer_base(pm_base_cfg)
 
-        enc_in=1,
-        d_model=64,
-        e_layers=3,
-        patch_len=12,
-        stride=8,
-        f_out=128,
-        head_hidden=128,
-        head_dropout=0.02,
-
-        exo_dim=weekly_exo_dim,
-        use_part_embedding=True,
-        part_vocab_size=_get_part_vocab_size_from_loader(train_loader),
-        part_embed_dim=16,
-
-        final_nonneg=True,
-        use_eol_prior=use_eol,
-        eol_feature_index=0,
-
-        exo_is_normalized_default=True,
-
-        expander_season_period=52,
-        expander_n_harmonics=8,
-    )
-
-    pm_base_model = build_patch_mixer_base(pm_base_config)
-    pm_quantile_model = build_patch_mixer_quantile(pm_quantile_config)
-
-    print('PatchMixer Base (Weekly)')
+    print(f'PatchMixer Base ({freq.capitalize()})')
     best_pm_base = train_patchmixer(
-        pm_base_model,
-        train_loader,
-        val_loader,
-        train_cfg=point_train_cfg,
-        stages=list(stages),
+        pm_base_model, train_loader, val_loader,
+        train_cfg=point_train_cfg, stages=list(stages),
         future_exo_cb=future_exo_cb,
-        exo_is_normalized=pm_base_config.exo_is_normalized_default,
+        exo_is_normalized=pm_base_cfg.exo_is_normalized_default,
     )
-    if save_root is not None:
-        ckpt_path = _make_ckpt_path(save_root, "weekly", "PatchMixerBase", lookback, horizon)
-        save_model(pm_base_model, pm_base_config, ckpt_path)
+    if save_root:
+        ckpt_path = _make_ckpt_path(save_root, freq, "PatchMixerBase", lookback, horizon)
+        save_model(pm_base_model, pm_base_cfg, ckpt_path)
         best_pm_base["ckpt_path"] = str(ckpt_path)
     results['PatchMixer Base'] = best_pm_base
 
-    print('PatchMixer Quantile (Weekly)')
-    best_pm_quantile = train_patchmixer(
-        pm_quantile_model,
-        train_loader,
-        val_loader,
-        train_cfg=quantile_train_cfg,
-        stages=list(stages),
+    # Quantile
+    pm_q_cfg = PatchMixerConfig(**pm_kwargs, loss_mode='quantile', quantiles=(0.1, 0.5, 0.9), head_dropout=0.02)
+    pm_q_model = build_patch_mixer_quantile(pm_q_cfg)
+
+    print(f'PatchMixer Quantile ({freq.capitalize()})')
+    best_pm_q = train_patchmixer(
+        pm_q_model, train_loader, val_loader,
+        train_cfg=quantile_train_cfg, stages=list(stages),
         future_exo_cb=future_exo_cb,
-        exo_is_normalized=pm_quantile_config.exo_is_normalized_default,
+        exo_is_normalized=pm_q_cfg.exo_is_normalized_default,
     )
-    if save_root is not None:
-        ckpt_path = _make_ckpt_path(save_root, "weekly", "PatchMixerQuantile", lookback, horizon)
-        save_model(pm_quantile_model, pm_quantile_config, ckpt_path)
-        best_pm_quantile["ckpt_path"] = str(ckpt_path)
-    results['PatchMixer Quantile'] = best_pm_quantile
+    if save_root:
+        ckpt_path = _make_ckpt_path(save_root, freq, "PatchMixerQuantile", lookback, horizon)
+        save_model(pm_q_model, pm_q_cfg, ckpt_path)
+        best_pm_q["ckpt_path"] = str(ckpt_path)
+    results['PatchMixer Quantile'] = best_pm_q
 
     # --------------------------------------------------
-    # Titan (Weekly)
+    # 2) Titan
     # --------------------------------------------------
     ti_config = TitanConfig(
         lookback=lookback,
@@ -327,394 +296,129 @@ def run_total_train_weekly(
         contextual_mem_size=256,
         persistent_mem_size=64,
         use_exogenous=True,
-        exo_dim=2,  # 주간 calendar sin/cos
+        exo_dim=exo_dim,
         final_clamp_nonneg=True,
-        use_revin = True,
-        revin_use_std = True,
+        use_revin=True,
+        revin_use_std=True,
         revin_subtract_last=False,
         revin_affine=True,
-        use_lmm = False
+        use_lmm=False
     )
+    if freq == 'hourly':
+        ti_config.contextual_mem_size = 512
 
+    # Titan Base
     ti_base = build_titan_base(ti_config)
-    ti_lmm = build_titan_lmm(ti_config)
-    ti_seq2seq = build_titan_seq2seq(ti_config)
-
-    print('Titan Base (Weekly)')
+    print(f'Titan Base ({freq.capitalize()})')
     best_ti_base = train_titan(
-        ti_base,
-        train_loader,
-        val_loader,
-        train_cfg=point_train_cfg,
-        stages=list(stages),
+        ti_base, train_loader, val_loader,
+        train_cfg=point_train_cfg, stages=list(stages),
         future_exo_cb=future_exo_cb,
     )
-    if save_root is not None:
-        ckpt_path = _make_ckpt_path(save_root, "weekly", "TitanBase", lookback, horizon)
+    if save_root:
+        ckpt_path = _make_ckpt_path(save_root, freq, "TitanBase", lookback, horizon)
         save_model(ti_base, ti_config, ckpt_path)
         best_ti_base["ckpt_path"] = str(ckpt_path)
     results['Titan Base'] = best_ti_base
 
-    print('Titan LMM (Weekly)')
+    # Titan LMM
+    ti_config_lmm = replace(ti_config, use_lmm=True)
+    ti_lmm = build_titan_lmm(ti_config_lmm)
+    print(f'Titan LMM ({freq.capitalize()})')
     best_ti_lmm = train_titan(
-        ti_lmm,
-        train_loader,
-        val_loader,
-        train_cfg=point_train_cfg,
-        stages=list(stages),
+        ti_lmm, train_loader, val_loader,
+        train_cfg=point_train_cfg, stages=list(stages),
         future_exo_cb=future_exo_cb,
     )
-    if save_root is not None:
-        ckpt_path = _make_ckpt_path(save_root, "weekly", "TitanLMM", lookback, horizon)
-        save_model(ti_lmm, ti_config, ckpt_path)
+    if save_root:
+        ckpt_path = _make_ckpt_path(save_root, freq, "TitanLMM", lookback, horizon)
+        save_model(ti_lmm, ti_config_lmm, ckpt_path)
         best_ti_lmm["ckpt_path"] = str(ckpt_path)
     results['Titan LMM'] = best_ti_lmm
 
-    print('Titan Seq2Seq (Weekly)')
-    best_ti_seq2seq = train_titan(
-        ti_seq2seq,
-        train_loader,
-        val_loader,
-        train_cfg=point_train_cfg,
-        stages=list(stages),
+    # Titan Seq2Seq
+    ti_seq2seq = build_titan_seq2seq(ti_config)
+    print(f'Titan Seq2Seq ({freq.capitalize()})')
+    best_ti_s2s = train_titan(
+        ti_seq2seq, train_loader, val_loader,
+        train_cfg=point_train_cfg, stages=list(stages),
         future_exo_cb=future_exo_cb,
     )
-    if save_root is not None:
-        ckpt_path = _make_ckpt_path(save_root, "weekly", "TitanSeq2Seq", lookback, horizon)
+    if save_root:
+        ckpt_path = _make_ckpt_path(save_root, freq, "TitanSeq2Seq", lookback, horizon)
         save_model(ti_seq2seq, ti_config, ckpt_path)
-        best_ti_seq2seq["ckpt_path"] = str(ckpt_path)
-    results['Titan Seq2Seq'] = best_ti_seq2seq
+        best_ti_s2s["ckpt_path"] = str(ckpt_path)
+    results['Titan Seq2Seq'] = best_ti_s2s
 
     # --------------------------------------------------
-    # PatchTST (Weekly)
+    # 3) PatchTST
     # --------------------------------------------------
-    print('PatchTST Base (Weekly)')
-    pt_point_config = PatchTSTConfig(
+    pt_kwargs = dict(
         device=device,
         lookback=lookback,
         horizon=horizon,
-        loss_mode='point',
-        point_loss='huber',
         c_in=1,
         d_model=256,
         n_layers=3,
-        patch_len=16,
-        stride=8,
+        patch_len=patch_len,
+        stride=stride,
     )
-    pt_base = build_patchTST_base(pt_point_config)
 
-    pt_quantile_config = PatchTSTConfig(
-        device=device,
-        lookback=lookback,
-        horizon=horizon,
-        loss_mode='quantile',
-        quantiles=(0.1, 0.5, 0.9),
-        c_in=1,
-        d_model=256,
-        n_layers=3,
-        patch_len=16,
-        stride=8,
-    )
-    pt_quantile = build_patchTST_quantile(pt_quantile_config)
+    pt_base_cfg = PatchTSTConfig(**pt_kwargs, loss_mode='point', point_loss='huber')
+    pt_base = build_patchTST_base(pt_base_cfg)
 
+    print(f'PatchTST Base ({freq.capitalize()})')
     best_pt_base = train_patchtst(
-        pt_base,
-        train_loader,
-        val_loader,
-        train_cfg=point_train_cfg,
-        stages=list(stages),
+        pt_base, train_loader, val_loader,
+        train_cfg=point_train_cfg, stages=list(stages),
         future_exo_cb=future_exo_cb,
     )
-    if save_root is not None:
-        ckpt_path = _make_ckpt_path(save_root, "weekly", "PatchTSTBase", lookback, horizon)
-        save_model(pt_base, pt_point_config, ckpt_path)
+    if save_root:
+        ckpt_path = _make_ckpt_path(save_root, freq, "PatchTSTBase", lookback, horizon)
+        save_model(pt_base, pt_base_cfg, ckpt_path)
         best_pt_base["ckpt_path"] = str(ckpt_path)
     results['PatchTST Base'] = best_pt_base
 
-    print('PatchTST Quantile (Weekly)')
-    best_pt_quantile = train_patchtst(
-        pt_quantile,
-        train_loader,
-        val_loader,
-        train_cfg=quantile_train_cfg,
-        stages=list(stages),
+    pt_q_cfg = PatchTSTConfig(**pt_kwargs, loss_mode='quantile', quantiles=(0.1, 0.5, 0.9))
+    pt_q = build_patchTST_quantile(pt_q_cfg)
+
+    print(f'PatchTST Quantile ({freq.capitalize()})')
+    best_pt_q = train_patchtst(
+        pt_q, train_loader, val_loader,
+        train_cfg=quantile_train_cfg, stages=list(stages),
         future_exo_cb=future_exo_cb,
         exo_is_normalized=True,
     )
-    if save_root is not None:
-        ckpt_path = _make_ckpt_path(save_root, "weekly", "PatchTSTQuantile", lookback, horizon)
-        save_model(pt_quantile, pt_quantile_config, ckpt_path)
-        best_pt_quantile["ckpt_path"] = str(ckpt_path)
-    results['PatchTST Quantile'] = best_pt_quantile
+    if save_root:
+        ckpt_path = _make_ckpt_path(save_root, freq, "PatchTSTQuantile", lookback, horizon)
+        save_model(pt_q, pt_q_cfg, ckpt_path)
+        best_pt_q["ckpt_path"] = str(ckpt_path)
+    results['PatchTST Quantile'] = best_pt_q
 
     return results
 
 
-# ===================== MONTHLY =====================
+# ===================== EXPORTED FUNCTIONS =====================
 
-def run_total_train_monthly(
-        train_loader,
-        val_loader,
-        device: str = 'cuda' if torch.cuda.is_available() else 'mps',
-        *,
-        lookback: int,
-        horizon: int,
-        save_dir: Optional[str] = None,
-) -> Dict[str, Dict]:
-    """
-    월간 전체 모델(PatchMixer, Titan, PatchTST)을 학습시키고 결과 반환.
-    save_dir가 주어지면 ckpt 저장.
-    """
-    save_root = Path(save_dir) if save_dir is not None else None
-
-    # 공통 학습 설정
-    point_train_cfg, quantile_train_cfg, spike_cfg, stages = _build_common_train_configs(
-        device=device, lookback=lookback, horizon=horizon
-    )
-
-    # 월간 캘린더 exogenous (M)
-    future_exo_cb = compose_exo_calendar_cb(date_type='M')
-
-    results: Dict[str, Dict] = {}
-
-    # --------------------------------------------------
-    # PatchMixer (Monthly)
-    # --------------------------------------------------
-    monthly_exo_dim = 2
-    use_eol = False
-
-    pm_base_config = PatchMixerConfigMonthly(
-        lookback=lookback,
-        horizon=horizon,
-        device=device,
-        loss_mode='point',
-        point_loss='mae',  # 월간은 scale 변동이 커서 MAE가 안정적인 편
-
-        enc_in=1,
-        d_model=64,
-        e_layers=3,
-        patch_len=6,
-        stride=3,
-        f_out=128,
-        head_hidden=128,
-        head_dropout=0.02,
-
-        exo_dim=monthly_exo_dim,
-        use_part_embedding=True,
-        part_vocab_size=_get_part_vocab_size_from_loader(train_loader),
-        part_embed_dim=16,
-
-        final_nonneg=True,
-        use_eol_prior=use_eol,
-        eol_feature_index=0,
-
-        exo_is_normalized_default=False,  # 월간은 역정규화 후 가산 권장
-
-        expander_season_period=12,
-        expander_n_harmonics=6,
-    )
-
-    pm_quantile_config = PatchMixerConfigMonthly(
-        lookback=lookback,
-        horizon=horizon,
-        device=device,
-        loss_mode='quantile',
-        quantiles=(0.1, 0.5, 0.9),
-
-        enc_in=1,
-        d_model=64,
-        e_layers=3,
-        patch_len=6,
-        stride=3,
-        f_out=128,
-        head_hidden=128,
-        head_dropout=0.02,
-
-        exo_dim=monthly_exo_dim,
-        use_part_embedding=True,
-        part_vocab_size=_get_part_vocab_size_from_loader(train_loader),
-        part_embed_dim=16,
-
-        final_nonneg=True,
-        use_eol_prior=use_eol,
-        eol_feature_index=0,
-
-        exo_is_normalized_default=False,
-
-        expander_season_period=12,
-        expander_n_harmonics=6,
-    )
-
-    pm_base_model = build_patch_mixer_base(pm_base_config)
-    pm_quantile_model = build_patch_mixer_quantile(pm_quantile_config)
-
-    print('PatchMixer Base (Monthly)')
-    best_pm_base = train_patchmixer(
-        pm_base_model,
-        train_loader,
-        val_loader,
-        train_cfg=point_train_cfg,
-        stages=list(stages),
-        future_exo_cb=future_exo_cb,
-        exo_is_normalized=pm_base_config.exo_is_normalized_default,
-    )
-    if save_root is not None:
-        ckpt_path = _make_ckpt_path(save_root, "monthly", "PatchMixerBase", lookback, horizon)
-        save_model(pm_base_model, pm_base_config, ckpt_path)
-        best_pm_base["ckpt_path"] = str(ckpt_path)
-    results['PatchMixer Base'] = best_pm_base
-
-    print('PatchMixer Quantile (Monthly)')
-    best_pm_quantile = train_patchmixer(
-        pm_quantile_model,
-        train_loader,
-        val_loader,
-        train_cfg=quantile_train_cfg,
-        stages=list(stages),
-        future_exo_cb=future_exo_cb,
-        exo_is_normalized=pm_quantile_config.exo_is_normalized_default,
-    )
-    if save_root is not None:
-        ckpt_path = _make_ckpt_path(save_root, "monthly", "PatchMixerQuantile", lookback, horizon)
-        save_model(pm_quantile_model, pm_quantile_config, ckpt_path)
-        best_pm_quantile["ckpt_path"] = str(ckpt_path)
-    results['PatchMixer Quantile'] = best_pm_quantile
-
-    # --------------------------------------------------
-    # Titan (Monthly)
-    # --------------------------------------------------
-    ti_m_config = TitanConfig(
-        lookback=lookback,
-        horizon=horizon,
-        input_dim=1,
-        d_model=256,
-        n_layers=3,
-        n_heads=4,
-        d_ff=512,
-        dropout=0.1,
-        contextual_mem_size=256,
-        persistent_mem_size=64,
-        use_exogenous=True,
-        exo_dim=2,  # 월간 calendar sin/cos
-        final_clamp_nonneg=True,
-    )
-
-    ti_base_m = build_titan_base(ti_m_config)
-    ti_lmm_m = build_titan_lmm(ti_m_config)
-    ti_seq2seq_m = build_titan_seq2seq(ti_m_config)
-
-    print('Titan Base (Monthly)')
-    best_ti_base_m = train_titan(
-        ti_base_m,
-        train_loader,
-        val_loader,
-        train_cfg=point_train_cfg,
-        stages=list(stages),
-        future_exo_cb=future_exo_cb,
-    )
-    if save_root is not None:
-        ckpt_path = _make_ckpt_path(save_root, "monthly", "TitanBase", lookback, horizon)
-        save_model(ti_base_m, ti_m_config, ckpt_path)
-        best_ti_base_m["ckpt_path"] = str(ckpt_path)
-    results['Titan Base'] = best_ti_base_m
-
-    print('Titan LMM (Monthly)')
-    best_ti_lmm_m = train_titan(
-        ti_lmm_m,
-        train_loader,
-        val_loader,
-        train_cfg=point_train_cfg,
-        stages=list(stages),
-        future_exo_cb=future_exo_cb,
-    )
-    if save_root is not None:
-        ckpt_path = _make_ckpt_path(save_root, "monthly", "TitanLMM", lookback, horizon)
-        save_model(ti_lmm_m, ti_m_config, ckpt_path)
-        best_ti_lmm_m["ckpt_path"] = str(ckpt_path)
-    results['Titan LMM'] = best_ti_lmm_m
-
-    print('Titan Seq2Seq (Monthly)')
-    best_ti_seq2seq_m = train_titan(
-        ti_seq2seq_m,
-        train_loader,
-        val_loader,
-        train_cfg=point_train_cfg,
-        stages=list(stages),
-        future_exo_cb=future_exo_cb,
-    )
-    if save_root is not None:
-        ckpt_path = _make_ckpt_path(save_root, "monthly", "TitanSeq2Seq", lookback, horizon)
-        save_model(ti_seq2seq_m, ti_m_config, ckpt_path)
-        best_ti_seq2seq_m["ckpt_path"] = str(ckpt_path)
-    results['Titan Seq2Seq'] = best_ti_seq2seq_m
-
-    # --------------------------------------------------
-    # PatchTST (Monthly)
-    # --------------------------------------------------
-    print('PatchTST Base (Monthly)')
-    pt_point_config_m = PatchTSTConfig(
-        device=device,
-        lookback=lookback,
-        horizon=horizon,
-        loss_mode='point',
-        point_loss='huber',
-        c_in=1,
-        d_model=256,
-        n_layers=3,
-        patch_len=6,
-        stride=3,
-    )
-    pt_base_m = build_patchTST_base(pt_point_config_m)
-
-    pt_quantile_config_m = PatchTSTConfig(
-        device=device,
-        lookback=lookback,
-        horizon=horizon,
-        loss_mode='quantile',
-        quantiles=(0.1, 0.5, 0.9),
-        c_in=1,
-        d_model=256,
-        n_layers=3,
-        patch_len=6,
-        stride=3,
-    )
-    pt_quantile_m = build_patchTST_quantile(pt_quantile_config_m)
-
-    best_pt_base_m = train_patchtst(
-        pt_base_m,
-        train_loader,
-        val_loader,
-        train_cfg=point_train_cfg,
-        stages=list(stages),
-        future_exo_cb=future_exo_cb,
-    )
-    if save_root is not None:
-        ckpt_path = _make_ckpt_path(save_root, "monthly", "PatchTSTBase", lookback, horizon)
-        save_model(pt_base_m, pt_point_config_m, ckpt_path)
-        best_pt_base_m["ckpt_path"] = str(ckpt_path)
-    results['PatchTST Base'] = best_pt_base_m
-
-    print('PatchTST Quantile (Monthly)')
-    best_pt_quantile_m = train_patchtst(
-        pt_quantile_m,
-        train_loader,
-        val_loader,
-        train_cfg=quantile_train_cfg,
-        stages=list(stages),
-        future_exo_cb=future_exo_cb,
-        exo_is_normalized=True,
-    )
-    if save_root is not None:
-        ckpt_path = _make_ckpt_path(save_root, "monthly", "PatchTSTQuantile", lookback, horizon)
-        save_model(pt_quantile_m, pt_quantile_config_m, ckpt_path)
-        best_pt_quantile_m["ckpt_path"] = str(ckpt_path)
-    results['PatchTST Quantile'] = best_pt_quantile_m
-
-    return results
+def run_total_train_weekly(train_loader, val_loader, device='cuda' if torch.cuda.is_available() else 'cpu', *, lookback,
+                           horizon, save_dir=None):
+    return _run_total_train_generic(train_loader, val_loader, device, lookback, horizon, 'weekly', save_dir)
 
 
+def run_total_train_monthly(train_loader, val_loader, device='cuda' if torch.cuda.is_available() else 'cpu', *,
+                            lookback, horizon, save_dir=None):
+    return _run_total_train_generic(train_loader, val_loader, device, lookback, horizon, 'monthly', save_dir)
 
-# ===================== METRIC SUMMARY =====================
+
+def run_total_train_daily(train_loader, val_loader, device='cuda' if torch.cuda.is_available() else 'cpu', *, lookback,
+                          horizon, save_dir=None):
+    return _run_total_train_generic(train_loader, val_loader, device, lookback, horizon, 'daily', save_dir)
+
+
+def run_total_train_hourly(train_loader, val_loader, device='cuda' if torch.cuda.is_available() else 'cpu', *, lookback,
+                           horizon, save_dir=None):
+    return _run_total_train_generic(train_loader, val_loader, device, lookback, horizon, 'hourly', save_dir)
+
 
 def summarize_metrics(results: Dict[str, Dict[str, np.ndarray]]) -> Dict[str, Dict[str, float]]:
     table: Dict[str, Dict[str, float]] = {}
@@ -727,14 +431,10 @@ def summarize_metrics(results: Dict[str, Dict[str, np.ndarray]]) -> Dict[str, Di
             'RMSE': rmse(y, yhat),
             'SMAPE': smape(y, yhat),
         }
-
-        # q_pred가 dict 형태 {0.1: ..., 0.5: ..., 0.9: ...}일 때만 구간지표 계산
         if res.get('q_pred') is not None and 0.1 in res['q_pred'] and 0.9 in res['q_pred']:
             result = quantile_metrics(y, yhat)
             row['converage_per_q'] = result['coverage_per_q']
             row['i80_cov'] = result['i80_cov']
             row['i80_wid'] = result['i80_wid']
-
         table[name] = row
-
     return table
