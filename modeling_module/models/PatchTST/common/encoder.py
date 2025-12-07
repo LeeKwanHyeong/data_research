@@ -47,16 +47,19 @@ class TSTEncoderLayer(nn.Module):
             Transpose(1, 2)
         ) if 'batch' in norm.lower() else nn.LayerNorm(d_model))
 
-    # === ENSURE: TSTEncoderLayer.forward ===
     def forward(self, src, prev_logits=None, attn_mask=None):
-        # src: [B,L,d_model] (L 가변)
-        x = self.norm1(src) if self.pre_norm else src
-        out, attn, logits = self.mha(x, attn_mask=attn_mask, prev_logits=prev_logits)  # [B,L,d_model]
-        if self.store_attn: self.attn = attn
-        src = src + self.dropout_attn(out)  # L 동일 → 안전
+        # src: [B,L,d_model]
+        # 수정: self.norm1 -> self.norm_attn
+        x = self.norm_attn(src) if self.pre_norm else src
 
-        y = self.norm2(src) if self.pre_norm else src
-        y = self.ff(y)  # [B,L,d_model]
+        out, attn, logits = self.mha(x, attn_mask=attn_mask, prev_logits=prev_logits)
+        if self.store_attn: self.attn = attn
+
+        src = src + self.dropout_attn(out)
+
+        # 수정: self.norm2 -> self.norm_ffn
+        y = self.norm_ffn(src) if self.pre_norm else src
+        y = self.ff(y)
         out = src + y
         return out, logits
 

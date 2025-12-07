@@ -41,21 +41,30 @@ class PatchBackboneBase(nn.Module):
         입력: x [B, C, L]
         출력: z [B, L_patch, d_model]
         """
-        # z = self.patch_proj(x)  # [B, d_model, L_patch]
-        # z = z.transpose(1, 2).contiguous()  # [B, L_patch, d_model]
-        #
-        # # positional encoding 직접 더하기
-        # z = z + self.pos_enc[: z.size(1), :].unsqueeze(0)
-        # if self.pos_enc.shape !=
-        # return z
-        z = self.patch_proj(x).transpose(1, 2).contiguous()  # [B, L_patch, d_model]
+        # 1) Convolution (Patching)
+        # padding_patch 처리는 do_patch 유틸을 쓰거나 여기서 처리해야 함.
+        # PatchTST는 보통 unfold 대신 Conv1d(stride)를 써서 패칭과 임베딩을 동시에 함.
+
+        # 만약 입력 길이 L이 stride로 나누어 떨어지지 않거나 패딩이 필요하다면
+        # Conv1d가 알아서 처리하지 않으므로 사전에 패딩이 필요할 수 있음.
+        # 여기서는 단순하게 Conv1d 결과 사용
+
+        z = self.patch_proj(x)  # [B, d_model, L_patch]
+        z = z.transpose(1, 2)  # [B, L_patch, d_model]
+
+        # 2) Positional Encoding 더하기
+        # 현재 배치의 패치 개수(L_patch)에 맞춰 PE 슬라이싱
         B, L_patch, D = z.shape
 
-        # 기존 pos_enc 대신, 매 호출마다 L_patch 맞춰 생성
-        pos_enc = self.pos_enc[:L_patch, :].unsqueeze(0).to(z.device)
-        if pos_enc.shape[1] != L_patch:
-            # 새 positional encoding 생성
-            pos_enc = PositionalEncoding(L_patch, D).to(z.device)
+        # self.pos_enc는 [Max_Len, D] 형태라고 가정
+        if self.pos_enc.size(0) < L_patch:
+            # 미리 생성된 PE보다 긴 시퀀스가 들어오면 새로 생성 (동적 대응)
+            new_pe = PositionalEncoding(L_patch, D).to(z.device)
+            # 학습 파라미터가 아니라면 바로 사용 가능, 학습 파라미터라면 문제될 수 있음
+            # (PatchTST는 보통 SinCos 고정 PE를 쓰므로 새로 생성해도 무방)
+            z = z + new_pe.unsqueeze(0)
+        else:
+            # 길이만큼 잘라서 사용
+            z = z + self.pos_enc[:L_patch, :].unsqueeze(0)
 
-        z = z + pos_enc
         return z
