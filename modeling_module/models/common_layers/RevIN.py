@@ -41,16 +41,16 @@ class RevIN(nn.Module):
         else:
             raise NotImplementedError(f"RevIN mode must be 'norm' or 'denorm', got {mode}")
 
-
     def _compute_stats(self, x: torch.Tensor):
         # x: [B, L, C]
         if self.subtract_last:
             self.last = x[:, -1:, :]
         else:
-            self.mean = x.mean(dim=(1, 0), keepdim=True) # keep buffers shaped [1,1,C]
-        # 위 줄은 전체 배치 평균으로 잡는 간단 버전. 필요 시 per-batch로 조정 가능.
-        # 표준편차는 per-batch, per-channel 기준으로 계산(간단 버전)
-        var = x.var(dim=(0, 1), keepdim=True, unbiased=False) # [1,1,C]
+            # 수정: dim=(1, 0) -> dim=1 (시간 축 기준 평균)
+            self.mean = x.mean(dim=1, keepdim=True).detach()
+
+            # 수정: dim=(0, 1) -> dim=1 (시간 축 기준 분산)
+        var = x.var(dim=1, keepdim=True, unbiased=False).detach()
         self.std = torch.sqrt(var + self.eps)
 
 
