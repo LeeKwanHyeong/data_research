@@ -274,7 +274,8 @@ class BaseModel(nn.Module):
             x_in = x
 
         # 1) RevIN + Backbone
-        x_n = self.revin(x_in, 'norm')
+        # x_n = self.revin(x_in, 'norm')
+        x_n = x_in
         z = self.backbone(x_n)  # [B, D_eff]
 
         # z 정합(동적 변화 대비)
@@ -366,7 +367,7 @@ class BaseModel(nn.Module):
         y  = y + self.dw_gain * yc
 
         # 10) 역정규화 + (필요 시) 원단위 exogenous 가산
-        y = self.revin(y.unsqueeze(-1), 'denorm').squeeze(-1)
+        # y = self.revin(y.unsqueeze(-1), 'denorm').squeeze(-1)
         if (ex is not None) and (not exo_is_normalized):
             y = y + ex
 

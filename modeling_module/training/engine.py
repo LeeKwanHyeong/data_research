@@ -257,6 +257,14 @@ class CommonTrainer:
                         self.logger("[Warn] NaN loss. step skipped.")
                         continue
                     self.scaler.scale(loss_t).backward()
+
+                    # with torch.no_grad():
+                    #     total_norm = 0.0
+                    #     for name, p in model.named_parameters():
+                    #         if p.grad is not None:
+                    #             total_norm += p.grad.abs().mean().item()
+                    #     print(f"[DEBUG] grad mean abs = {total_norm:.6f}")
+
                     self.scaler.unscale_(self.opt)
                     torch.nn.utils.clip_grad_norm_(model.parameters(), self.cfg.max_grad_norm)
                     self.scaler.step(self.opt)

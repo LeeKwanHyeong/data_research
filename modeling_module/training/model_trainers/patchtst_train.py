@@ -80,7 +80,8 @@ def train_patchtst(
             future_exo_cb=future_exo_cb or calendar_sin_cos,  # 주/월 sin-cos 자동 주입
             logger=print,
             autocast_input=autocast_input,
-            extra_loss_fn=make_pspa_fn()
+            # extra_loss_fn=make_pspa_fn()
+            extra_loss_fn=None
         )
         model = trainer.fit(model, train_loader, val_loader, tta_steps=0)
         best = {"model": model, "cfg": cfg_i}

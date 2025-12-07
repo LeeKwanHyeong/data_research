@@ -125,7 +125,8 @@ def train_titan(
             future_exo_cb=future_exo_cb,
             logger=print,
             autocast_input=autocast_input,
-            extra_loss_fn=make_pspa_fn()
+            # extra_loss_fn=make_pspa_fn()
+            extra_loss_fn = None
         )
         model = trainer.fit(model, tl_i, val_loader, tta_steps=2)
         best = {"model": model, "cfg": cfg_i}

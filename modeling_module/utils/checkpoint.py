@@ -1,6 +1,8 @@
 # model_io.py
 import os
 import json
+from typing import Dict
+
 import torch
 from dataclasses import asdict, is_dataclass
 
@@ -89,15 +91,6 @@ def save_json_config(cfg, path: str):
     print(f"[save] config saved to: {path}")
 
 
-# ------------------------------------------------------------------
-# 2. 새로운 로더 (Jupyter / inference 에서 사용)
-#    - builders: {"titan_base": lambda cfg: build_titan_base(cfg), ...}
-#    - strict=True 로 설정하면, 키/shape 틀리면 바로 RuntimeError
-# ------------------------------------------------------------------
-import os
-import torch
-from typing import Dict
-
 def load_model_dict(save_dir: str, builders: Dict[str, callable], device="cpu", strict: bool = False):
     """
     - save_dir: 각 모델이 `{name}.pt` 형식으로 저장된 디렉터리
@@ -115,21 +108,52 @@ def load_model_dict(save_dir: str, builders: Dict[str, callable], device="cpu", 
         print(f"[load] {name} ← {path}")
         ckpt = torch.load(path, map_location="cpu")
 
-        # ★ 여기서 config 꺼내서 builder에 넘겨줌
+        # -----------------------------
+        # 1) config 복원
+        # -----------------------------
+        # 새 포맷: "cfg"에 그대로 객체가 들어있는 경우
         cfg_obj = ckpt.get("cfg", None)
 
-        # ★ 꼭 build_fn(cfg_obj)로 '호출'해야 함
+        # 구 포맷: "config" 키만 있는 경우
+        if cfg_obj is None and "config" in ckpt:
+            cfg_obj = ckpt["config"]
+
+        # (추가로 cfg_state/cfg_cls 포맷을 쓰고 싶다면 여기서 처리해도 됨)
+        # if cfg_obj is None:
+        #     cfg_state = ckpt.get("cfg_state", None)
+        #     cfg_cls = ckpt.get("cfg_cls", None)
+        #     ... _rebuild_XXX(cfg_state) ...
+
+        # config 정보를 끝까지 못 찾으면 바로 에러
+        if cfg_obj is None:
+            raise ValueError(
+                f"[load_model_dict] No config info found in {path}. "
+                f"keys={list(ckpt.keys())}"
+            )
+        print(cfg_obj)
+
+        # builder에 config 객체 그대로 전달 (사무실에서 쓰시던 방식 그대로)
         model = build_fn(cfg_obj)
 
-        # 혹시라도 builder가 모델이 아닌 걸 반환하면 방어
         if not isinstance(model, torch.nn.Module):
             raise TypeError(
                 f"builder for '{name}' must return nn.Module, got {type(model)}. "
                 f"확인: build_fn={build_fn}"
             )
 
-        # state_dict 로드
-        sd = ckpt["state_dict"]
+        # -----------------------------
+        # 2) state_dict 복원 (새/구 포맷 모두 지원)
+        # -----------------------------
+        if "state_dict" in ckpt:
+            sd = ckpt["state_dict"]      # 새로운 포맷
+        elif "model_state" in ckpt:
+            sd = ckpt["model_state"]     # 사무실에서 쓰던 옛 포맷
+        else:
+            raise ValueError(
+                f"[load_model_dict] No state_dict/model_state found in {path}. "
+                f"keys={list(ckpt.keys())}"
+            )
+
         try:
             model.load_state_dict(sd, strict=strict)
         except RuntimeError as e:
@@ -139,6 +163,7 @@ def load_model_dict(save_dir: str, builders: Dict[str, callable], device="cpu", 
             skipped = []
             for k, v in sd.items():
                 if k not in own:
+                    skipped.append((k, v.shape, None))
                     continue
                 if own[k].shape != v.shape:
                     skipped.append((k, v.shape, own[k].shape))

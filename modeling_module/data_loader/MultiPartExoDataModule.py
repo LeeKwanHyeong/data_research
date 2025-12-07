@@ -593,7 +593,7 @@ class MultiPartExoDataModule:
         horizon: int,
         *,
         is_running: bool,  # True: 주(YYYYWW), False: 월(YYYYMM)
-        batch_size: int = 64,
+        batch_size: int = 32,
         val_ratio: float = 0.2,
         shuffle: bool = False,
         seed: int = 42,

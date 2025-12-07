@@ -56,13 +56,8 @@ class TitanDecoderLayer(nn.Module):
         return out
 
 
+# decoder.py
 class TitanDecoder(nn.Module):
-    """
-    Titan용 Causal Transformer 디코더 스택
-    - query_embed + pos_embed를 초기 입력으로 사용
-    - (선택) 미래 exogenous를 proj하여 입력에 더함
-    """
-
     def __init__(self,
                  d_model: int,
                  n_layers: int = 2,
@@ -75,8 +70,14 @@ class TitanDecoder(nn.Module):
         super().__init__()
         self.horizon = horizon
         self.exo_dim = exo_dim
+
+        # 기존 임베딩
         self.query_embed = nn.Parameter(torch.randn(1, horizon, d_model) * 0.02)
         self.pos_embed = nn.Parameter(torch.randn(1, horizon, d_model) * 0.02)
+
+        # [수정 1] 여기에 이 줄을 꼭 추가해야 합니다!
+        self.enc_last_proj = nn.Linear(d_model, d_model)
+
         self.exo_proj = nn.Linear(exo_dim, d_model) if exo_dim > 0 else None
         self.layers = nn.ModuleList([
             TitanDecoderLayer(d_model, n_heads, d_ff, dropout, causal)
@@ -88,11 +89,63 @@ class TitanDecoder(nn.Module):
         B, L, D = memory.shape
         H = self.horizon
 
-        tgt = self.query_embed.expand(B, H, D) + self.pos_embed.expand(B, H, D)
+        # [수정 2] forward 로직 (작성하신 대로 유지)
+        enc_last = memory[:, -1:, :]  # [B, 1, D]
+
+        # __init__에 정의가 되어 있어야 아래 줄이 실행됩니다.
+        enc_last_emb = self.enc_last_proj(enc_last).expand(B, H, D)
+
+        tgt = self.query_embed.expand(B, H, D) + self.pos_embed.expand(B, H, D) + enc_last_emb
+
         if (self.exo_proj is not None) and (future_exo is not None):
             tgt = tgt + self.exo_proj(future_exo)  # [B, H, D]
 
         x = tgt
         for layer in self.layers:
             x = layer(x, memory)
-        return x  # [B, H, D]
+        return x
+
+# class TitanDecoder(nn.Module):
+#     """
+#     Titan용 Causal Transformer 디코더 스택
+#     - query_embed + pos_embed를 초기 입력으로 사용
+#     - (선택) 미래 exogenous를 proj하여 입력에 더함
+#     """
+#
+#     def __init__(self,
+#                  d_model: int,
+#                  n_layers: int = 2,
+#                  n_heads: int = 4,
+#                  d_ff: int = 512,
+#                  dropout: float = 0.1,
+#                  horizon: int = 60,
+#                  exo_dim: int = 0,
+#                  causal: bool = True):
+#         super().__init__()
+#         self.horizon = horizon
+#         self.exo_dim = exo_dim
+#         self.query_embed = nn.Parameter(torch.randn(1, horizon, d_model) * 0.02)
+#         self.pos_embed = nn.Parameter(torch.randn(1, horizon, d_model) * 0.02)
+#         self.exo_proj = nn.Linear(exo_dim, d_model) if exo_dim > 0 else None
+#         self.layers = nn.ModuleList([
+#             TitanDecoderLayer(d_model, n_heads, d_ff, dropout, causal)
+#             for _ in range(n_layers)
+#         ])
+#
+#     def forward(self, memory: torch.Tensor, future_exo: torch.Tensor | None = None) -> torch.Tensor:
+#         # memory: [B, L, D]
+#         B, L, D = memory.shape
+#         H = self.horizon
+#
+#         # #
+#         enc_last = memory[:, -1:, :]
+#         enc_last_emb = self.enc_last_proj(enc_last).expand(B, H, D)
+#         tgt = self.query_embed.expand(B, H, D) + self.pos_embed.expand(B, H, D) + enc_last_emb
+#         # tgt = self.query_embed.expand(B, H, D) + self.pos_embed.expand(B, H, D)
+#         if (self.exo_proj is not None) and (future_exo is not None):
+#             tgt = tgt + self.exo_proj(future_exo)  # [B, H, D]
+#
+#         x = tgt
+#         for layer in self.layers:
+#             x = layer(x, memory)
+#         return x  # [B, H, D]

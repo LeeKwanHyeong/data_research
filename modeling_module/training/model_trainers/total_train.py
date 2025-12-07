@@ -81,6 +81,13 @@ def _make_ckpt_path(
     return save_dir / fname
 
 
+from typing import Tuple
+from modeling_module.training.config import (
+    TrainingConfig,
+    StageConfig,
+    SpikeLossConfig,
+)
+
 def _build_common_train_configs(
     *,
     device: str,
@@ -88,18 +95,22 @@ def _build_common_train_configs(
     horizon: int,
 ) -> Tuple[TrainingConfig, TrainingConfig, SpikeLossConfig, Tuple[StageConfig, StageConfig]]:
     """
-    주간/월간 공통으로 쓰는 Stage, SpikeLoss, TrainingConfig를 생성하는 헬퍼.
-    필요하면 주간/월간에서 override.
+    주간/월간 공통으로 쓰는 Stage, SpikeLoss, TrainingConfig 생성 헬퍼.
+    필요하면 freq별로 override만 추가해서 사용.
     """
-    # 2-stage 학습 스케줄
+
+    # 1) 2-stage 학습 스케줄 -------------------------
+    # warm-up: spike off, 상대적으로 러닝레이트 높게
     stg_warmup = StageConfig(
-        epochs=1,
+        epochs=50,
         spike_enabled=False,
         lr=3e-4,
         use_horizon_decay=False,
     )
+
+    # spike stage: spike loss on, lr 살짝 낮추고 horizon decay 사용
     stg_spike = StageConfig(
-        epochs=1,
+        epochs=100,
         spike_enabled=True,
         lr=1e-4,
         use_horizon_decay=True,
@@ -107,23 +118,24 @@ def _build_common_train_configs(
     )
     stages = (stg_warmup, stg_spike)
 
-    # Spike loss 공통 설정
+    # 2) Spike loss 공통 설정 ------------------------
     spike_cfg = SpikeLossConfig(
         enabled=True,
-        strategy='mix',
+        strategy='mix',          # huber + asym을 섞는 방식
         huber_delta=0.6,
         asym_up_weight=1.0,
-        asym_down_weight=8.0,  # 언더예측 페널티
+        asym_down_weight=8.0,    # 언더예측 페널티 강화
         mad_k=1.5,
-        w_spike=32.0,
-        w_norm=1.0,
+        w_spike=32.0,            # spike 구간 가중치
+        w_norm=1.0,              # 정상 구간 가중치
         alpha_huber=0.6,
         beta_asym=0.4,
         mix_with_baseline=False,
         gamma_baseline=0.0,
-        # w_cap=12.0,  # 필요 시 사용
+        # w_cap=12.0,            # 필요 시 cap
     )
 
+    # 3) Point용 공통 TrainingConfig -----------------
     point_train_cfg = TrainingConfig(
         device=device,
         lookback=lookback,
@@ -146,6 +158,7 @@ def _build_common_train_configs(
         max_grad_norm=30.0,
     )
 
+    # 4) Quantile용 공통 TrainingConfig --------------
     quantile_train_cfg = TrainingConfig(
         device=device,
         lookback=lookback,
@@ -316,6 +329,11 @@ def run_total_train_weekly(
         use_exogenous=True,
         exo_dim=2,  # 주간 calendar sin/cos
         final_clamp_nonneg=True,
+        use_revin = True,
+        revin_use_std = True,
+        revin_subtract_last=False,
+        revin_affine=True,
+        use_lmm = False
     )
 
     ti_base = build_titan_base(ti_config)
