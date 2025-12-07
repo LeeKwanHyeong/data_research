@@ -83,7 +83,7 @@ def predict_120_for_model(model, x_init, device="cpu", prefer="dms") -> torch.Te
     if prefer == "dms":
         f = DMSForecaster(model, target_channel=0, fill_mode="copy_last",
                           lmm_mode=lmm_mode, predict_fn=predict_fn, ttm=None)
-        y_hat = f.forecast_DMS_to_IMS(x_init, horizon=120, device=device, extend='ims', context_policy='once')
+        y_hat = f.point_DMS_to_IMS(x_init, horizon=120, device=device, extend='ims', context_policy='once')
     else:
         f = IMSForecaster(model, target_channel=0, fill_mode="copy_last",
                           lmm_mode=lmm_mode, predict_fn=predict_fn, ttm=None)

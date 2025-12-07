@@ -129,15 +129,17 @@ class DMSForecaster:
     """
 
     def __init__(
-        self,
-        model: torch.nn.Module,
-        *,
-        target_channel: int = 0,
-        fill_mode: str = "copy_last",
-        lmm_mode: Optional[str] = None,
-        predict_fn: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
-        ttm: Optional[object] = None,
-        future_exo_cb: Optional[Callable[[int, int], torch.Tensor]] = lambda s, h: make_calendar_exo(s, h, period=52),
+            self,
+            model: torch.nn.Module,
+            *,
+            target_channel: int = 0,
+            fill_mode: str = "copy_last",
+            lmm_mode: Optional[str] = None,
+            predict_fn: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
+            ttm: Optional[object] = None,
+            # 수정: 기본값을 None으로 두고, 호출 시점에서 처리하도록 변경하거나
+            # exogenous_utils.py의 범용 함수를 사용하도록 유도
+            future_exo_cb: Optional[Callable[[int, int], torch.Tensor]] = None,
     ):
         self.model = model
         self.target_channel = target_channel
@@ -305,7 +307,7 @@ class DMSForecaster:
     # ---------- public: point DMS→IMS ----------
 
     @torch.no_grad()
-    def forecast_DMS_to_IMS(
+    def point_DMS_to_IMS(
         self,
         x_init: Optional[torch.Tensor] = None,   # preferred name
         *,

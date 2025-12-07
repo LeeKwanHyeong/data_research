@@ -71,10 +71,12 @@ class BaseModel(nn.Module):
 
         # 백본 out 차원
         self.in_dim = getattr(self.backbone, 'out_dim', getattr(self.backbone, 'patch_repr_dim', None))
-        assert self.in_dim is not None, "Backbone must expose out_dim or patch_repr_dim."
+        assert self.in_dim is not None
 
         # z 정합 및 expander
-        self.z_align: Optional[nn.Linear] = None
+        # self.z_align: Optional[nn.Linear] = None
+        # self.z_proj: nn.Module = nn.Identity()
+        self.z_align = nn.Linear(self.in_dim, self.in_dim)
         self.z_proj: nn.Module = nn.Identity()
         self.expander: Optional[TemporalExpander] = None
 
@@ -281,8 +283,8 @@ class BaseModel(nn.Module):
         z = self.backbone(x_n)  # [B, D_eff]
 
         # z 정합(동적 변화 대비)
-        if (self.z_align is None) or (z.size(-1) != self.in_dim):
-            self.z_align = nn.Linear(z.size(-1), self.in_dim, bias=False).to(z.device)
+        # if (self.z_align is None) or (z.size(-1) != self.in_dim):
+        #     self.z_align = nn.Linear(z.size(-1), self.in_dim, bias=False).to(z.device)
         z = self.z_align(z)  # [B, in_dim]
 
         # 1.5) (권장) z단에서 과거 exo 결합
@@ -431,7 +433,8 @@ class QuantileModel(nn.Module):
             fusion=self.fusion,
         )
         self.in_dim = self.backbone.out_dim
-        self.z_align: Optional[nn.Linear] = None
+        # self.z_align: Optional[nn.Linear] = None
+        self.z_align = nn.Linear(self.in_dim, self.in_dim)
         self.expander: Optional[TemporalExpander] = None
         self.z_proj: nn.Module = nn.Identity()
 
@@ -589,8 +592,8 @@ class QuantileModel(nn.Module):
         x_n = self.revin(x_in, 'norm')
         z = self.backbone(x_n)  # [B, D_eff]
 
-        if (self.z_align is None) or (z.size(-1) != self.in_dim):
-            self.z_align = nn.Linear(z.size(-1), self.in_dim, bias=False).to(z.device)
+        # if (self.z_align is None) or (z.size(-1) != self.in_dim):
+        #     self.z_align = nn.Linear(z.size(-1), self.in_dim, bias=False).to(z.device)
         z = self.z_align(z)
 
         # 1.5) (권장) z단에서 과거 exo 결합

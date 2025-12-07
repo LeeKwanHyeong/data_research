@@ -1,6 +1,6 @@
 import os
 import inspect
-from typing import Dict, Tuple, Optional, Callable
+from typing import Dict, Tuple, Optional, Callable, Union
 
 import numpy as np
 import torch
@@ -225,6 +225,292 @@ def _probe_output(model, x1, device='cuda' if torch.cuda.is_available() else 'cp
                 out = t
                 break
     return out  # Tensor or dict
+
+
+# ==============================
+# Core plotting (Refactored)
+# ==============================
+def _plot_single_series(
+        *,
+        hist: Optional[np.ndarray],
+        y_true: Optional[np.ndarray],
+        preds_point: Dict[str, np.ndarray],
+        preds_q10: Dict[str, np.ndarray],
+        preds_q50: Dict[str, np.ndarray],
+        preds_q90: Dict[str, np.ndarray],
+        horizon: int,
+        title: str,
+        out_path: Optional[str],
+        show: bool,
+        zoom_future: bool = False,
+        zoom_len: Optional[int] = None,
+        xlabel: str = "Time",  # Custom label support
+):
+    """
+    한 파트에 대해 히스토리 + 여러 모델의 예측을 그린다.
+    """
+    # X축 생성
+    t_hist = np.arange(-len(hist) + 1, 1) if (hist is not None and hist.size > 0) else None
+    t_fut = np.arange(1, horizon + 1)
+
+    plt.figure(figsize=(12, 6))  # 조금 더 크게
+
+    # 1. History
+    if hist is not None and hist.size > 0:
+        plt.plot(t_hist, hist, label="History", linewidth=2, color='black', alpha=0.7)
+
+    # Zoom 설정
+    if zoom_future:
+        # zoom_len이 없으면 horizon의 절반 혹은 적절한 값 사용
+        zL = int(zoom_len or horizon)
+        zL = max(1, min(zL, horizon))
+        t_view = t_fut[:zL]
+
+        # History도 너무 길면 잘라서 보여주기 (옵션)
+        if t_hist is not None and len(t_hist) > zL * 2:
+            # 히스토리는 줌 길이의 2배 정도만 보여줌
+            t_hist_view = t_hist[-zL * 2:]
+            hist_view = hist[-zL * 2:]
+        else:
+            t_hist_view = t_hist
+            hist_view = hist
+    else:
+        zL = horizon
+        t_view = t_fut
+        t_hist_view = t_hist
+        hist_view = hist
+
+    # 2. Ground Truth
+    if y_true is not None:
+        yt = np.asarray(y_true, float).reshape(-1)
+        # 길이 맞춤 (Pad or Cut)
+        if yt.size > horizon:
+            yt = yt[:horizon]
+        elif yt.size < horizon:
+            yt = np.concatenate([yt, np.full(horizon - yt.size, np.nan)])
+
+        plt.plot(t_view, yt[:zL], label="True", linewidth=2.5, color='green', alpha=0.8)
+
+    # 3. Quantile Predictions
+    for nm in list(preds_q50.keys()):
+        q10 = np.asarray(preds_q10.get(nm))
+        q50 = np.asarray(preds_q50.get(nm))
+        q90 = np.asarray(preds_q90.get(nm))
+
+        if q10 is None or q50 is None or q90 is None: continue
+
+        # 길이 맞춤 함수
+        def _fit(a):
+            a = a.reshape(-1)
+            if a.size > horizon: return a[:horizon]
+            if a.size < horizon: return np.concatenate([a, np.full(horizon - a.size, np.nan)])
+            return a
+
+        q10, q50, q90 = _fit(q10), _fit(q50), _fit(q90)
+
+        # Plot
+        plt.fill_between(t_view, q10[:zL], q90[:zL], alpha=0.15, label=f"{nm} P10–P90")
+        plt.plot(t_view, q50[:zL], linewidth=2, linestyle='--', label=f"{nm} P50")
+
+    # 4. Point Predictions
+    for nm, yhat in preds_point.items():
+        if nm in preds_q50: continue  # Quantile 모델은 위에서 그림
+
+        a = np.asarray(yhat).reshape(-1)
+        if a.size > horizon:
+            a = a[:horizon]
+        elif a.size < horizon:
+            a = np.concatenate([a, np.full(horizon - a.size, np.nan)])
+
+        plt.plot(t_view, a[:zL], label=nm, linewidth=2, alpha=0.9)
+
+    # 5. Simple Ensemble (Average of Point/Q50)
+    # (q90 기반 앙상블은 특수한 경우라 일반적인 평균으로 변경하거나 옵션화 추천)
+    # 여기서는 Point Forecast들의 평균으로 구현
+    stack = []
+    for nm in preds_point.keys():
+        # q50이 있으면 그것을, 없으면 point 사용
+        base = preds_q50.get(nm, preds_point[nm])
+        base = np.asarray(base).reshape(-1)
+        if base.size > horizon:
+            base = base[:horizon]
+        elif base.size < horizon:
+            base = np.concatenate([base, np.full(horizon - base.size, np.nan)])
+        stack.append(base)
+
+    if stack:
+        M = np.vstack(stack)
+        ens_mean = np.nanmean(M, axis=0)
+        plt.plot(t_view, ens_mean[:zL], color='red', linestyle=':', linewidth=3, label="Ensemble (Mean)")
+
+    # Decorate
+    plt.axvline(0, color="gray", linewidth=1.5, linestyle='-')
+    plt.title(title, fontsize=14)
+    plt.xlabel(xlabel, fontsize=12)
+    plt.ylabel("Value", fontsize=12)
+    plt.grid(True, which='both', linestyle='--', alpha=0.5)
+    plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')  # Legend 밖으로
+    plt.tight_layout()
+
+    if out_path:
+        plt.savefig(out_path, dpi=150, bbox_inches='tight')
+    if show:
+        plt.show()
+    else:
+        plt.close()
+
+
+# ==============================
+# Unified Public API (Replaces plot_27w, plot_120m)
+# ==============================
+@torch.no_grad()
+def plot_forecast(
+        models: Dict[str, torch.nn.Module],
+        loader,
+        *,
+        device: str = 'cuda' if torch.cuda.is_available() else 'cpu',
+        horizon: int,  # 필수 입력
+        mode: str = "val",  # 'val' | 'infer'
+        freq: str = "weekly",  # 'weekly', 'monthly', 'daily', 'hourly'
+        plan_dt: Optional[int] = None,  # Anchor date
+        max_plots: int = 10,  # 너무 많이 그리지 않도록 기본값 조정
+        out_dir: Optional[str] = None,
+        show: bool = True,
+        future_exo_cb=None,
+        truth_cb: Optional[Callable] = None,
+        zoom: Union[bool, int] = False,  # True면 자동, 숫자면 해당 길이만큼 줌
+):
+    """
+    통합 예측 플로팅 함수.
+    모든 주기(freq)와 Horizon에 대응합니다.
+    """
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+
+    # 줌 설정 처리
+    zoom_future = False
+    zoom_len = None
+    if isinstance(zoom, bool) and zoom:
+        zoom_future = True
+        zoom_len = horizon  # 기본은 전체 다 보여주되 로직상 분기
+    elif isinstance(zoom, int) and zoom > 0:
+        zoom_future = True
+        zoom_len = zoom
+
+    plotted = 0
+
+    # 배치 언패킹 헬퍼 (기존 _unpack_plot_batch 사용)
+    # (이 함수는 plot_utils.py 상단에 정의되어 있다고 가정)
+
+    for batch in loader:
+        # 배치가 (x, y) 등 단순한 경우부터 (x, y, id, exo...) 복잡한 경우까지 처리
+        # 여기서는 내부 헬퍼 _unpack_plot_batch가 있다고 가정하고 호출
+        # (만약 없다면 아래 간단 구현 사용)
+
+        # 간단 구현:
+        part_ids = fe_cont = pe_cont = pe_cat = None
+        if mode == 'val':
+            if len(batch) == 2:
+                xb, yb = batch
+            elif len(batch) >= 3:
+                xb, yb, part_ids, *rest = batch;
+            # Exo 있는 경우 처리 (순서: x, y, id, fe, peC, peK)
+            if len(batch) >= 4: fe_cont = batch[3]
+            if len(batch) >= 5: pe_cont = batch[4]
+            if len(batch) >= 6: pe_cat = batch[5]
+        else:  # infer
+            yb = None
+            if len(batch) == 2:
+                xb, part_ids = batch
+            elif len(batch) >= 3:
+                xb, part_ids, fe_cont, *rest = batch
+            if len(batch) >= 4: pe_cont = batch[3]
+            if len(batch) >= 5: pe_cat = batch[4]
+
+        if xb.dim() == 2:
+            xb = xb.unsqueeze(-1)
+
+        B = xb.size(0)
+        for i in range(B):
+            if plotted >= max_plots:
+                return
+
+            # 단일 샘플 추출
+            x1 = xb[i:i + 1].to(device)
+            pid = part_ids[i] if (part_ids is not None and i < len(part_ids)) else f"idx{plotted}"
+
+            # Tensor인 경우만 슬라이싱
+            fe1 = fe_cont[i:i + 1] if isinstance(fe_cont, torch.Tensor) else None
+            pc1 = pe_cont[i:i + 1] if isinstance(pe_cont, torch.Tensor) else None
+            pk1 = pe_cat[i:i + 1] if isinstance(pe_cat, torch.Tensor) else None
+            pid1 = None
+            if isinstance(pid, torch.Tensor):
+                pid1 = pid.unsqueeze(0) if pid.dim() == 0 else pid
+            elif isinstance(part_ids, torch.Tensor):
+                pid1 = part_ids[i:i + 1]
+
+            # y_true (Ground Truth) 준비
+            y_true = None
+            if mode == "val" and yb is not None:
+                y_true = yb[i].detach().cpu().numpy().reshape(-1)
+            elif mode == "infer" and truth_cb is not None and plan_dt is not None:
+                # truth_cb 서명에 맞춰 호출 (예: pid, plan_dt, horizon, freq)
+                y_true = truth_cb(str(pid), plan_dt, horizon, freq)
+
+            # 모델별 예측
+            preds_point, preds_q10, preds_q50, preds_q90 = {}, {}, {}, {}
+
+            for name, mdl in models.items():
+                # _predict_any는 forecaster.py 로직을 사용하거나 plot_utils 내장 함수 사용
+                # (여기서는 위에서 정의한 내장 함수 사용 가정)
+                p = _predict_any(
+                    mdl, x1, horizon=horizon, device=device,
+                    future_exo_cb=future_exo_cb,
+                    part_ids=pid1,
+                    future_exo_batch=fe1,
+                    past_exo_cont=pc1,
+                    past_exo_cat=pk1
+                )
+
+                if "point" in p:
+                    preds_point[name] = p["point"]
+                if "q" in p:  # Quantile 결과
+                    q_dict = p["q"]
+                    if "q10" in q_dict: preds_q10[name] = q_dict["q10"]
+                    if "q50" in q_dict: preds_q50[name] = q_dict["q50"]
+                    if "q90" in q_dict: preds_q90[name] = q_dict["q90"]
+                    # Quantile 모델의 Point는 q50으로 덮어쓰기 (선택)
+                    if "q50" in q_dict: preds_point[name] = q_dict["q50"]
+
+            # 타이틀 생성
+            t_str = f"[{freq.upper()}] Mode={mode.upper()} H={horizon}"
+            if plan_dt: t_str += f" PlanDt={plan_dt}"
+            t_str += f" | ID={pid}"
+
+            # 그리기
+            hist = _to_1d_history(x1)
+
+            # 파일명 안전하게
+            safe_pid = str(pid).replace('/', '_').replace('\\', '_')
+            fname = f"{mode}_{freq}_H{horizon}_{safe_pid}.png"
+            out_path = os.path.join(out_dir, fname) if out_dir else None
+
+            _plot_single_series(
+                hist=hist,
+                y_true=y_true,
+                preds_point=preds_point,
+                preds_q10=preds_q10,
+                preds_q50=preds_q50,
+                preds_q90=preds_q90,
+                horizon=horizon,
+                title=t_str,
+                out_path=out_path,
+                show=show,
+                zoom_future=zoom_future,
+                zoom_len=zoom_len,
+                xlabel=f"Time Steps ({freq})",
+            )
+            plotted += 1
 
 
 # ==============================
@@ -476,6 +762,7 @@ def _predict_any(
                 mode="eval",
             )
 
+
         # 1.5) dict 출력 우선 처리 (Quantile/Point 혼합도 안전 처리)
         if isinstance(out, dict):
             # (a) 'q'가 있으면 분위수 처리
@@ -542,7 +829,7 @@ def _predict_any(
                 f = DMSForecaster(model, target_channel=0, fill_mode="copy_last",
                                   lmm_mode="eval", predict_fn=None, ttm=None, future_exo_cb=future_exo_cb)
                 with torch.no_grad():
-                    y_hat = f.forecast_DMS_to_IMS(
+                    y_hat = f.point_DMS_to_IMS(
                         x_init=x1_dev, horizon=horizon, device=device,
                         extend="ims", context_policy="once"
                     )
@@ -607,7 +894,7 @@ def _predict_any(
             f = DMSForecaster(model, target_channel=0, fill_mode="copy_last",
                               lmm_mode="eval", predict_fn=None, ttm=None, future_exo_cb=future_exo_cb)
             with torch.no_grad():
-                y_hat = f.forecast_DMS_to_IMS(
+                y_hat = f.point_DMS_to_IMS(
                     x_init=x1_dev, horizon=horizon, device=device,
                     extend="ims", context_policy="once"
                 )
@@ -617,10 +904,11 @@ def _predict_any(
         f = DMSForecaster(model, target_channel=0, fill_mode="copy_last",
                           lmm_mode="eval", predict_fn=None, ttm=None, future_exo_cb=future_exo_cb)
         with torch.no_grad():
-            y_hat = f.forecast_DMS_to_IMS(
+            y_hat = f.point_DMS_to_IMS(
                 x_init=x1_dev, horizon=horizon, device=device,
                 extend="ims", context_policy="once"
             )
+
         return {"point": y_hat.squeeze(0).detach().cpu().numpy()}
 
     finally:
@@ -628,124 +916,124 @@ def _predict_any(
             model.train()
 
 
-# ==============================
-# Core plotting
-# ==============================
-def _plot_single_series(
-    *,
-    hist: Optional[np.ndarray],
-    y_true: Optional[np.ndarray],
-    preds_point: Dict[str, np.ndarray],
-    preds_q10: Dict[str, np.ndarray],
-    preds_q50: Dict[str, np.ndarray],
-    preds_q90: Dict[str, np.ndarray],
-    horizon: int,
-    title: str,
-    out_path: Optional[str],
-    show: bool,
-    zoom_future: bool = False,
-    zoom_len: Optional[int] = None,
-):
-    """
-    한 파트에 대해 히스토리 + 여러 모델의 예측을 그린다.
-    - horizon 길이를 기준으로 x-축(1..H)을 맞춘다.
-    - zoom_future=True 이면 미래 구간 일부만(예: 27) 확대하여 그린다.
-    """
-    t_hist = np.arange(-len(hist) + 1, 1) if (hist is not None and hist.size > 0) else None
-    t_fut = np.arange(1, horizon + 1)
-
-    plt.figure(figsize=(12, 5))
-
-    # history
-    if hist is not None and hist.size > 0:
-        plt.plot(t_hist, hist, label="History", linewidth=2, alpha=0.8)
-
-    # ground truth (있다면)
-    if y_true is not None:
-        yt = np.asarray(y_true, float).reshape(-1)
-        if yt.size > horizon:
-            yt = yt[:horizon]
-        elif yt.size < horizon:
-            yt = np.concatenate([yt, np.full(horizon - yt.size, np.nan)])
-        if zoom_future:
-            zL = int(zoom_len or horizon)
-            zL = max(1, min(zL, horizon))
-            plt.plot(t_fut[:zL], yt[:zL], label="True", linewidth=2)
-        else:
-            plt.plot(t_fut, yt, label="True", linewidth=2)
-
-    # quantile (있다면)
-    for nm in list(preds_q50.keys()):
-        q10 = np.asarray(preds_q10.get(nm))
-        q50 = np.asarray(preds_q50.get(nm))
-        q90 = np.asarray(preds_q90.get(nm))
-        if q10 is None or q50 is None or q90 is None:
-            continue
-
-        def _fit(a):
-            a = a.reshape(-1)
-            if a.size > horizon:
-                return a[:horizon]
-            if a.size < horizon:
-                return np.concatenate([a, np.full(horizon - a.size, np.nan)])
-            return a
-
-        q10, q50, q90 = _fit(q10), _fit(q50), _fit(q90)
-        if zoom_future:
-            zL = int(zoom_len or horizon); zL = max(1, min(zL, horizon))
-            plt.fill_between(t_fut[:zL], q10[:zL], q90[:zL], alpha=0.15, label=f"{nm} P10–P90")
-            plt.plot(t_fut[:zL], q50[:zL], linewidth=1.8, alpha=0.95, label=f"{nm} P50")
-        else:
-            plt.fill_between(t_fut, q10, q90, alpha=0.15, label=f"{nm} P10–P90")
-            plt.plot(t_fut, q50, linewidth=1.8, alpha=0.95, label=f"{nm} P50")
-
-    # point-only models
-    for nm, yhat in preds_point.items():
-        if nm in preds_q50:  # 중앙선 중복 회피
-            continue
-        a = np.asarray(yhat).reshape(-1)
-        if a.size > horizon:
-            a = a[:horizon]
-        elif a.size < horizon:
-            a = np.concatenate([a, np.full(horizon - a.size, np.nan)])
-        if zoom_future:
-            zL = int(zoom_len or horizon); zL = max(1, min(zL, horizon))
-            plt.plot(t_fut[:zL], a[:zL], label=nm, alpha=0.9)
-        else:
-            plt.plot(t_fut, a, label=nm, alpha=0.9)
-
-    # 간단 앙상블 (q90 기반)
-    stack = []
-    for nm in preds_point.keys():
-        base = preds_q90.get(nm, preds_point[nm])
-        base = np.asarray(base).reshape(-1)
-        if base.size > horizon:
-            base = base[:horizon]
-        elif base.size < horizon:
-            base = np.concatenate([base, np.full(horizon - base.size, np.nan)])
-        stack.append(base)
-    if stack:
-        M = np.vstack(stack)
-        ens_q90 = np.nanmean(M, axis=0)
-        if zoom_future:
-            zL = int(zoom_len or horizon); zL = max(1, min(zL, horizon))
-            plt.plot(t_fut[:zL], ens_q90[:zL], linewidth=2.8, alpha=0.95, label="Ensemble (q90-based)")
-        else:
-            plt.plot(t_fut, ens_q90, linewidth=2.8, alpha=0.95, label="Ensemble (q90-based)")
-
-    plt.axvline(0, color="gray", linewidth=1, alpha=0.6)
-    plt.title(title)
-    plt.xlabel("Time (history ≤ 0 < future)")
-    plt.ylabel("Demand")
-    plt.legend(ncol=2)
-    plt.tight_layout()
-
-    if out_path:
-        plt.savefig(out_path, dpi=150)
-    if show:
-        plt.show()
-    else:
-        plt.close()
+# # ==============================
+# # Core plotting
+# # ==============================
+# def _plot_single_series(
+#     *,
+#     hist: Optional[np.ndarray],
+#     y_true: Optional[np.ndarray],
+#     preds_point: Dict[str, np.ndarray],
+#     preds_q10: Dict[str, np.ndarray],
+#     preds_q50: Dict[str, np.ndarray],
+#     preds_q90: Dict[str, np.ndarray],
+#     horizon: int,
+#     title: str,
+#     out_path: Optional[str],
+#     show: bool,
+#     zoom_future: bool = False,
+#     zoom_len: Optional[int] = None,
+# ):
+#     """
+#     한 파트에 대해 히스토리 + 여러 모델의 예측을 그린다.
+#     - horizon 길이를 기준으로 x-축(1..H)을 맞춘다.
+#     - zoom_future=True 이면 미래 구간 일부만(예: 27) 확대하여 그린다.
+#     """
+#     t_hist = np.arange(-len(hist) + 1, 1) if (hist is not None and hist.size > 0) else None
+#     t_fut = np.arange(1, horizon + 1)
+#
+#     plt.figure(figsize=(12, 5))
+#
+#     # history
+#     if hist is not None and hist.size > 0:
+#         plt.plot(t_hist, hist, label="History", linewidth=2, alpha=0.8)
+#
+#     # ground truth (있다면)
+#     if y_true is not None:
+#         yt = np.asarray(y_true, float).reshape(-1)
+#         if yt.size > horizon:
+#             yt = yt[:horizon]
+#         elif yt.size < horizon:
+#             yt = np.concatenate([yt, np.full(horizon - yt.size, np.nan)])
+#         if zoom_future:
+#             zL = int(zoom_len or horizon)
+#             zL = max(1, min(zL, horizon))
+#             plt.plot(t_fut[:zL], yt[:zL], label="True", linewidth=2)
+#         else:
+#             plt.plot(t_fut, yt, label="True", linewidth=2)
+#
+#     # quantile (있다면)
+#     for nm in list(preds_q50.keys()):
+#         q10 = np.asarray(preds_q10.get(nm))
+#         q50 = np.asarray(preds_q50.get(nm))
+#         q90 = np.asarray(preds_q90.get(nm))
+#         if q10 is None or q50 is None or q90 is None:
+#             continue
+#
+#         def _fit(a):
+#             a = a.reshape(-1)
+#             if a.size > horizon:
+#                 return a[:horizon]
+#             if a.size < horizon:
+#                 return np.concatenate([a, np.full(horizon - a.size, np.nan)])
+#             return a
+#
+#         q10, q50, q90 = _fit(q10), _fit(q50), _fit(q90)
+#         if zoom_future:
+#             zL = int(zoom_len or horizon); zL = max(1, min(zL, horizon))
+#             plt.fill_between(t_fut[:zL], q10[:zL], q90[:zL], alpha=0.15, label=f"{nm} P10–P90")
+#             plt.plot(t_fut[:zL], q50[:zL], linewidth=1.8, alpha=0.95, label=f"{nm} P50")
+#         else:
+#             plt.fill_between(t_fut, q10, q90, alpha=0.15, label=f"{nm} P10–P90")
+#             plt.plot(t_fut, q50, linewidth=1.8, alpha=0.95, label=f"{nm} P50")
+#
+#     # point-only models
+#     for nm, yhat in preds_point.items():
+#         if nm in preds_q50:  # 중앙선 중복 회피
+#             continue
+#         a = np.asarray(yhat).reshape(-1)
+#         if a.size > horizon:
+#             a = a[:horizon]
+#         elif a.size < horizon:
+#             a = np.concatenate([a, np.full(horizon - a.size, np.nan)])
+#         if zoom_future:
+#             zL = int(zoom_len or horizon); zL = max(1, min(zL, horizon))
+#             plt.plot(t_fut[:zL], a[:zL], label=nm, alpha=0.9)
+#         else:
+#             plt.plot(t_fut, a, label=nm, alpha=0.9)
+#
+#     # 간단 앙상블 (q90 기반)
+#     stack = []
+#     for nm in preds_point.keys():
+#         base = preds_q90.get(nm, preds_point[nm])
+#         base = np.asarray(base).reshape(-1)
+#         if base.size > horizon:
+#             base = base[:horizon]
+#         elif base.size < horizon:
+#             base = np.concatenate([base, np.full(horizon - base.size, np.nan)])
+#         stack.append(base)
+#     if stack:
+#         M = np.vstack(stack)
+#         ens_q90 = np.nanmean(M, axis=0)
+#         if zoom_future:
+#             zL = int(zoom_len or horizon); zL = max(1, min(zL, horizon))
+#             plt.plot(t_fut[:zL], ens_q90[:zL], linewidth=2.8, alpha=0.95, label="Ensemble (q90-based)")
+#         else:
+#             plt.plot(t_fut, ens_q90, linewidth=2.8, alpha=0.95, label="Ensemble (q90-based)")
+#
+#     plt.axvline(0, color="gray", linewidth=1, alpha=0.6)
+#     plt.title(title)
+#     plt.xlabel("Time (history ≤ 0 < future)")
+#     plt.ylabel("Demand")
+#     plt.legend(ncol=2)
+#     plt.tight_layout()
+#
+#     if out_path:
+#         plt.savefig(out_path, dpi=150)
+#     if show:
+#         plt.show()
+#     else:
+#         plt.close()
 
 
 # ==============================

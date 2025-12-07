@@ -157,23 +157,39 @@ def load_model_dict(save_dir: str, builders: Dict[str, callable], device="cpu", 
         try:
             model.load_state_dict(sd, strict=strict)
         except RuntimeError as e:
-            print(f"[warn] {name}: strict load failed → partial load로 재시도")
-            own = model.state_dict()
-            filtered = {}
-            skipped = []
+            # shape mismatch 등 에러 발생 시 처리
+            print(f"[info] {name}: strict load skipped, trying partial load...")
+
+            own_state = model.state_dict()
+            filtered_state = {}
+            skipped_keys = []
+
             for k, v in sd.items():
-                if k not in own:
-                    skipped.append((k, v.shape, None))
+                if k not in own_state:
+                    # 모델에 없는 키는 스킵
                     continue
-                if own[k].shape != v.shape:
-                    skipped.append((k, v.shape, own[k].shape))
+                if v.shape != own_state[k].shape:
+                    # RevIN 버퍼(mean, std 등)는 배치 사이즈 때문에 다를 수 있음 -> 안전하게 스킵
+                    # 하지만 학습 가능한 파라미터(weight, bias)가 다르면 문제임
+                    if "revin" in k and ("mean" in k or "std" in k or "last" in k):
+                        # RevIN 통계량은 스킵해도 무방 (추론 시 재계산됨)
+                        pass
+                    else:
+                        # 그 외 파라미터 불일치는 경고 대상
+                        skipped_keys.append(f"{k} (ckpt {v.shape} vs model {own_state[k].shape})")
                     continue
-                filtered[k] = v
-            if skipped:
-                print("[load partial] shape-mismatch skipped:")
-                for k, s_ckpt, s_model in skipped:
-                    print(f"  - {k}: ckpt={s_ckpt}, model={s_model}")
-            model.load_state_dict(filtered, strict=False)
+
+                filtered_state[k] = v
+
+            # 필터링된 가중치 로드
+            model.load_state_dict(filtered_state, strict=False)
+
+            if skipped_keys:
+                print(f"[warn] Skipped shape-mismatch keys in {name}:")
+                for sk in skipped_keys:
+                    print(f"  - {sk}")
+            else:
+                print(f"[info] {name}: Partial load successful (RevIN buffers skipped safely).")
 
         model.to(device).eval()
         models[name] = model
