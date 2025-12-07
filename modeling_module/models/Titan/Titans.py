@@ -102,6 +102,7 @@ class _TitanBase(nn.Module):
             self.contextual_mem_size,
             self.persistent_mem_size,
             self.dropout,
+            use_context_update=False  # 일단 안전하게 False로 고정하거나 config 옵션 연동
         )
 
     @classmethod
@@ -154,9 +155,6 @@ class TitanBaseModel(_TitanBase):
             exo_dim=(self.exo_dim if self.use_exogenous else 0),
         )
         self.proj = nn.Linear(self.d_model, 1)
-        print("revin_use_std:", self.revin_use_std)
-        print('revin_subtract_last', self.revin_subtract_last)
-        print('final_clamp_nonneg', self.final_clamp_nonneg)
 
     def forward(self, x: torch.Tensor, *, future_exo: torch.Tensor | None = None) -> torch.Tensor:
         # 1) RevIN norm (입력 전처리) ---------------------

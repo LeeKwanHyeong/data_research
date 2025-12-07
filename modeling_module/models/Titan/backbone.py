@@ -36,14 +36,15 @@ class MemoryEncoder(nn.Module):
     """입력 투영 + TitanBackbone × n_layers"""
 
     def __init__(self, input_dim: int, d_model: int, n_layers: int, n_heads: int, d_ff: int,
-                 contextual_mem_size: int, persistent_mem_size: int, dropout: float = 0.1):
+                 contextual_mem_size: int, persistent_mem_size: int, dropout: float = 0.1,
+                 use_context_update: bool = False): # <--- 인자 추가 및 기본값 False
         super().__init__()
         self.input_proj = nn.Linear(input_dim, d_model)
         self.layers = nn.ModuleList([
             TitanBackbone(d_model, n_heads, d_ff, contextual_mem_size, persistent_mem_size, dropout)
             for _ in range(n_layers)
         ])
-        self.use_context_update = True  # 학습 시 레이어 출력으로 메모리 업데이트 활성화
+        self.use_context_update = use_context_update  # <--- 인자 값 사용
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.input_proj(x)
