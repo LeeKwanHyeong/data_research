@@ -1,142 +1,245 @@
+# src/modeling_module/models/PatchTST/PatchTST.py
+
 import torch
 from torch import nn
-
 from modeling_module.models.PatchTST.common.configs import PatchTSTConfig
 from modeling_module.models.PatchTST.supervised.backbone import SupervisedBackbone
 from modeling_module.models.common_layers.RevIN import RevIN
 
 
+class PointHeadWithExo(nn.Module):
+    """
+    Backbone 출력 + Future Exo -> Horizon 예측
+    """
 
-# ------------------------------
-# 1) Point Forecast Head
-# ------------------------------
-class PointHead(nn.Module):
-    """
-    단일 포인트 예측 헤드.
-    Backbone에서 나온 feature sequence (B, L_tok, d_model)을 받아서
-    평균 혹은 마지막 토큰을 이용해 (B, horizon) 출력으로 변환.
-    """
-    def __init__(self, d_model: int, horizon: int, agg: str = "mean"):
+    def __init__(self, d_model: int, horizon: int, d_future: int, patch_num: int, agg: str = "mean"):
         super().__init__()
         self.agg = agg
-        self.proj = nn.Linear(d_model, horizon)
-
-    def forward(self, z_bld: torch.Tensor) -> torch.Tensor:
-        # z_bld: [B, L_tok, d_model]
-        feat = z_bld.mean(dim=1) if self.agg == "mean" else z_bld[:, -1, :]
-        return self.proj(feat)  # [B, horizon]
-
-
-# ------------------------------
-# 2) Quantile Forecast Head
-# ------------------------------
-class QuantileHead(nn.Module):
-    """
-    다중 분위수 예측 헤드.
-    (B, L_tok, d_model) -> (B, Q, horizon)
-    """
-    def __init__(self,
-                 d_model: int,
-                 horizon: int,
-                 quantiles=(0.1, 0.5, 0.9),
-                 hidden: int = 128,
-                 monotonic: bool = True):
-        super().__init__()
-        self.Q = len(quantiles)
         self.horizon = horizon
-        self.monotonic = monotonic
+        self.d_future = d_future
+
+        # Future Exo Projection: [B, H, d_future] -> [B, d_model]
+        # 미래 정보를 d_model 크기로 압축하여 문맥에 더하거나 concat
+        self.future_proj = nn.Linear(horizon * d_future, d_model) if d_future > 0 else None
+
+        # Final Projection
+        # Input: d_model (Backbone) + d_model (Future) if concat else d_model
+        # 여기서는 단순하게 Backbone Feat + Future Feat (Concat) 전략 사용
+        in_dim = d_model * 2 if d_future > 0 else d_model
+
+        self.proj = nn.Linear(in_dim, horizon)
+
+    def forward(self, z_bld: torch.Tensor, future_exo: torch.Tensor = None) -> torch.Tensor:
+        if self.agg == "mean":
+            feat = z_bld.mean(dim=1)
+        else:
+            feat = z_bld[:, -1, :]
+
+        if self.d_future > 0:
+            if future_exo is None:
+                raise RuntimeError(
+                    f"[PatchTST] d_future={self.d_future}인데 future_exo가 None입니다. "
+                    f"Adapter/forward 시그니처 호환을 확인하세요."
+                )
+            B, H, D = future_exo.shape
+            if D != self.d_future:
+                raise RuntimeError(
+                    f"[PatchTST] future_exo last-dim(D)={D} != d_future={self.d_future}"
+                )
+
+            f_flat = future_exo.reshape(B, -1)
+            f_feat = self.future_proj(f_flat)
+            feat = torch.cat([feat, f_feat], dim=-1)
+
+        return self.proj(feat)
+
+class QuantileHeadWithExo(nn.Module):
+    """
+    (B, L_tok, d_model) + Future Exo -> (B, H, Q)
+    - Future Exo: [B, H, d_future]를 (H*d_future)로 펼쳐 d_model로 projection 후 concat
+    - 최종 출력: (B, H, Q)  (Q는 마지막 축)
+    """
+    def __init__(
+        self,
+        d_model: int,
+        horizon: int,
+        d_future: int,
+        quantiles=(0.1, 0.5, 0.9),
+        hidden: int = 128,
+        monotonic: bool = True,
+    ):
+        super().__init__()
+        self.horizon = int(horizon)
+        self.quantiles = tuple(quantiles)
+        self.Q = len(self.quantiles)
+        self.monotonic = bool(monotonic)
+        self.d_future = int(d_future)
+
+        self.future_proj = nn.Linear(self.horizon * self.d_future, d_model) if self.d_future > 0 else None
+        in_dim = d_model * 2 if self.d_future > 0 else d_model
 
         self.net = nn.Sequential(
-            nn.Linear(d_model, hidden),
+            nn.Linear(in_dim, hidden),
             nn.GELU(),
-            nn.Linear(hidden, horizon * self.Q)
+            nn.Linear(hidden, self.horizon * self.Q),
         )
 
-    def forward(self, z_bld: torch.Tensor) -> torch.Tensor:
+    def forward(self, z_bld: torch.Tensor, future_exo: torch.Tensor = None) -> torch.Tensor:
         B = z_bld.size(0)
         feat = z_bld.mean(dim=1)  # [B, d_model]
-        q = self.net(feat).view(B, self.horizon, self.Q)  # [B, H, Q]
-        q = q.permute(0, 2, 1).contiguous()               # [B, Q, H]
+
+        if self.d_future > 0:
+            if future_exo is None:
+                raise RuntimeError(
+                    f"[PatchTST-Quantile] d_future={self.d_future}인데 future_exo가 None입니다."
+                )
+            if future_exo.dim() == 2:  # (H,E) -> (B,H,E)
+                future_exo = future_exo.unsqueeze(0).expand(B, -1, -1)
+
+            if future_exo.dim() != 3:
+                raise RuntimeError(f"[PatchTST-Quantile] future_exo must be 3D, got {tuple(future_exo.shape)}")
+
+            b2, H, D = future_exo.shape
+            if b2 != B:
+                raise RuntimeError(f"[PatchTST-Quantile] future_exo batch mismatch: {b2} != {B}")
+            if H != self.horizon:
+                # horizon이 다른 호출(IMS 확장 등)을 허용하려면 여기 정책을 바꾸셔야 합니다.
+                raise RuntimeError(f"[PatchTST-Quantile] future_exo horizon mismatch: {H} != {self.horizon}")
+            if D != self.d_future:
+                raise RuntimeError(
+                    f"[PatchTST-Quantile] future_exo last-dim(D)={D} != d_future={self.d_future}"
+                )
+
+            f_flat = future_exo.reshape(B, -1)      # [B, H*D]
+            f_feat = self.future_proj(f_flat)       # [B, d_model]
+            feat = torch.cat([feat, f_feat], dim=-1)  # [B, 2*d_model]
+
+        out = self.net(feat).view(B, self.horizon, self.Q)  # [B, H, Q]
+
         if self.monotonic:
-            q, _ = torch.sort(q, dim=1)
-        return q
+            out, _ = torch.sort(out, dim=-1)  # quantile 축(Q) monotonic
+        return out
 
-
-# ------------------------------
-# 3) Full Models
-# ------------------------------
 class PatchTSTPointModel(nn.Module):
-    """
-    PatchTST Backbone + Point Head
-    """
     def __init__(self, cfg, attn_core=None):
         super().__init__()
         self.cfg = cfg
+
+        # Backbone (Past Exo 처리 포함)
         self.backbone = SupervisedBackbone(cfg, attn_core)
-        self.head = PointHead(cfg.d_model, cfg.horizon)
+
+        # Patch Number 계산 (Head 초기화용)
+        from modeling_module.models.PatchTST.common.patching import compute_patch_num
+        patch_num = compute_patch_num(cfg.lookback, cfg.patch_len, cfg.stride, cfg.padding_patch)
+
+        # Head (Future Exo 처리 포함)
+        self.head = PointHeadWithExo(
+            d_model=cfg.d_model,
+            horizon=cfg.horizon,
+            d_future=getattr(cfg, 'd_future', 0),
+            patch_num=patch_num,
+            agg="mean"  # or "last"
+        )
+
         self.is_quantile = False
         self.horizon = cfg.horizon
-        self.model_name = "PatchTST BaseModel"
+        self.model_name = "PatchTST ExoModel"
 
-        # Forecaster 호환: 속성명을 revin_layer로 통일
+        # RevIN은 Target 변수에만 적용 (Exo는 DataModule 단계나 별도 Norm 필요)
         self.revin_layer = RevIN(num_features=cfg.c_in)
 
     @classmethod
     def from_config(cls, config: "PatchTSTConfig"):
         return cls(cfg=config)
 
-    def forward(self, x_b_l_c: torch.Tensor, future_exo=None, mode=None) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        # ---- New (Trainer/DefaultAdapter compatible) ----
+        future_exo: torch.Tensor | None = None,
+        past_exo_cont: torch.Tensor | None = None,
+        past_exo_cat: torch.Tensor | None = None,
+        part_ids=None,
+        mode: str | None = None,
+        # ---- Legacy aliases (backward-compat) ----
+        fe_cont: torch.Tensor | None = None,
+        pe_cont: torch.Tensor | None = None,
+        pe_cat: torch.Tensor | None = None,
+        **kwargs,
+    ):
         """
-        x_b_l_c: [B, L, C] (원공간)
-        반환: y_n: [B, H] (정규화 공간; Forecaster에서 model.revin_layer(y, 'denorm') 처리)
+        Trainer/Adapter가 넘기는 인자명(future_exo, past_exo_cont, past_exo_cat)과
+        기존 PatchTST 인자명(fe_cont, pe_cont, pe_cat)을 모두 수용합니다.
         """
-        # 1) 입력 정규화 (컨텍스트: 배치별/채널별 통계가 revin_layer 내부에 저장)
-        x_n = self.revin_layer(x_b_l_c, 'norm')          # [B, L, C]
 
-        # 2) Backbone forward (PatchTST는 [B, C, L] 입력)
-        x_n_b_c_l = x_n.permute(0, 2, 1)                 # [B, C, L]
-        z = self.backbone(x_n_b_c_l)                     # [B, L_tok, d_model]
+        # 0) alias resolve
+        fe = future_exo if future_exo is not None else fe_cont
+        p_cont = past_exo_cont if past_exo_cont is not None else pe_cont
+        p_cat = past_exo_cat if past_exo_cat is not None else pe_cat
 
-        # 3) Head → normalized space 예측
-        y_n = self.head(z)                               # [B, H]
-        return y_n                                       # denorm은 Forecaster가 일원화 수행
+        # 1) RevIN normalize (기존 로직 유지)
+        x_n = self.revin(x, "norm") if getattr(self, "use_revin", False) else x
+
+        # 2) Backbone Forward (Past Exo)
+        z = self.backbone(x_n, p_cont=p_cont, p_cat=p_cat)  # [B, N, d_model]
+
+        # 3) Head Forward (Future Exo)
+        y_n = self.head(z, future_exo=fe)  # [B, H]
+
+        return y_n
 
 class PatchTSTQuantileModel(nn.Module):
-    """
-    PatchTST Backbone + Quantile Head (quantile forecast)
-    - 입력은 RevIN으로 'norm'만 수행
-    - 출력은 normalized space 그대로 반환(dict with 'q')
-    """
     def __init__(self, cfg, attn_core=None):
         super().__init__()
         self.cfg = cfg
         self.backbone = SupervisedBackbone(cfg, attn_core)
-        self.head = QuantileHead(cfg.d_model, cfg.horizon,
-                                 quantiles=getattr(cfg, "quantiles", (0.1, 0.5, 0.9)))
+
+        self.head = QuantileHeadWithExo(
+            d_model=cfg.d_model,
+            horizon=cfg.horizon,
+            d_future=getattr(cfg, "d_future", 0),
+            quantiles=getattr(cfg, "quantiles", (0.1, 0.5, 0.9)),
+            hidden=getattr(cfg, "q_hidden", 128),
+            monotonic=getattr(cfg, "monotonic_quantiles", True),
+        )
+
         self.is_quantile = True
         self.horizon = cfg.horizon
         self.model_name = "PatchTST QuantileModel"
 
-        # Forecaster 호환: 속성명을 revin_layer로 통일
         self.revin_layer = RevIN(num_features=cfg.c_in)
 
     @classmethod
     def from_config(cls, config: "PatchTSTConfig"):
         return cls(cfg=config)
 
-    def forward(self, x_b_l_c: torch.Tensor, future_exo=None, mode=None):
-        """
-        x_b_l_c: [B, L, C] (원공간)
-        반환: {"q": q_n}  with q_n: [B, H, Q] (정규화 공간)
-              (Forecaster가 'q'를 우선 선택해 horizon을 정규화하고, revin_layer로 denorm)
-        """
-        # 1) 입력 정규화
-        x_n = self.revin_layer(x_b_l_c, 'norm')          # [B, L, C]
+    def forward(
+        self,
+        x: torch.Tensor,
+        # ---- New (Trainer/DefaultAdapter compatible) ----
+        future_exo: torch.Tensor | None = None,
+        past_exo_cont: torch.Tensor | None = None,
+        past_exo_cat: torch.Tensor | None = None,
+        part_ids=None,
+        mode: str | None = None,
+        # ---- Legacy aliases (backward-compat) ----
+        fe_cont: torch.Tensor | None = None,
+        pe_cont: torch.Tensor | None = None,
+        pe_cat: torch.Tensor | None = None,
+        **kwargs,
+    ):
+        # alias resolve (Point 모델과 동일)
+        fe = future_exo if future_exo is not None else fe_cont
+        p_cont = past_exo_cont if past_exo_cont is not None else pe_cont
+        p_cat = past_exo_cat if past_exo_cat is not None else pe_cat
 
-        # 2) Backbone forward (PatchTST는 [B, C, L] 입력)
-        x_n_b_c_l = x_n.permute(0, 2, 1)                 # [B, C, L]
-        z = self.backbone(x_n_b_c_l)                     # [B, L_tok, d_model]
+        # 1) normalize (target only)
+        x_n = self.revin_layer(x, "norm")  # [B, L, C]
 
-        # 3) Head → normalized space quantiles
-        q_n = self.head(z)                               # [B, H, Q]
+        # 2) backbone (past exo 포함)
+        z = self.backbone(x_n, p_cont=p_cont, p_cat=p_cat)  # [B, N, d_model]
+
+        # 3) head (future exo 포함)  -> [B, H, Q]
+        q_n = self.head(z, future_exo=fe)
+
         return {"q": q_n}

@@ -224,6 +224,11 @@ class CommonTrainer:
 
                 # future_exo 결정 (배치 > cb)
                 future_exo = self._resolve_future_exo(fe_cont, x, y, device=device)
+                # if future_exo is None:
+                #     print("[DEBUG] future_exo is None")
+                # else:
+                #     print("[DEBUG] future_exo shape:", tuple(future_exo.shape))
+
 
                 with autocast(
                     device_type=self.cfg.amp_device,

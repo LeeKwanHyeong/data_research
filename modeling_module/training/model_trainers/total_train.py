@@ -1,4 +1,4 @@
-from typing import Dict, Tuple, Optional
+from typing import Dict, Tuple, Optional, Iterable, List, Callable
 from pathlib import Path
 from dataclasses import asdict, is_dataclass, replace
 
@@ -68,6 +68,7 @@ def _make_ckpt_path(
 ) -> Path:
     save_dir.mkdir(parents=True, exist_ok=True)
     fname = f"{freq}_{model_name}_L{lookback}_H{horizon}.pt"
+    # fname = f"{model_name}.pt"
     return save_dir / fname
 
 
@@ -89,8 +90,8 @@ def _build_common_train_configs(
         spike_epochs = 70
     else:  # weekly, monthly
         base_lr = 3e-4
-        warmup_epochs = 50
-        spike_epochs = 100
+        warmup_epochs = 1
+        spike_epochs = 1
 
     # 1) 2-stage 학습 스케줄
     stg_warmup = StageConfig(
@@ -173,114 +174,93 @@ def _build_common_train_configs(
     return point_train_cfg, quantile_train_cfg, spike_cfg, stages
 
 
-# ===================== GENERIC RUNNER (통합) =====================
+def _norm_list(xs: Optional[Iterable[str]]) -> List[str]:
+    if xs is None:
+        return []
+    return [str(x).strip().lower() for x in xs if str(x).strip()]
 
-def _run_total_train_generic(
-        train_loader,
-        val_loader,
+def _contains(xs: List[str], key: str) -> bool:
+    return key.lower() in xs
+
+
+# ---------------------------------------------------------------------
+# 모델별 러너: “(freq 공통 계산 결과) + loaders”만 받아서 results를 채움
+# ---------------------------------------------------------------------
+def _run_patchtst(
+        *,
+        results: Dict[str, Dict],
+        freq: str,
+        train_loader, val_loader,
+        save_root,
+        lookback: int, horizon: int,
+        future_exo_cb,
+        exo_dim: int,
+        patch_len: int, stride: int,
+        point_train_cfg, quantile_train_cfg,
+        stages,
         device: str,
-        lookback: int,
-        horizon: int,
-        freq: str,  # 'monthly', 'weekly', 'daily', 'hourly'
-        save_dir: Optional[str]
-) -> Dict[str, Dict]:
-    save_root = Path(save_dir) if save_dir is not None else None
-
-    # 1. Config & Exo Callback 설정
-    point_train_cfg, quantile_train_cfg, spike_cfg, stages = _build_common_train_configs(
-        device=device, lookback=lookback, horizon=horizon, freq=freq
-    )
-
-    # date_type 매핑
-    date_type_map = {'weekly': 'W', 'monthly': 'M', 'daily': 'D', 'hourly': 'H'}
-    dt_char = date_type_map.get(freq, 'W')
-    future_exo_cb = compose_exo_calendar_cb(date_type=dt_char)
-
-    # 2. Exo Dimension 결정 (Sin/Cos 인코딩 기준)
-    # Monthly/Weekly: period=1 (sin, cos) -> 2
-    # Daily: period=2 (dow, doy) -> 4
-    # Hourly: period=2 (hour, hour_of_week) -> 4
-    if freq in ('daily', 'hourly'):
-        exo_dim = 4
-    else:
-        exo_dim = 2
-
-    results: Dict[str, Dict] = {}
-
+):
     # --------------------------------------------------
-    # 1) PatchMixer
+    # 3) PatchTST
     # --------------------------------------------------
-    # 주기별 Patch Len / Stride 추천값
-    if freq == 'hourly':
-        patch_len, stride = 24, 12
-        season_period = 24
-    elif freq == 'daily':
-        patch_len, stride = 14, 7
-        season_period = 7
-    elif freq == 'weekly':
-        patch_len, stride = 12, 8
-        season_period = 52
-    else:  # monthly
-        patch_len, stride = 6, 3
-        season_period = 12
-
-    # Config kwargs 구성
-    pm_kwargs = dict(
+    print(f'exogenous dimension:: {exo_dim}')
+    pt_kwargs = dict(
+        device=device,
         lookback=lookback,
         horizon=horizon,
-        device=device,
-        enc_in=1,
-        d_model=64,
-        e_layers=3,
+        c_in=1,
+        d_model=256,
+        n_layers=3,
         patch_len=patch_len,
         stride=stride,
-        f_out=128,
-        head_hidden=128,
-        exo_dim=exo_dim,
-        use_part_embedding=True,
-        part_vocab_size=_get_part_vocab_size_from_loader(train_loader),
-        part_embed_dim=16,
-        final_nonneg=True,
-        use_eol_prior=False,
-        exo_is_normalized_default=(freq != 'monthly'),  # 월간만 False 권장
-        expander_season_period=season_period,
-        expander_n_harmonics=min(season_period // 2, 16),
+        d_future=exo_dim,
     )
 
-    # Base
-    pm_base_cfg = PatchMixerConfig(**pm_kwargs, loss_mode='point', point_loss='huber', head_dropout=0.05)
-    pm_base_model = build_patch_mixer_base(pm_base_cfg)
+    pt_base_cfg = PatchTSTConfig(**pt_kwargs, loss_mode='point', point_loss='huber')
+    pt_base = build_patchTST_base(pt_base_cfg)
 
-    print(f'PatchMixer Base ({freq.capitalize()})')
-    best_pm_base = train_patchmixer(
-        pm_base_model, train_loader, val_loader,
+    print(f'PatchTST Base ({freq.capitalize()})')
+    best_pt_base = train_patchtst(
+        pt_base, train_loader, val_loader,
         train_cfg=point_train_cfg, stages=list(stages),
         future_exo_cb=future_exo_cb,
-        exo_is_normalized=pm_base_cfg.exo_is_normalized_default,
     )
     if save_root:
-        ckpt_path = _make_ckpt_path(save_root, freq, "PatchMixerBase", lookback, horizon)
-        save_model(pm_base_model, pm_base_cfg, ckpt_path)
-        best_pm_base["ckpt_path"] = str(ckpt_path)
-    results['PatchMixer Base'] = best_pm_base
+        ckpt_path = _make_ckpt_path(save_root, freq, "PatchTSTBase", lookback, horizon)
+        save_model(pt_base, pt_base_cfg, ckpt_path)
+        best_pt_base["ckpt_path"] = str(ckpt_path)
+    results['PatchTST Base'] = best_pt_base
 
-    # Quantile
-    pm_q_cfg = PatchMixerConfig(**pm_kwargs, loss_mode='quantile', quantiles=(0.1, 0.5, 0.9), head_dropout=0.02)
-    pm_q_model = build_patch_mixer_quantile(pm_q_cfg)
+    pt_q_cfg = PatchTSTConfig(**pt_kwargs, loss_mode='quantile', quantiles=(0.1, 0.5, 0.9))
+    pt_q = build_patchTST_quantile(pt_q_cfg)
 
-    print(f'PatchMixer Quantile ({freq.capitalize()})')
-    best_pm_q = train_patchmixer(
-        pm_q_model, train_loader, val_loader,
+    print(f'PatchTST Quantile ({freq.capitalize()})')
+    best_pt_q = train_patchtst(
+        pt_q, train_loader, val_loader,
         train_cfg=quantile_train_cfg, stages=list(stages),
         future_exo_cb=future_exo_cb,
-        exo_is_normalized=pm_q_cfg.exo_is_normalized_default,
+        exo_is_normalized=True,
     )
     if save_root:
-        ckpt_path = _make_ckpt_path(save_root, freq, "PatchMixerQuantile", lookback, horizon)
-        save_model(pm_q_model, pm_q_cfg, ckpt_path)
-        best_pm_q["ckpt_path"] = str(ckpt_path)
-    results['PatchMixer Quantile'] = best_pm_q
+        ckpt_path = _make_ckpt_path(save_root, freq, "PatchTSTQuantile", lookback, horizon)
+        save_model(pt_q, pt_q_cfg, ckpt_path)
+        best_pt_q["ckpt_path"] = str(ckpt_path)
+    results['PatchTST Quantile'] = best_pt_q
 
+def _run_titan(
+        *,
+        results: Dict[str, Dict],
+        freq: str,
+        train_loader, val_loader,
+        save_root,
+        lookback: int, horizon: int,
+        future_exo_cb,
+        exo_dim: int,
+        patch_len: int, stride: int,
+        point_train_cfg, quantile_train_cfg,
+        stages,
+        device: str,
+):
     # --------------------------------------------------
     # 2) Titan
     # --------------------------------------------------
@@ -350,50 +330,165 @@ def _run_total_train_generic(
         best_ti_s2s["ckpt_path"] = str(ckpt_path)
     results['Titan Seq2Seq'] = best_ti_s2s
 
+def _run_patchmixer(
+        *,
+        results: Dict[str, Dict],
+        freq: str,
+        train_loader, val_loader,
+        save_root,
+        lookback: int, horizon: int,
+        future_exo_cb,
+        exo_dim: int,
+        patch_len: int, stride: int,
+        point_train_cfg, quantile_train_cfg,
+        stages,
+        device: str,
+):
     # --------------------------------------------------
-    # 3) PatchTST
+    # 1) PatchMixer
     # --------------------------------------------------
-    pt_kwargs = dict(
-        device=device,
+    # 주기별 Patch Len / Stride 추천값
+    if freq == 'hourly':
+        patch_len, stride = 24, 12
+        season_period = 24
+    elif freq == 'daily':
+        patch_len, stride = 14, 7
+        season_period = 7
+    elif freq == 'weekly':
+        patch_len, stride = 12, 8
+        season_period = 52
+    else:  # monthly
+        patch_len, stride = 6, 3
+        season_period = 12
+    # Config kwargs 구성
+    pm_kwargs = dict(
         lookback=lookback,
         horizon=horizon,
-        c_in=1,
-        d_model=256,
-        n_layers=3,
+        device=device,
+        enc_in=1,
+        d_model=64,
+        e_layers=3,
         patch_len=patch_len,
         stride=stride,
+        f_out=128,
+        head_hidden=128,
+        exo_dim=exo_dim,
+        use_part_embedding=True,
+        part_vocab_size=_get_part_vocab_size_from_loader(train_loader),
+        part_embed_dim=16,
+        final_nonneg=True,
+        use_eol_prior=False,
+        exo_is_normalized_default=(freq != 'monthly'),  # 월간만 False 권장
+        expander_season_period=season_period,
+        expander_n_harmonics=min(season_period // 2, 16),
     )
 
-    pt_base_cfg = PatchTSTConfig(**pt_kwargs, loss_mode='point', point_loss='huber')
-    pt_base = build_patchTST_base(pt_base_cfg)
+    # Base
+    pm_base_cfg = PatchMixerConfig(**pm_kwargs, loss_mode='point', point_loss='huber', head_dropout=0.05)
+    pm_base_model = build_patch_mixer_base(pm_base_cfg)
 
-    print(f'PatchTST Base ({freq.capitalize()})')
-    best_pt_base = train_patchtst(
-        pt_base, train_loader, val_loader,
+    print(f'PatchMixer Base ({freq.capitalize()})')
+    best_pm_base = train_patchmixer(
+        pm_base_model, train_loader, val_loader,
         train_cfg=point_train_cfg, stages=list(stages),
         future_exo_cb=future_exo_cb,
+        exo_is_normalized=pm_base_cfg.exo_is_normalized_default,
     )
     if save_root:
-        ckpt_path = _make_ckpt_path(save_root, freq, "PatchTSTBase", lookback, horizon)
-        save_model(pt_base, pt_base_cfg, ckpt_path)
-        best_pt_base["ckpt_path"] = str(ckpt_path)
-    results['PatchTST Base'] = best_pt_base
+        ckpt_path = _make_ckpt_path(save_root, freq, "PatchMixerBase", lookback, horizon)
+        save_model(pm_base_model, pm_base_cfg, ckpt_path)
+        best_pm_base["ckpt_path"] = str(ckpt_path)
+    results['PatchMixer Base'] = best_pm_base
 
-    pt_q_cfg = PatchTSTConfig(**pt_kwargs, loss_mode='quantile', quantiles=(0.1, 0.5, 0.9))
-    pt_q = build_patchTST_quantile(pt_q_cfg)
+    # Quantile
+    pm_q_cfg = PatchMixerConfig(**pm_kwargs, loss_mode='quantile', quantiles=(0.1, 0.5, 0.9), head_dropout=0.02)
+    pm_q_model = build_patch_mixer_quantile(pm_q_cfg)
 
-    print(f'PatchTST Quantile ({freq.capitalize()})')
-    best_pt_q = train_patchtst(
-        pt_q, train_loader, val_loader,
+    print(f'PatchMixer Quantile ({freq.capitalize()})')
+    best_pm_q = train_patchmixer(
+        pm_q_model, train_loader, val_loader,
         train_cfg=quantile_train_cfg, stages=list(stages),
         future_exo_cb=future_exo_cb,
-        exo_is_normalized=True,
+        exo_is_normalized=pm_q_cfg.exo_is_normalized_default,
     )
     if save_root:
-        ckpt_path = _make_ckpt_path(save_root, freq, "PatchTSTQuantile", lookback, horizon)
-        save_model(pt_q, pt_q_cfg, ckpt_path)
-        best_pt_q["ckpt_path"] = str(ckpt_path)
-    results['PatchTST Quantile'] = best_pt_q
+        ckpt_path = _make_ckpt_path(save_root, freq, "PatchMixerQuantile", lookback, horizon)
+        save_model(pm_q_model, pm_q_cfg, ckpt_path)
+        best_pm_q["ckpt_path"] = str(ckpt_path)
+    results['PatchMixer Quantile'] = best_pm_q
+
+MODEL_REGISTRY: Dict[str, Callable] = {
+    "patchtst": _run_patchtst,
+    "titan": _run_titan,
+    "patchmixer": _run_patchmixer,
+}
+
+# ===================== GENERIC RUNNER (통합) =====================
+def _run_total_train_generic(
+    train_loader,
+    val_loader,
+    device: str,
+    lookback: int,
+    horizon: int,
+    freq: str,
+    save_dir: Optional[str],
+    *,
+    models_to_run: Optional[Iterable[str]] = None,      # NEW
+):
+    save_root = Path(save_dir) if save_dir is not None else None
+
+    point_train_cfg, quantile_train_cfg, spike_cfg, stages = _build_common_train_configs(
+        device=device, lookback=lookback, horizon=horizon, freq=freq
+    )
+
+    date_type_map = {"weekly": "W", "monthly": "M", "daily": "D", "hourly": "H"}
+    dt_char = date_type_map.get(freq, "W")
+    future_exo_cb = compose_exo_calendar_cb(date_type=dt_char)
+
+    exo_dim = 4 if freq in ("daily", "hourly") else 2
+
+    # freq별 patch_len/stride/season_period
+    if freq == "hourly":
+        patch_len, stride, season_period = 24, 12, 24
+    elif freq == "daily":
+        patch_len, stride, season_period = 14, 7, 7
+    elif freq == "weekly":
+        patch_len, stride, season_period = 12, 8, 52
+    else:
+        patch_len, stride, season_period = 6, 3, 12
+
+    # NEW: 선택값 정규화
+    selected = _norm_list(models_to_run)
+    if not selected:
+        selected = ["patchtst"]  # 기본값(원하시면 전체로 바꿔도 됨)
+
+    # 검증
+    unknown = [m for m in selected if m not in MODEL_REGISTRY]
+    if unknown:
+        raise ValueError(f"Unknown models_to_run: {unknown}. allowed={list(MODEL_REGISTRY.keys())}")
+
+    results: Dict[str, Dict] = {}
+
+    # NEW: 선택된 모델만 실행
+    for m in selected:
+        print(f"\n[total_train] === RUN: {m} ({freq}) ===")
+        MODEL_REGISTRY[m](
+            results=results,
+            freq=freq,
+            train_loader=train_loader,
+            val_loader=val_loader,
+            save_root=save_root,
+            lookback=lookback,
+            horizon=horizon,
+            future_exo_cb=future_exo_cb,
+            exo_dim=exo_dim,
+            patch_len=patch_len,
+            stride=stride,
+            point_train_cfg=point_train_cfg,
+            quantile_train_cfg=quantile_train_cfg,
+            stages=stages,
+            device=device,
+        )
 
     return results
 
@@ -401,23 +496,23 @@ def _run_total_train_generic(
 # ===================== EXPORTED FUNCTIONS =====================
 
 def run_total_train_weekly(train_loader, val_loader, device='cuda' if torch.cuda.is_available() else 'cpu', *, lookback,
-                           horizon, save_dir=None):
-    return _run_total_train_generic(train_loader, val_loader, device, lookback, horizon, 'weekly', save_dir)
+                           horizon, save_dir=None, models_to_run=None):
+    return _run_total_train_generic(train_loader, val_loader, device, lookback, horizon, 'weekly', save_dir, models_to_run=models_to_run)
 
 
 def run_total_train_monthly(train_loader, val_loader, device='cuda' if torch.cuda.is_available() else 'cpu', *,
-                            lookback, horizon, save_dir=None):
-    return _run_total_train_generic(train_loader, val_loader, device, lookback, horizon, 'monthly', save_dir)
+                            lookback, horizon, save_dir=None, models_to_run=None):
+    return _run_total_train_generic(train_loader, val_loader, device, lookback, horizon, 'monthly', save_dir, models_to_run=models_to_run)
 
 
 def run_total_train_daily(train_loader, val_loader, device='cuda' if torch.cuda.is_available() else 'cpu', *, lookback,
-                          horizon, save_dir=None):
-    return _run_total_train_generic(train_loader, val_loader, device, lookback, horizon, 'daily', save_dir)
+                          horizon, save_dir=None, models_to_run=None):
+    return _run_total_train_generic(train_loader, val_loader, device, lookback, horizon, 'daily', save_dir, models_to_run=models_to_run)
 
 
 def run_total_train_hourly(train_loader, val_loader, device='cuda' if torch.cuda.is_available() else 'cpu', *, lookback,
-                           horizon, save_dir=None):
-    return _run_total_train_generic(train_loader, val_loader, device, lookback, horizon, 'hourly', save_dir)
+                           horizon, save_dir=None, models_to_run=None):
+    return _run_total_train_generic(train_loader, val_loader, device, lookback, horizon, 'hourly', save_dir, models_to_run=models_to_run)
 
 
 def summarize_metrics(results: Dict[str, Dict[str, np.ndarray]]) -> Dict[str, Dict[str, float]]:

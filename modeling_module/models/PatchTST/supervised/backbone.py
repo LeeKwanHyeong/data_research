@@ -21,7 +21,7 @@ class SupervisedBackbone(PatchBackboneBase):
         self.cfg = cfg
 
         # -----------------------------------
-        # [1] Attention Core 자동 선택
+        # 1. Attention Core 자동 선택
         # -----------------------------------
         if attn_core is None:
             attn_type = getattr(cfg.attn, "type", "full").lower()
@@ -31,7 +31,6 @@ class SupervisedBackbone(PatchBackboneBase):
                     mask_flag=cfg.attn.causal,
                     attention_dropout=cfg.attn.attn_dropout,
                     output_attention=cfg.attn.output_attention,
-                    # residual=cfg.attn.residual_logits,
                 )
             elif attn_type == "probsparse":
                 attn_core = ProbAttention(
@@ -54,7 +53,7 @@ class SupervisedBackbone(PatchBackboneBase):
         self.attn_core = attn_core
 
         # -----------------------------------
-        # [2] Encoder Layer Stack
+        # 2. Encoder Layer Stack
         # -----------------------------------
         layers = []
         for i in range(cfg.n_layers):
@@ -66,7 +65,6 @@ class SupervisedBackbone(PatchBackboneBase):
                 proj_dropout=cfg.attn.proj_dropout,
                 attn_core=self.attn_core,
             )
-
             layers.append(
                 TSTEncoderLayer(
                     mha=mha,
@@ -82,19 +80,24 @@ class SupervisedBackbone(PatchBackboneBase):
         self.norm_out = nn.LayerNorm(cfg.d_model)
 
     # -----------------------------------
-    # [3] Forward (Patchify → Encoder)
+    # 3. Forward (Patchify → Encoder)
     # -----------------------------------
-    def forward(self, x_bcl: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, p_cont: torch.Tensor = None, p_cat: torch.Tensor = None) -> torch.Tensor:
         """
-        입력 x_bcl: [B, C, L]
-        반환 z: [B, L_tok, d_model]
+        Args:
+            x: Target [B, L, C] (Revin Normalized)
+            p_cont: Past Exo Continuous [B, L, d_past_cont]
+            p_cat: Past Exo Categorical [B, L, d_past_cat]
+        Returns:
+            z: [B, N, d_model]
         """
-        # Patch embedding + positional encoding
-        z = self._patchify(x_bcl)           # [B, L_tok, d_model]
+        # 1) Patchify & Embed (with Exo)
+        z = self._patchify_and_embed(x, p_cont, p_cat)  # [B, N, d_model]
 
-        # Transformer encoder 통과
-        z = self.encoder(z)                 # [B, L_tok, d_model]
+        # 2) Transformer Encoder
+        z = self.encoder(z)  # [B, N, d_model]
 
-        # Output 정규화
+        # 3) Output Norm
         z = self.norm_out(z)
+
         return z
