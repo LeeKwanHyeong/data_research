@@ -16,7 +16,8 @@ from modeling_module.utils.exogenous_utils import calendar_sin_cos
 
 # PatchTST 내부 head 재구성에 필요
 from modeling_module.models.PatchTST.common.patching import compute_patch_num
-from modeling_module.models.PatchTST.supervised.PatchTST import PointHeadWithExo  # 경로는 실제 프로젝트에 맞게 조정
+from modeling_module.models.PatchTST.supervised.PatchTST import PointHeadWithExo, \
+    QuantileHeadWithExo  # 경로는 실제 프로젝트에 맞게 조정
 
 
 def _dump_cfg(cfg):
@@ -64,34 +65,38 @@ def _pick_future_exo_cb(model, user_cb: Optional[Callable]) -> Optional[Callable
     return calendar_sin_cos if d_future > 0 else None
 
 
+
 def _ensure_patchtst_future_head(model, exo_dim: int):
-    """
-    PatchTST는 cfg.d_future와 head(PointHeadWithExo)의 in_dim이 강하게 결합되어 있어
-    future exo 차원이 바뀌면 head를 재구성해야 matmul mismatch가 안 납니다.
-    """
     cfg = getattr(model, "cfg", None)
     if cfg is None:
         return model
 
     current = int(getattr(cfg, "d_future", 0))
-    if exo_dim <= 0:
-        cfg.d_future = 0
-        # d_future=0이면 head는 d_model 입력만 받도록 재구성
-    else:
-        cfg.d_future = int(exo_dim)
+    cfg.d_future = int(exo_dim) if exo_dim > 0 else 0
 
-    # patch_num 재계산
     patch_num = compute_patch_num(cfg.lookback, cfg.patch_len, cfg.stride, cfg.padding_patch)
 
-    # head 재구성
-    model.head = PointHeadWithExo(
-        d_model=cfg.d_model,
-        horizon=cfg.horizon,
-        d_future=int(cfg.d_future),
-        patch_num=patch_num,
-        agg=getattr(model.head, "agg", "mean"),
-    )
-    print(f"[train_patchtst] head rebuilt: d_future {current} -> {cfg.d_future}")
+    if getattr(model, "is_quantile", False):
+        # Quantile head에는 patch_num이 필요 없으면 제거(당신 코드 정의 기준)
+        model.head = QuantileHeadWithExo(
+            d_model=cfg.d_model,
+            horizon=cfg.horizon,
+            d_future=int(cfg.d_future),
+            quantiles=getattr(cfg, "quantiles", (0.1, 0.5, 0.9)),
+            hidden=getattr(cfg, "q_hidden", 128),
+            monotonic=True,
+        )
+        print(f"[train_patchtst] quantile head rebuilt: d_future {current} -> {cfg.d_future}")
+    else:
+        model.head = PointHeadWithExo(
+            d_model=cfg.d_model,
+            horizon=cfg.horizon,
+            d_future=int(cfg.d_future),
+            patch_num=patch_num,
+            agg=getattr(model.head, "agg", "mean"),
+        )
+        print(f"[train_patchtst] point head rebuilt: d_future {current} -> {cfg.d_future}")
+
     return model
 
 

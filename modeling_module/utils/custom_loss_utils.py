@@ -27,6 +27,53 @@ EPS = 1e-12
 def _as_float_tensor(x: torch.Tensor) -> torch.Tensor:
     return x if x.is_floating_point() else x.float()
 
+def _normalize_quantile_pred(
+    pred_q: torch.Tensor | dict,
+    target: torch.Tensor,
+    quantiles: Iterable[float],
+) -> tuple[torch.Tensor, torch.Tensor, int, int]:
+    """
+    pred_q: Tensor or {"q": Tensor}
+    target: (B,H) or (B,1,H)
+    return: pred_q_norm (B,Q,H), target_2d (B,H), Q, H
+    """
+    # 0) dict -> tensor
+    if isinstance(pred_q, dict):
+        if "q" not in pred_q:
+            raise RuntimeError(f"[pinball] dict pred has no 'q' key. keys={list(pred_q.keys())}")
+        pred_q = pred_q["q"]
+
+    # 1) target shape normalize -> (B,H)
+    if target.dim() == 3 and target.size(1) == 1:
+        target = target.squeeze(1)
+    if target.dim() != 2:
+        raise RuntimeError(f"[pinball] target must be (B,H). got {tuple(target.shape)}")
+
+    target = _as_float_tensor(target)
+    H = target.shape[-1]
+    Q = len(list(quantiles))
+
+    # 2) pred_q to float & device
+    pred_q = _as_float_tensor(pred_q).to(device=target.device)
+
+    # 3) pred_q shape normalize
+    if pred_q.dim() == 3:
+        # (B,H,Q) -> (B,Q,H)
+        if pred_q.shape[1] == H and pred_q.shape[2] == Q:
+            pred_q = pred_q.permute(0, 2, 1).contiguous()
+        # already (B,Q,H)
+        elif pred_q.shape[1] == Q and pred_q.shape[2] == H:
+            pass
+        else:
+            raise RuntimeError(
+                f"[pinball] pred_q shape={tuple(pred_q.shape)} not compatible with "
+                f"target H={H}, Q={Q}. Expected (B,Q,H) or (B,H,Q)."
+            )
+    else:
+        raise RuntimeError(f"[pinball] pred_q must be 3D. got {tuple(pred_q.shape)}")
+
+    return pred_q, target, Q, H
+
 
 def _safe_weighted_mean(x: torch.Tensor, w: Optional[torch.Tensor]) -> torch.Tensor:
     """
@@ -182,50 +229,60 @@ def intermittent_weights_balanced(
 # =====================================================
 
 def pinball_plain(
-    pred_q: torch.Tensor,
+    pred_q: torch.Tensor | dict,
     y: torch.Tensor,
-    quantiles: Iterable[float] = (0.1, 0.5, 0.9)
+    quantiles: Iterable[float] = (0.1, 0.5, 0.9),
 ) -> torch.Tensor:
     """
-    pred_q: (B,Q,H), y: (B,H)
-    모든 분위수에 대한 pinball 평균
+    pred_q: (B,Q,H) or (B,H,Q) or {"q": ...}
+    y     : (B,H) or (B,1,H)
     """
-    y = _as_float_tensor(y)
-    pred_q = _as_float_tensor(pred_q).to(device=y.device)
+    pred_q, y, Q, H = _normalize_quantile_pred(pred_q, y, quantiles)
+
     diff = y.unsqueeze(1) - pred_q  # (B,Q,H)
     losses = []
-    for i, q in enumerate(quantiles):
-        losses.append(_pinball_elem(diff[:, i], float(q)).mean())
+    for i, q in enumerate(list(quantiles)):
+        q_t = torch.as_tensor(float(q), dtype=diff.dtype, device=diff.device)
+        e = torch.maximum(q_t * diff[:, i], (q_t - 1.0) * diff[:, i])  # (B,H)
+        losses.append(e.mean())
     return sum(losses) / max(1, len(losses))
 
 
 def pinball_loss_weighted(
-    pred_q: torch.Tensor,
+    pred_q: torch.Tensor | dict,
     target: torch.Tensor,
     quantiles: Tuple[float, ...] = (0.1, 0.5, 0.9),
     weights: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
-    pred_q: (B,Q,H), target: (B,H)
-    weights: (B,H) 또는 (B,1,H)로 브로드캐스트 가능
+    pred_q: (B,Q,H) or (B,H,Q) or {"q": ...}
+    target: (B,H) or (B,1,H)
     """
-    pred_q = _as_float_tensor(pred_q)
-    target = _as_float_tensor(target).to(device=pred_q.device)
+    pred_q, target, Q, H = _normalize_quantile_pred(pred_q, target, quantiles)
 
     diff = target.unsqueeze(1) - pred_q  # (B,Q,H)
+
     if weights is None:
-        # 비가중 pinball
-        losses = [_pinball_elem(diff[:, i], float(q)).mean() for i, q in enumerate(quantiles)]
+        losses = []
+        for i, q in enumerate(quantiles):
+            q_t = torch.as_tensor(float(q), dtype=diff.dtype, device=diff.device)
+            e = torch.maximum(q_t * diff[:, i], (q_t - 1.0) * diff[:, i])
+            losses.append(e.mean())
         return sum(losses) / max(1, len(quantiles))
 
-    # 가중 pinball (Q축 동일 가중)
-    w = _ensure_w_shape(weights, pred_q)  # (B,1,H)
+    # weights: (B,H) -> (B,1,H) broadcast
+    w = _as_float_tensor(weights).to(device=target.device)
+    if w.dim() == 2:
+        w = w.unsqueeze(1)
+
     losses = []
     for i, q in enumerate(quantiles):
-        e = _pinball_elem(diff[:, i], float(q))  # (B,H)
-        losses.append(_safe_weighted_mean(e, w.squeeze(1)))
+        q_t = torch.as_tensor(float(q), dtype=diff.dtype, device=diff.device)
+        e = torch.maximum(q_t * diff[:, i], (q_t - 1.0) * diff[:, i])  # (B,H)
+        num = (e * w.squeeze(1)).sum()
+        den = w.squeeze(1).sum()
+        losses.append(num / (den + EPS))
     return sum(losses) / max(1, len(quantiles))
-
 
 def pinball_loss_weighted_masked(
     pred_q: torch.Tensor,
@@ -239,6 +296,29 @@ def pinball_loss_weighted_masked(
     """
     pred_q = _as_float_tensor(pred_q)
     target = _as_float_tensor(target).to(device=pred_q.device)
+
+    Q = len(quantiles)
+    H = target.shape[-1]
+
+    if pred_q.dim() == 3:
+        # case1) (B,H,Q) -> (B,Q,H)
+        if pred_q.shape[1] == H and pred_q.shape[2] == Q:
+            pred_q = pred_q.permute(0, 2, 1).contiguous()
+
+        # case2) already (B,Q,H)
+        elif pred_q.shape[1] == Q and pred_q.shape[2] == H:
+            pass
+
+        else:
+            raise RuntimeError(
+                f"[pinball_loss] pred_q shape={tuple(pred_q.shape)} not compatible with "
+                f"target H={H}, Q={Q}. Expected (B,Q,H) or (B,H,Q)."
+            )
+    else:
+        # pred_q가 2D로 들어오면(=Point처럼) 애초에 quantile loss 대상이 아닙니다.
+        raise RuntimeError(
+            f"[pinball_loss] pred_q must be 3D (B,Q,H). got shape={tuple(pred_q.shape)}"
+        )
 
     diff = target.unsqueeze(1) - pred_q  # (B,Q,H)
     w = _ensure_w_shape(weights, pred_q)  # (B,1,H) or None

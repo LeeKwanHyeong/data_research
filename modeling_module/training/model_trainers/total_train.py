@@ -214,6 +214,7 @@ def _run_patchtst(
         patch_len=patch_len,
         stride=stride,
         d_future=exo_dim,
+        use_revin = True
     )
 
     pt_base_cfg = PatchTSTConfig(**pt_kwargs, loss_mode='point', point_loss='huber')

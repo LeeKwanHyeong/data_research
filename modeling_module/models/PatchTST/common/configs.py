@@ -110,7 +110,7 @@ class PatchTSTConfig(TrainingConfig):
     store_attn: bool = False            # 어텐션 가중치 저장
     pe: str = 'zeros'                   # Positional Embedding 유형
     learn_pe: bool = True               # Positional Embedding 학습 여부
-    revin: bool = True                  # RevIN 사용 여부
+    use_revin: bool = True                  # RevIN 사용 여부
     affine: bool = True                 # RevIN affine 사용 여부
     subtract_last: bool = False         # RevIN 마지막값 기준 보정
     verbose: bool = False               # 상세 로그

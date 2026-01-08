@@ -29,7 +29,7 @@ def compose_exo_calendar_cb(date_type: str = "W", *, sincos: bool = True) -> Cal
     date_type = date_type.upper()
 
     # 주기 설정 (List of periods)
-    # 딥러닝 모델은 절대적인 날짜보다 '반복되는 주기성'을 학습하는 것이 중요합니다.
+    # 딥러닝 모델은 절대적인 날짜보다 '반복되는 주기성'을 학습하는 것이 중요.
     if date_type == 'M':
         periods = [12.0]
     elif date_type == 'W':

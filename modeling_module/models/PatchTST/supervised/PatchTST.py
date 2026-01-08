@@ -178,13 +178,18 @@ class PatchTSTPointModel(nn.Module):
         p_cat = past_exo_cat if past_exo_cat is not None else pe_cat
 
         # 1) RevIN normalize (기존 로직 유지)
-        x_n = self.revin(x, "norm") if getattr(self, "use_revin", False) else x
+        use_revin = getattr(self.cfg, "use_revin", True)
+        x_n = self.revin_layer(x, "norm") if use_revin else x
 
         # 2) Backbone Forward (Past Exo)
         z = self.backbone(x_n, p_cont=p_cont, p_cat=p_cat)  # [B, N, d_model]
 
         # 3) Head Forward (Future Exo)
         y_n = self.head(z, future_exo=fe)  # [B, H]
+
+        if use_revin:
+            y = self.revin_layer(y_n.unsqueeze(-1), "denorm").squeeze(-1)  # [B,H]
+            return y
 
         return y_n
 
@@ -228,18 +233,35 @@ class PatchTSTQuantileModel(nn.Module):
         pe_cat: torch.Tensor | None = None,
         **kwargs,
     ):
+        use_revin = getattr(self.cfg, "use_revin", True)
         # alias resolve (Point 모델과 동일)
         fe = future_exo if future_exo is not None else fe_cont
         p_cont = past_exo_cont if past_exo_cont is not None else pe_cont
         p_cat = past_exo_cat if past_exo_cat is not None else pe_cat
 
         # 1) normalize (target only)
-        x_n = self.revin_layer(x, "norm")  # [B, L, C]
+        x_n = self.revin_layer(x, "norm") if use_revin else x  # [B, L, C]
 
         # 2) backbone (past exo 포함)
         z = self.backbone(x_n, p_cont=p_cont, p_cat=p_cat)  # [B, N, d_model]
 
         # 3) head (future exo 포함)  -> [B, H, Q]
         q_n = self.head(z, future_exo=fe)
+
+        if use_revin:
+            if q_n.dim() == 2:
+                # [B,H] -> [B,H,1]로 만들어 denorm
+                q_den = self.revin_layer(q_n.unsqueeze(-1), "denorm").squeeze(-1)  # [B,H]
+                return {"q": q_den}
+
+            elif q_n.dim() == 3:
+                # [B,H,Q] -> flatten 후 denorm -> reshape
+                B, H, Q = q_n.shape
+                q_flat = q_n.reshape(B, H * Q, 1)  # [B, H*Q, 1]
+                q_den = self.revin_layer(q_flat, "denorm").reshape(B, H, Q)
+                return {"q": q_den}
+
+            else:
+                raise RuntimeError(f"[PatchTSTQuantile] unexpected q_n.dim={q_n.dim()} shape={tuple(q_n.shape)}")
 
         return {"q": q_n}
