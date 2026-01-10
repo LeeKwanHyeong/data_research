@@ -1,4 +1,3 @@
-# src/modeling_module/models/PatchTST/PatchTST.py
 
 import torch
 from torch import nn
